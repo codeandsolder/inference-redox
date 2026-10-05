@@ -1,4 +1,6 @@
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,9 +146,51 @@ async fn handle(
     }
 }
 
+fn key_from_env_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let contents = fs::read_to_string(path)?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("OPENROUTER_API_KEY=") {
+            let value = value.trim().trim_matches(['\'', '"']);
+            if !value.is_empty() {
+                return Ok(value.to_owned());
+            }
+        }
+    }
+    Err(format!("OPENROUTER_API_KEY not found in {}", path.display()).into())
+}
+
+fn load_api_key() -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(key) = env::var("OPENROUTER_API_KEY")
+        && !key.trim().is_empty()
+    {
+        return Ok(key);
+    }
+    let mut args = env::args_os().skip(1);
+    let Some(arg) = args.next() else {
+        return Err(
+            "OPENROUTER_API_KEY is unset; pass --env-file <path> or set the environment variable"
+                .into(),
+        );
+    };
+    if arg != "--env-file" {
+        return Err(format!("unknown argument: {}", arg.to_string_lossy()).into());
+    }
+    let Some(path) = args.next() else {
+        return Err("--env-file requires a path".into());
+    };
+    if let Some(extra) = args.next() {
+        return Err(format!("unexpected argument: {}", extra.to_string_lossy()).into());
+    }
+    key_from_env_file(Path::new(&path))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = env::var("OPENROUTER_API_KEY")?;
+    let api_key = load_api_key()?;
     let provider = Arc::new(OpenRouter::new(api_key));
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
