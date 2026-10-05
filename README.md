@@ -6,7 +6,7 @@ Provider-agnostic inference routing utilities. Providers keep their exact wire g
 
 OpenRouter is the first backend. Its endpoint catalog is normalized into:
 
-- prompt/completion/request pricing;
+- prompt/completion/request pricing, including prompt-length pricing overrides and cache read/write rates;
 - p50/p75/p90/p95/p99 latency and throughput samples (p95 is interpolated when the source only publishes p90/p99);
 - recent uptime;
 - context and output limits;
@@ -18,7 +18,9 @@ OpenRouter is the first backend. Its endpoint catalog is normalized into:
 
 `latency + expected_output_tokens / throughput`
 
-The p75 TTFT estimate is primary; a p95 TTFT tail estimate is the next tie-breaker, then expected cost. OpenRouter receives the resulting full endpoint tags in explicit order with provider fallback enabled. Transport, HTTP 408/429, and 5xx failures are retried by the client as a second reliability layer.
+The primary response-time estimate uses the p75 service percentile for both TTFT and output throughput; p95 is the tail guard, then expected cost breaks ties. If endpoint telemetry is unavailable, the OpenRouter adapter keeps the cost/capability filter and delegates speed ordering back to OpenRouter (`latency` for short responses, `throughput` for larger ones). Tiered endpoints such as Flex are emitted using their native `service_tier` grammar and fall back across route batches automatically. Transport, HTTP 408/429/5xx, and routable endpoint failures are retried with `Retry-After` support.
+
+`expected_output_tokens` is deliberately an estimate used for price and response-time selection, not a generation cap. Set `InferenceRequest::max_output_tokens` separately when a hard limit is actually desired.
 
 ```rust,no_run
 use inference_redox::{
