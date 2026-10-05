@@ -1,10 +1,12 @@
-use std::collections::BTreeSet;
-use std::time::Duration;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::{
@@ -23,6 +25,14 @@ pub struct OpenRouter {
     base_url: String,
     app_title: Option<String>,
     http_referer: Option<String>,
+    catalog_cache: Arc<Mutex<HashMap<String, CachedEndpoints>>>,
+    catalog_ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct CachedEndpoints {
+    fetched_at: Instant,
+    endpoints: Vec<Endpoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +61,8 @@ impl OpenRouter {
             base_url: DEFAULT_BASE_URL.to_owned(),
             app_title: None,
             http_referer: None,
+            catalog_cache: Arc::new(Mutex::new(HashMap::new())),
+            catalog_ttl: Duration::from_secs(60),
         }
     }
 
@@ -70,6 +82,12 @@ impl OpenRouter {
     ) -> Self {
         self.app_title = Some(title.into());
         self.http_referer = Some(http_referer.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
+        self.catalog_ttl = ttl;
         self
     }
 
@@ -418,27 +436,52 @@ impl OpenRouterEndpoint {
 #[async_trait]
 impl InferenceProvider for OpenRouter {
     async fn endpoints(&self, model: &str) -> Result<Vec<Endpoint>, ProviderError> {
-        let url = self.model_endpoint_url(model)?;
-        let response = self
-            .request(reqwest::Method::GET, url)
-            .send()
-            .await
-            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Catalog(format!("HTTP {status}: {body}")));
+        let mut cache = self.catalog_cache.lock().await;
+        if let Some(cached) = cache.get(model)
+            && cached.fetched_at.elapsed() <= self.catalog_ttl
+        {
+            return Ok(cached.endpoints.clone());
         }
-        let envelope: EndpointEnvelope = response
-            .json()
-            .await
-            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-        Ok(envelope
-            .data
-            .endpoints
-            .into_iter()
-            .map(|endpoint| endpoint.normalize(model))
-            .collect())
+        let stale = cache.get(model).map(|cached| cached.endpoints.clone());
+        let url = self.model_endpoint_url(model)?;
+        let fetched = async {
+            let response = self
+                .request(reqwest::Method::GET, url)
+                .send()
+                .await
+                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(ProviderError::Catalog(format!("HTTP {status}: {body}")));
+            }
+            let envelope: EndpointEnvelope = response
+                .json()
+                .await
+                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+            Ok::<Vec<Endpoint>, ProviderError>(
+                envelope
+                    .data
+                    .endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.normalize(model))
+                    .collect(),
+            )
+        }
+        .await;
+        match fetched {
+            Ok(endpoints) => {
+                cache.insert(
+                    model.to_owned(),
+                    CachedEndpoints {
+                        fetched_at: Instant::now(),
+                        endpoints: endpoints.clone(),
+                    },
+                );
+                Ok(endpoints)
+            }
+            Err(error) => stale.ok_or(error),
+        }
     }
 
     async fn execute_plan(
