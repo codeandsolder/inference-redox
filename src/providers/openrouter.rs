@@ -390,12 +390,10 @@ fn utc_window_active(start_hhmm: u32, end_hhmm: u32, now_minutes: u32) -> bool {
     let Some(end) = hhmm_to_minutes(end_hhmm) else {
         return false;
     };
-    if start == end {
-        true
-    } else if start < end {
-        (start..end).contains(&now_minutes)
-    } else {
-        now_minutes >= start || now_minutes < end
+    match start.cmp(&end) {
+        std::cmp::Ordering::Equal => true,
+        std::cmp::Ordering::Less => (start..end).contains(&now_minutes),
+        std::cmp::Ordering::Greater => now_minutes >= start || now_minutes < end,
     }
 }
 
@@ -890,7 +888,7 @@ mod tests {
     #[test]
     fn accepts_time_of_day_pricing_override_shape() -> Result<(), serde_json::Error> {
         let raw = json!({
-            "context_length": 128000,
+            "context_length": 128_000,
             "model_id": "deepseek/deepseek-v4.1-flash",
             "name": "Alibaba: DeepSeek V4.1 Flash",
             "pricing": {
