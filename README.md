@@ -6,7 +6,7 @@ Provider-agnostic inference routing utilities. Providers keep their exact wire g
 
 OpenRouter is the first backend. Its endpoint catalog is normalized into:
 
-- prompt/completion/request pricing, including prompt-length pricing overrides and cache read/write rates;
+- prompt/completion/request pricing, including prompt-length and provider time-of-day pricing overrides plus cache read/write rates;
 - p50/p75/p90/p95/p99 latency and throughput samples (p95 is interpolated when the source only publishes p90/p99);
 - recent uptime;
 - context and output limits;
@@ -18,7 +18,7 @@ OpenRouter is the first backend. Its endpoint catalog is normalized into:
 
 `latency + expected_output_tokens / throughput`
 
-The primary response-time estimate uses p75 TTFT plus median output throughput; p95 TTFT is the tail guard, then expected cost breaks ties. Throughput uses p50 because higher throughput percentiles are faster/optimistic samples and OpenRouter does not expose the lower-side percentile needed for a true p75 response-time bound. If endpoint telemetry is unavailable, the OpenRouter adapter keeps the cost/capability filter and delegates speed ordering back to OpenRouter (`latency` for short responses, `throughput` for larger ones). Tiered endpoints such as Flex are emitted using their native `service_tier` grammar and fall back across route batches automatically. Transport, HTTP 408/429/5xx, and routable endpoint failures are retried with `Retry-After` support.
+The primary response-time estimate uses p75 TTFT plus median output throughput; OpenRouter latency telemetry is normalized when the live per-model API reports milliseconds rather than documented seconds; p95 TTFT is the tail guard, then expected cost breaks ties. Throughput uses p50 because OpenRouter endpoint surfaces have shown inconsistent throughput-percentile direction/semantics; median throughput avoids turning that presentation detail into a routing assumption. If endpoint telemetry is unavailable, the OpenRouter adapter keeps the cost/capability filter and delegates speed ordering back to OpenRouter (`latency` for short responses, `throughput` for larger ones). Tiered endpoints such as Flex are emitted using their native `service_tier` grammar and fall back across route batches automatically. Transport, HTTP 408/429/5xx, and routable endpoint failures are retried with `Retry-After` support.
 
 `expected_output_tokens` is deliberately an estimate used for price and response-time selection, not a generation cap. Set `InferenceRequest::max_output_tokens` separately when a hard limit is actually desired.
 
@@ -69,6 +69,12 @@ println!("{} via {} candidates", response.content, route.candidates.len());
 # Ok(())
 # }
 ```
+
+## Long-lived stdio bridge
+
+`inference-redox-stdio` exposes the same normalized request and routing semantics to non-Rust callers as multiplexed JSONL. It keeps one provider instance and endpoint-catalog cache warm, supports concurrent in-flight `route` and `infer` requests keyed by caller IDs, and drains outstanding requests before shutdown. Credentials may come from the process environment or `--env-file <path>`.
+
+The bridge is deliberately thin: provider-specific request grammar, capability filtering, request-shape cost calculation, service-tier handling, fallback and retry policy remain in the Rust adapter rather than being reimplemented by callers.
 
 ## Provider architecture
 
