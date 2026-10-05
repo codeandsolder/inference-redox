@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
+    let mut tasks = JoinSet::new();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -202,7 +204,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         match serde_json::from_str::<WireRequest>(&line) {
             Ok(request) => {
-                tokio::spawn(handle(Arc::clone(&provider), Arc::clone(&stdout), request));
+                tasks.spawn(handle(Arc::clone(&provider), Arc::clone(&stdout), request));
+                while tasks.try_join_next().is_some() {}
             }
             Err(error) => {
                 write_json(
@@ -217,5 +220,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    while tasks.join_next().await.is_some() {}
     Ok(())
 }
