@@ -150,3 +150,45 @@ fn p75_is_interpolated_from_p50_and_p90() {
     };
     assert_eq!(p.p75_or_interpolate(), Some(15.0));
 }
+
+#[test]
+fn pricing_override_changes_shape_cost() {
+    let pricing = Pricing {
+        prompt_per_token: 1.0e-6,
+        completion_per_token: 2.0e-6,
+        overrides: vec![inference_redox::PricingOverride {
+            min_prompt_tokens: 1_000,
+            prompt_per_token: Some(3.0e-6),
+            completion_per_token: Some(4.0e-6),
+            ..inference_redox::PricingOverride::default()
+        }],
+        ..Pricing::default()
+    };
+    assert_eq!(pricing.effective(999).prompt_per_token, 1.0e-6);
+    assert_eq!(pricing.effective(1_000).prompt_per_token, 3.0e-6);
+    assert!(pricing.expected_cost(1_000, 100) > pricing.expected_cost(999, 100));
+}
+
+#[test]
+fn expected_output_is_not_a_hard_limit() -> Result<(), inference_redox::ProviderError> {
+    let mut request = InferenceRequest::new("x/model", "hello", 100);
+    request.prompt_tokens = Some(100);
+    request.max_output_tokens = Some(200);
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![endpoint("ok", 1e-6, 1e-6, 0.1, 100.0)],
+    )?;
+    assert_eq!(plan.expected_output_tokens, 100);
+
+    request.max_output_tokens = Some(99);
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![endpoint("bad", 1e-6, 1e-6, 0.1, 100.0)],
+        ),
+        Err(inference_redox::ProviderError::InvalidRequest(_))
+    ));
+    Ok(())
+}

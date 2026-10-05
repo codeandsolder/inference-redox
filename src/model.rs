@@ -43,8 +43,27 @@ impl Percentiles {
     }
 }
 
-/// Normalized per-token endpoint pricing in USD.
+/// Effective token rates after request-shape pricing overrides are applied.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct EffectivePricing {
+    pub prompt_per_token: f64,
+    pub completion_per_token: f64,
+    pub cache_read_per_token: Option<f64>,
+    pub cache_write_per_token: Option<f64>,
+}
+
+/// A pricing tier that activates at a prompt-token threshold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct PricingOverride {
+    pub min_prompt_tokens: u64,
+    pub prompt_per_token: Option<f64>,
+    pub completion_per_token: Option<f64>,
+    pub cache_read_per_token: Option<f64>,
+    pub cache_write_per_token: Option<f64>,
+}
+
+/// Normalized endpoint pricing in USD.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pricing {
     pub prompt_per_token: f64,
     pub completion_per_token: f64,
@@ -52,14 +71,47 @@ pub struct Pricing {
     pub discount: f64,
     pub cache_read_per_token: Option<f64>,
     pub cache_write_per_token: Option<f64>,
+    pub overrides: Vec<PricingOverride>,
 }
 
 impl Pricing {
+    /// Resolve prompt-length-dependent token rates.
+    #[must_use]
+    pub fn effective(&self, prompt_tokens: u64) -> EffectivePricing {
+        let mut effective = EffectivePricing {
+            prompt_per_token: self.prompt_per_token,
+            completion_per_token: self.completion_per_token,
+            cache_read_per_token: self.cache_read_per_token,
+            cache_write_per_token: self.cache_write_per_token,
+        };
+        if let Some(override_) = self
+            .overrides
+            .iter()
+            .filter(|override_| override_.min_prompt_tokens <= prompt_tokens)
+            .max_by_key(|override_| override_.min_prompt_tokens)
+        {
+            effective.prompt_per_token = override_
+                .prompt_per_token
+                .unwrap_or(effective.prompt_per_token);
+            effective.completion_per_token = override_
+                .completion_per_token
+                .unwrap_or(effective.completion_per_token);
+            effective.cache_read_per_token = override_
+                .cache_read_per_token
+                .or(effective.cache_read_per_token);
+            effective.cache_write_per_token = override_
+                .cache_write_per_token
+                .or(effective.cache_write_per_token);
+        }
+        effective
+    }
+
     /// Estimate uncached request cost for a request shape.
     #[must_use]
-    pub fn expected_cost(self, prompt_tokens: u64, output_tokens: u64) -> f64 {
-        let token_cost = self.prompt_per_token * tokens_as_f64(prompt_tokens)
-            + self.completion_per_token * tokens_as_f64(output_tokens);
+    pub fn expected_cost(&self, prompt_tokens: u64, output_tokens: u64) -> f64 {
+        let effective = self.effective(prompt_tokens);
+        let token_cost = effective.prompt_per_token * tokens_as_f64(prompt_tokens)
+            + effective.completion_per_token * tokens_as_f64(output_tokens);
         self.request + token_cost * (1.0 - self.discount.clamp(0.0, 1.0))
     }
 }
@@ -198,6 +250,7 @@ pub struct InferenceRequest {
     pub prompt: String,
     pub expected_output_tokens: u64,
     pub prompt_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
     pub requirements: RequestRequirements,
 }
 
@@ -213,6 +266,7 @@ impl InferenceRequest {
             prompt: prompt.into(),
             expected_output_tokens,
             prompt_tokens: None,
+            max_output_tokens: None,
             requirements: RequestRequirements::default(),
         }
     }

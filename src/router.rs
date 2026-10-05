@@ -17,14 +17,17 @@ fn supports_request(endpoint: &Endpoint, request: &InferenceRequest, prompt_toke
     if endpoint.status < 0 {
         return false;
     }
-    let total = prompt_tokens.saturating_add(request.expected_output_tokens);
+    let output_capacity = request
+        .max_output_tokens
+        .unwrap_or(request.expected_output_tokens);
+    let total = prompt_tokens.saturating_add(output_capacity);
     if endpoint.context_length.is_some_and(|limit| total > limit)
         || endpoint
             .max_prompt_tokens
             .is_some_and(|limit| prompt_tokens > limit)
         || endpoint
             .max_completion_tokens
-            .is_some_and(|limit| request.expected_output_tokens > limit)
+            .is_some_and(|limit| output_capacity > limit)
     {
         return false;
     }
@@ -89,11 +92,20 @@ fn expected_time(endpoint: &Endpoint, output_tokens: u64, tail: bool) -> Option<
     } else {
         endpoint.stats.latency_seconds.p75_or_interpolate()
     }?;
-    // Higher throughput percentiles are faster, so using p75 throughput as a
-    // tail estimate would be backwards. Until a provider publishes lower
-    // throughput percentiles, use median throughput and put the conservative
-    // percentile on TTFT/latency instead.
-    let throughput = endpoint.stats.throughput_tokens_per_second.p50?;
+    // OpenRouter's throughput percentile is a lower-bound service percentile:
+    // p75 means 75% of requests achieved at least that token rate. Pair the
+    // same percentile with TTFT to estimate an upper-middle end-to-end time.
+    let throughput = if tail {
+        endpoint
+            .stats
+            .throughput_tokens_per_second
+            .p95_or_interpolate()
+    } else {
+        endpoint
+            .stats
+            .throughput_tokens_per_second
+            .p75_or_interpolate()
+    }?;
     if throughput <= 0.0 || !throughput.is_finite() || latency < 0.0 || !latency.is_finite() {
         return None;
     }
@@ -126,6 +138,15 @@ pub fn build_route_plan(
     let prompt_tokens = request
         .prompt_tokens
         .unwrap_or_else(|| approximate_prompt_tokens(&request.prompt));
+    if request
+        .max_output_tokens
+        .is_some_and(|maximum| maximum < request.expected_output_tokens)
+    {
+        return Err(ProviderError::InvalidRequest(format!(
+            "max_output_tokens is smaller than expected_output_tokens for {}",
+            request.model
+        )));
+    }
 
     let multiplier = match strategy {
         RoutingStrategy::FastestResponseCheap(multiplier)

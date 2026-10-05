@@ -10,6 +10,8 @@ use crate::{
 pub enum ProviderError {
     #[error("no eligible endpoint: {0}")]
     NoEligibleEndpoint(String),
+    #[error("invalid inference request: {0}")]
+    InvalidRequest(String),
     #[error("invalid routing strategy: {0}")]
     InvalidStrategy(String),
     #[error("provider catalog error: {0}")]

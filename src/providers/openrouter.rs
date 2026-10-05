@@ -2,15 +2,15 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest,
-    InferenceResponse, Percentiles, Pricing, ProviderError, ReasoningEffort, ReasoningSupport,
-    ResponseSchema, RetryPolicy, RoutePlan,
+    InferenceResponse, Percentiles, Pricing, PricingOverride, ProviderError, ReasoningEffort,
+    ReasoningSupport, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan,
 };
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -23,6 +23,23 @@ pub struct OpenRouter {
     base_url: String,
     app_title: Option<String>,
     http_referer: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenRouterServiceTier {
+    Flex,
+    Priority,
+    Scale,
+}
+
+impl OpenRouterServiceTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Flex => "flex",
+            Self::Priority => "priority",
+            Self::Scale => "scale",
+        }
+    }
 }
 
 impl OpenRouter {
@@ -77,11 +94,54 @@ impl OpenRouter {
         ))
     }
 
-    fn provider_order(plan: &RoutePlan) -> Vec<String> {
-        plan.candidates
-            .iter()
-            .map(|candidate| candidate.endpoint.id.clone())
-            .collect()
+    fn service_tier(endpoint_id: &str) -> Option<OpenRouterServiceTier> {
+        match endpoint_id.rsplit_once('/').map(|(_, suffix)| suffix) {
+            Some("flex") => Some(OpenRouterServiceTier::Flex),
+            Some("priority") => Some(OpenRouterServiceTier::Priority),
+            Some("scale") => Some(OpenRouterServiceTier::Scale),
+            _ => None,
+        }
+    }
+
+    fn provider_selector(candidate: &RouteCandidate) -> String {
+        if Self::service_tier(&candidate.endpoint.id).is_some() {
+            candidate.endpoint.id.split_once('/').map_or_else(
+                || candidate.endpoint.id.clone(),
+                |(base, _)| base.to_owned(),
+            )
+        } else {
+            candidate.endpoint.id.clone()
+        }
+    }
+
+    fn route_batches(plan: &RoutePlan) -> Vec<Vec<&RouteCandidate>> {
+        let mut batches: Vec<Vec<&RouteCandidate>> = Vec::new();
+        for candidate in &plan.candidates {
+            let tier = Self::service_tier(&candidate.endpoint.id);
+            let append = batches.last().is_some_and(|batch| {
+                batch
+                    .first()
+                    .is_some_and(|first| Self::service_tier(&first.endpoint.id) == tier)
+            });
+            if append {
+                let index = batches.len() - 1;
+                batches[index].push(candidate);
+            } else {
+                batches.push(vec![candidate]);
+            }
+        }
+        batches
+    }
+
+    fn selectors(candidates: &[&RouteCandidate]) -> Vec<String> {
+        let mut selectors = Vec::new();
+        for candidate in candidates {
+            let selector = Self::provider_selector(candidate);
+            if !selectors.contains(&selector) {
+                selectors.push(selector);
+            }
+        }
+        selectors
     }
 
     fn response_format(schema: &ResponseSchema) -> Value {
@@ -102,43 +162,88 @@ impl OpenRouter {
         }
     }
 
-    fn compile_body(request: &InferenceRequest, plan: &RoutePlan) -> Value {
+    fn compile_body(
+        request: &InferenceRequest,
+        plan: &RoutePlan,
+        candidates: &[&RouteCandidate],
+    ) -> Value {
         let mut object = serde_json::Map::new();
         object.insert("model".to_owned(), json!(request.model));
         object.insert(
             "messages".to_owned(),
             json!([{"role": "user", "content": request.prompt}]),
         );
-        object.insert(
-            "max_completion_tokens".to_owned(),
-            json!(request.expected_output_tokens),
-        );
-        let order = Self::provider_order(plan);
-        let max_prompt_price = plan
-            .candidates
+        if let Some(maximum) = request.max_output_tokens {
+            let use_completion_name = candidates.first().is_some_and(|candidate| {
+                candidate
+                    .endpoint
+                    .capabilities
+                    .supported_parameters
+                    .contains("max_completion_tokens")
+            });
+            let key = if use_completion_name {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            object.insert(key.to_owned(), json!(maximum));
+        }
+
+        let selectors = Self::selectors(candidates);
+        let max_prompt_price = candidates
             .iter()
-            .map(|candidate| candidate.endpoint.pricing.prompt_per_token)
+            .map(|candidate| {
+                candidate
+                    .endpoint
+                    .pricing
+                    .effective(plan.prompt_tokens)
+                    .prompt_per_token
+            })
             .fold(0.0_f64, f64::max)
             * 1_000_000.0;
-        let max_completion_price = plan
-            .candidates
+        let max_completion_price = candidates
             .iter()
-            .map(|candidate| candidate.endpoint.pricing.completion_per_token)
+            .map(|candidate| {
+                candidate
+                    .endpoint
+                    .pricing
+                    .effective(plan.prompt_tokens)
+                    .completion_per_token
+            })
             .fold(0.0_f64, f64::max)
             * 1_000_000.0;
-        object.insert(
-            "provider".to_owned(),
+        let has_local_latency = candidates
+            .iter()
+            .any(|candidate| candidate.expected_response_p75_seconds.is_some());
+        let mut provider = serde_json::Map::new();
+        provider.insert("only".to_owned(), json!(selectors));
+        provider.insert("allow_fallbacks".to_owned(), json!(true));
+        provider.insert("require_parameters".to_owned(), json!(true));
+        provider.insert(
+            "max_price".to_owned(),
             json!({
-                "order": order,
-                "only": Self::provider_order(plan),
-                "allow_fallbacks": true,
-                "require_parameters": true,
-                "max_price": {
-                    "prompt": max_prompt_price,
-                    "completion": max_completion_price,
-                },
+                "prompt": max_prompt_price,
+                "completion": max_completion_price,
             }),
         );
+        if has_local_latency {
+            provider.insert("order".to_owned(), json!(Self::selectors(candidates)));
+        } else {
+            let sort = if request.expected_output_tokens <= 512 {
+                "latency"
+            } else {
+                "throughput"
+            };
+            provider.insert("sort".to_owned(), json!(sort));
+        }
+        object.insert("provider".to_owned(), Value::Object(provider));
+
+        if let Some(tier) = candidates
+            .first()
+            .and_then(|candidate| Self::service_tier(&candidate.endpoint.id))
+        {
+            object.insert("service_tier".to_owned(), json!(tier.as_str()));
+        }
         if let Some(schema) = request.requirements.response_schema.as_ref() {
             object.insert("response_format".to_owned(), Self::response_format(schema));
         }
@@ -159,6 +264,15 @@ impl OpenRouter {
 
     fn next_backoff(current: Duration, max: Duration) -> Duration {
         current.saturating_mul(2).min(max)
+    }
+
+    fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
     }
 }
 
@@ -199,8 +313,22 @@ struct OpenRouterPricing {
     completion: Option<String>,
     request: Option<String>,
     discount: Option<f64>,
-    cache_read: Option<String>,
-    cache_write: Option<String>,
+    #[serde(alias = "cache_read")]
+    input_cache_read: Option<String>,
+    #[serde(alias = "cache_write")]
+    input_cache_write: Option<String>,
+    overrides: Option<Vec<OpenRouterPricingOverride>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterPricingOverride {
+    min_prompt_tokens: u64,
+    prompt: Option<String>,
+    completion: Option<String>,
+    #[serde(alias = "cache_read")]
+    input_cache_read: Option<String>,
+    #[serde(alias = "cache_write")]
+    input_cache_write: Option<String>,
 }
 
 fn parse_price(value: Option<&str>) -> f64 {
@@ -237,14 +365,39 @@ impl OpenRouterEndpoint {
                 discount: self.pricing.discount.unwrap_or(0.0).clamp(0.0, 1.0),
                 cache_read_per_token: self
                     .pricing
-                    .cache_read
+                    .input_cache_read
                     .as_deref()
-                    .and_then(|v| v.parse().ok()),
+                    .and_then(|value| value.parse().ok()),
                 cache_write_per_token: self
                     .pricing
-                    .cache_write
+                    .input_cache_write
                     .as_deref()
-                    .and_then(|v| v.parse().ok()),
+                    .and_then(|value| value.parse().ok()),
+                overrides: self
+                    .pricing
+                    .overrides
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|override_| PricingOverride {
+                        min_prompt_tokens: override_.min_prompt_tokens,
+                        prompt_per_token: override_
+                            .prompt
+                            .as_deref()
+                            .and_then(|value| value.parse().ok()),
+                        completion_per_token: override_
+                            .completion
+                            .as_deref()
+                            .and_then(|value| value.parse().ok()),
+                        cache_read_per_token: override_
+                            .input_cache_read
+                            .as_deref()
+                            .and_then(|value| value.parse().ok()),
+                        cache_write_per_token: override_
+                            .input_cache_write
+                            .as_deref()
+                            .and_then(|value| value.parse().ok()),
+                    })
+                    .collect(),
             },
             stats: EndpointStats {
                 latency_seconds: self.latency_last_30m.unwrap_or_default(),
@@ -299,56 +452,68 @@ impl InferenceProvider for OpenRouter {
                 "retry.max_attempts must be at least 1".to_owned(),
             ));
         }
+        let batches = Self::route_batches(plan);
+        if batches.is_empty() {
+            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
+        }
         let url = format!("{}/chat/completions", self.base_url);
-        let body = Self::compile_body(request, plan);
         let mut backoff = retry.initial_backoff;
         let mut last_error = None;
 
         for attempt in 1..=retry.max_attempts {
-            match self
-                .request(reqwest::Method::POST, url.clone())
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => {
-                    let raw: Value = response
-                        .json()
-                        .await
-                        .map_err(|error| ProviderError::Response(error.to_string()))?;
-                    let content = raw
-                        .pointer("/choices/0/message/content")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    return Ok(InferenceResponse {
-                        content,
-                        model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
-                        provider: raw
-                            .get("provider")
+            let mut retry_after = None;
+            for batch in &batches {
+                let body = Self::compile_body(request, plan, batch);
+                match self
+                    .request(reqwest::Method::POST, url.clone())
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        let raw: Value = response
+                            .json()
+                            .await
+                            .map_err(|error| ProviderError::Response(error.to_string()))?;
+                        let content = raw
+                            .pointer("/choices/0/message/content")
                             .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        usage_cost_usd: raw.pointer("/usage/cost").and_then(Value::as_f64),
-                        raw,
-                    });
-                }
-                Ok(response) => {
-                    let status = response.status();
-                    let retryable = Self::retryable_status(status);
-                    let text = response.text().await.unwrap_or_default();
-                    last_error = Some(format!("HTTP {status}: {text}"));
-                    if !retryable || attempt == retry.max_attempts {
-                        break;
+                            .unwrap_or_default()
+                            .to_owned();
+                        return Ok(InferenceResponse {
+                            content,
+                            model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
+                            provider: raw
+                                .get("provider")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            usage_cost_usd: raw.pointer("/usage/cost").and_then(Value::as_f64),
+                            raw,
+                        });
                     }
-                }
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                    if attempt == retry.max_attempts {
-                        break;
+                    Ok(response) => {
+                        let status = response.status();
+                        retry_after = Self::retry_after(&response).or(retry_after);
+                        let retryable =
+                            Self::retryable_status(status) || status == StatusCode::NOT_FOUND;
+                        let text = response.text().await.unwrap_or_default();
+                        last_error = Some(format!("HTTP {status}: {text}"));
+                        if !retryable {
+                            return Err(ProviderError::Request(
+                                last_error.unwrap_or_else(|| "request failed".to_owned()),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        last_error = Some(error.to_string());
                     }
                 }
             }
-            sleep(backoff).await;
+            if attempt == retry.max_attempts {
+                break;
+            }
+            let delay = retry_after.unwrap_or(backoff).min(retry.max_backoff);
+            sleep(delay).await;
             backoff = Self::next_backoff(backoff, retry.max_backoff);
         }
 
@@ -369,6 +534,7 @@ mod tests {
             prompt: "hello".to_owned(),
             expected_output_tokens: 42,
             prompt_tokens: Some(5),
+            max_output_tokens: None,
             requirements: crate::RequestRequirements {
                 response_schema: Some(ResponseSchema::JsonSchema {
                     name: "answer".to_owned(),
@@ -405,11 +571,17 @@ mod tests {
                 expected_response_p95_seconds: None,
             }],
         };
-        let body = OpenRouter::compile_body(&request, &plan);
+        let body = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
         assert_eq!(
-            body.pointer("/provider/order/0").and_then(Value::as_str),
+            body.pointer("/provider/only/0").and_then(Value::as_str),
             Some("fast-provider/fp8")
         );
+        assert_eq!(
+            body.pointer("/provider/sort").and_then(Value::as_str),
+            Some("latency")
+        );
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("max_tokens").is_none());
         assert_eq!(
             body.pointer("/reasoning/effort").and_then(Value::as_str),
             Some("low")
@@ -419,5 +591,134 @@ mod tests {
                 .and_then(Value::as_str),
             Some("json_schema")
         );
+    }
+
+    #[test]
+    fn parses_shape_dependent_pricing_and_cache_fields() -> Result<(), serde_json::Error> {
+        let raw = json!({
+            "context_length": 1_050_000,
+            "max_completion_tokens": 128_000,
+            "max_prompt_tokens": 922_000,
+            "model_id": "openai/gpt-6-luna",
+            "name": "OpenAI: GPT-6 Luna (Flex)",
+            "pricing": {
+                "prompt": "0.00000005",
+                "completion": "0.00000025",
+                "input_cache_read": "0.000000005",
+                "input_cache_write": "0.0000000625",
+                "discount": 0,
+                "overrides": [{
+                    "min_prompt_tokens": 272_000,
+                    "prompt": "0.0000001",
+                    "completion": "0.000000375",
+                    "input_cache_read": "0.00000001",
+                    "input_cache_write": "0.000_000_125"
+                }]
+            },
+            "provider_name": "OpenAI",
+            "status": 0,
+            "supported_parameters": ["reasoning", "response_format", "structured_outputs"],
+            "supports_implicit_caching": false,
+            "tag": "openai/flex",
+            "uptime_last_30m": 99.9
+        });
+        let endpoint: OpenRouterEndpoint = serde_json::from_value(raw)?;
+        let normalized = endpoint.normalize("openai/gpt-6-luna");
+        assert_eq!(
+            normalized.pricing.effective(100_000).prompt_per_token,
+            0.000_000_05
+        );
+        assert_eq!(
+            normalized.pricing.effective(300_000).prompt_per_token,
+            0.000_000_1
+        );
+        assert_eq!(
+            normalized.pricing.effective(300_000).cache_read_per_token,
+            Some(0.000_000_01)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flex_endpoint_sets_service_tier_and_base_provider_selector() {
+        let request = InferenceRequest::new("openai/gpt-6-luna", "hello", 64);
+        let mut endpoint = Endpoint {
+            id: "openai/flex".to_owned(),
+            provider: "OpenAI".to_owned(),
+            model: request.model.clone(),
+            display_name: "Flex".to_owned(),
+            quantization: None,
+            status: 0,
+            context_length: Some(1_000_000),
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: Pricing::default(),
+            stats: EndpointStats::default(),
+            capabilities: EndpointCapabilities::default(),
+        };
+        endpoint
+            .capabilities
+            .supported_parameters
+            .insert("response_format".to_owned());
+        let plan = RoutePlan {
+            prompt_tokens: 5,
+            expected_output_tokens: 64,
+            cheapest_cost_usd: 0.0,
+            cost_ceiling_usd: 0.0,
+            candidates: vec![crate::RouteCandidate {
+                endpoint,
+                expected_cost_usd: 0.0,
+                expected_response_p75_seconds: None,
+                expected_response_p95_seconds: None,
+            }],
+        };
+        let body = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
+        assert_eq!(
+            body.get("service_tier").and_then(Value::as_str),
+            Some("flex")
+        );
+        assert_eq!(
+            body.pointer("/provider/only/0").and_then(Value::as_str),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn local_telemetry_uses_explicit_ranked_order() {
+        let request = InferenceRequest::new("vendor/model", "hello", 64);
+        let mut fast = Endpoint {
+            id: "fast/fp8".to_owned(),
+            provider: "Fast".to_owned(),
+            model: request.model.clone(),
+            display_name: "Fast".to_owned(),
+            quantization: Some("fp8".to_owned()),
+            status: 0,
+            context_length: Some(1_000_000),
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: Pricing::default(),
+            stats: EndpointStats::default(),
+            capabilities: EndpointCapabilities::default(),
+        };
+        fast.stats.latency_seconds.p75 = Some(0.2);
+        fast.stats.throughput_tokens_per_second.p75 = Some(100.0);
+        let plan = RoutePlan {
+            prompt_tokens: 5,
+            expected_output_tokens: 64,
+            cheapest_cost_usd: 0.0,
+            cost_ceiling_usd: 0.0,
+            candidates: vec![crate::RouteCandidate {
+                endpoint: fast,
+                expected_cost_usd: 0.0,
+                expected_response_p75_seconds: Some(0.84),
+                expected_response_p95_seconds: None,
+            }],
+        };
+        let body = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
+        assert_eq!(
+            body.pointer("/provider/order/0").and_then(Value::as_str),
+            Some("fast/fp8")
+        );
+        assert!(body.pointer("/provider/sort").is_none());
     }
 }
