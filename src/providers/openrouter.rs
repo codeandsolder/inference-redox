@@ -366,6 +366,28 @@ fn parse_price(value: Option<&str>) -> f64 {
     value.and_then(|value| value.parse().ok()).unwrap_or(0.0)
 }
 
+fn normalize_latency_seconds(mut latency: Percentiles) -> Percentiles {
+    // OpenRouter's per-model endpoint API currently emits some latency telemetry
+    // in milliseconds even though the documented normalized endpoint example is
+    // in seconds. Detect the live millisecond shape from a typical percentile;
+    // a >120 s p50/p75 would not be a useful interactive endpoint anyway.
+    let anchor = latency.p50.or(latency.p75).or(latency.p90);
+    if anchor.is_some_and(|value| value > 120.0) {
+        for value in [
+            &mut latency.p50,
+            &mut latency.p75,
+            &mut latency.p90,
+            &mut latency.p95,
+            &mut latency.p99,
+        ] {
+            if let Some(sample) = value.as_mut() {
+                *sample /= 1_000.0;
+            }
+        }
+    }
+    latency
+}
+
 impl OpenRouterEndpoint {
     fn normalize(self, requested_model: &str) -> Endpoint {
         let parameters: BTreeSet<String> = self
@@ -431,7 +453,9 @@ impl OpenRouterEndpoint {
                     .collect(),
             },
             stats: EndpointStats {
-                latency_seconds: self.latency_last_30m.unwrap_or_default(),
+                latency_seconds: normalize_latency_seconds(
+                    self.latency_last_30m.unwrap_or_default(),
+                ),
                 throughput_tokens_per_second: self.throughput_last_30m.unwrap_or_default(),
                 uptime_5m: self.uptime_last_5m,
                 uptime_30m: self.uptime_last_30m,
@@ -787,5 +811,32 @@ mod tests {
             Some("fast/fp8")
         );
         assert!(body.pointer("/provider/sort").is_none());
+    }
+
+    #[test]
+    fn normalizes_live_millisecond_latency_shape() {
+        let normalized = normalize_latency_seconds(Percentiles {
+            p50: Some(3109.5),
+            p75: Some(7074.75),
+            p90: Some(13656.5),
+            p95: None,
+            p99: Some(54984.87),
+        });
+        assert_eq!(normalized.p50, Some(3.1095));
+        assert_eq!(normalized.p75, Some(7.07475));
+        assert_eq!(normalized.p99, Some(54.98487));
+    }
+
+    #[test]
+    fn keeps_documented_second_latency_shape() {
+        let normalized = normalize_latency_seconds(Percentiles {
+            p50: Some(0.25),
+            p75: Some(0.35),
+            p90: Some(0.48),
+            p95: None,
+            p99: Some(0.85),
+        });
+        assert_eq!(normalized.p50, Some(0.25));
+        assert_eq!(normalized.p75, Some(0.35));
     }
 }
