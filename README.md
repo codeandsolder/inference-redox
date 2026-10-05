@@ -20,6 +20,8 @@ OpenRouter is the first backend. Its endpoint catalog is normalized into:
 
 The primary response-time estimate uses p75 TTFT plus median output throughput; OpenRouter latency telemetry is normalized when the live per-model API reports milliseconds rather than documented seconds; p95 TTFT is the tail guard, then expected cost breaks ties. Throughput uses p50 because OpenRouter endpoint surfaces have shown inconsistent throughput-percentile direction/semantics; median throughput avoids turning that presentation detail into a routing assumption. If endpoint telemetry is unavailable, the OpenRouter adapter keeps the cost/capability filter and delegates speed ordering back to OpenRouter (`latency` for short responses, `throughput` for larger ones). Tiered endpoints such as Flex are emitted using their native `service_tier` grammar and fall back across route batches automatically. Transport, HTTP 408/429/5xx, and routable endpoint failures are retried with `Retry-After` support.
 
+OpenRouter routing controls are compiled from catalog endpoint tags to provider slugs (`deepinfra/fp8` → `deepinfra`, `openai/flex` → `openai`) before emitting `provider.only` / `provider.order`; tier and quantization suffixes are endpoint metadata, not provider identifiers.
+
 `expected_output_tokens` is deliberately an estimate used for price and response-time selection, not a generation cap. Set `InferenceRequest::max_output_tokens` separately when a hard limit is actually desired.
 
 ```rust,no_run

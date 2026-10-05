@@ -122,14 +122,10 @@ impl OpenRouter {
     }
 
     fn provider_selector(candidate: &RouteCandidate) -> String {
-        if Self::service_tier(&candidate.endpoint.id).is_some() {
-            candidate.endpoint.id.split_once('/').map_or_else(
-                || candidate.endpoint.id.clone(),
-                |(base, _)| base.to_owned(),
-            )
-        } else {
-            candidate.endpoint.id.clone()
-        }
+        candidate.endpoint.id.split_once('/').map_or_else(
+            || candidate.endpoint.id.clone(),
+            |(provider, _)| provider.to_owned(),
+        )
     }
 
     fn route_batches(plan: &RoutePlan) -> Vec<Vec<&RouteCandidate>> {
@@ -693,7 +689,7 @@ mod tests {
         let body = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
         assert_eq!(
             body.pointer("/provider/only/0").and_then(Value::as_str),
-            Some("fast-provider/fp8")
+            Some("fast-provider")
         );
         assert_eq!(
             body.pointer("/provider/sort").and_then(Value::as_str),
@@ -845,7 +841,7 @@ mod tests {
         let body = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
         assert_eq!(
             body.pointer("/provider/order/0").and_then(Value::as_str),
-            Some("fast/fp8")
+            Some("fast")
         );
         assert!(body.pointer("/provider/sort").is_none());
     }
