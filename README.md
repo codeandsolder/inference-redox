@@ -18,7 +18,7 @@ OpenRouter is the first backend. Its endpoint catalog is normalized into:
 
 `latency + expected_output_tokens / throughput`
 
-The primary response-time estimate uses the p75 service percentile for both TTFT and output throughput; p95 is the tail guard, then expected cost breaks ties. If endpoint telemetry is unavailable, the OpenRouter adapter keeps the cost/capability filter and delegates speed ordering back to OpenRouter (`latency` for short responses, `throughput` for larger ones). Tiered endpoints such as Flex are emitted using their native `service_tier` grammar and fall back across route batches automatically. Transport, HTTP 408/429/5xx, and routable endpoint failures are retried with `Retry-After` support.
+The primary response-time estimate uses p75 TTFT plus median output throughput; p95 TTFT is the tail guard, then expected cost breaks ties. Throughput uses p50 because higher throughput percentiles are faster/optimistic samples and OpenRouter does not expose the lower-side percentile needed for a true p75 response-time bound. If endpoint telemetry is unavailable, the OpenRouter adapter keeps the cost/capability filter and delegates speed ordering back to OpenRouter (`latency` for short responses, `throughput` for larger ones). Tiered endpoints such as Flex are emitted using their native `service_tier` grammar and fall back across route batches automatically. Transport, HTTP 408/429/5xx, and routable endpoint failures are retried with `Retry-After` support.
 
 `expected_output_tokens` is deliberately an estimate used for price and response-time selection, not a generation cap. Set `InferenceRequest::max_output_tokens` separately when a hard limit is actually desired.
 

@@ -92,20 +92,11 @@ fn expected_time(endpoint: &Endpoint, output_tokens: u64, tail: bool) -> Option<
     } else {
         endpoint.stats.latency_seconds.p75_or_interpolate()
     }?;
-    // OpenRouter's throughput percentile is a lower-bound service percentile:
-    // p75 means 75% of requests achieved at least that token rate. Pair the
-    // same percentile with TTFT to estimate an upper-middle end-to-end time.
-    let throughput = if tail {
-        endpoint
-            .stats
-            .throughput_tokens_per_second
-            .p95_or_interpolate()
-    } else {
-        endpoint
-            .stats
-            .throughput_tokens_per_second
-            .p75_or_interpolate()
-    }?;
+    // Throughput percentiles run in the opposite desirability direction from
+    // latency: OpenRouter's p75/p95 throughput values are progressively faster
+    // (more optimistic) samples. The catalog does not expose p25/p05, so use
+    // median throughput and put the requested service percentile on TTFT.
+    let throughput = endpoint.stats.throughput_tokens_per_second.p50?;
     if throughput <= 0.0 || !throughput.is_finite() || latency < 0.0 || !latency.is_finite() {
         return None;
     }
