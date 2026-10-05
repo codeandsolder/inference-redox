@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, header::RETRY_AFTER};
@@ -353,7 +353,9 @@ struct OpenRouterPricing {
 
 #[derive(Debug, Deserialize)]
 struct OpenRouterPricingOverride {
-    min_prompt_tokens: u64,
+    min_prompt_tokens: Option<u64>,
+    utc_start: Option<u32>,
+    utc_end: Option<u32>,
     prompt: Option<String>,
     completion: Option<String>,
     #[serde(alias = "cache_read")]
@@ -364,6 +366,83 @@ struct OpenRouterPricingOverride {
 
 fn parse_price(value: Option<&str>) -> f64 {
     value.and_then(|value| value.parse().ok()).unwrap_or(0.0)
+}
+
+fn parse_optional_price(value: Option<&str>) -> Option<f64> {
+    value.and_then(|value| value.parse().ok())
+}
+
+fn utc_minutes_now() -> Option<u32> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    Some(((elapsed.as_secs() % 86_400) / 60) as u32)
+}
+
+fn hhmm_to_minutes(value: u32) -> Option<u32> {
+    let hours = value / 100;
+    let minutes = value % 100;
+    (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
+}
+
+fn utc_window_active(start_hhmm: u32, end_hhmm: u32, now_minutes: u32) -> bool {
+    let Some(start) = hhmm_to_minutes(start_hhmm) else {
+        return false;
+    };
+    let Some(end) = hhmm_to_minutes(end_hhmm) else {
+        return false;
+    };
+    if start == end {
+        true
+    } else if start < end {
+        (start..end).contains(&now_minutes)
+    } else {
+        now_minutes >= start || now_minutes < end
+    }
+}
+
+fn normalize_pricing(raw: OpenRouterPricing) -> Pricing {
+    let mut prompt_per_token = parse_price(raw.prompt.as_deref());
+    let mut completion_per_token = parse_price(raw.completion.as_deref());
+    let mut cache_read_per_token = parse_optional_price(raw.input_cache_read.as_deref());
+    let mut cache_write_per_token = parse_optional_price(raw.input_cache_write.as_deref());
+    let mut overrides = Vec::new();
+    let now_minutes = utc_minutes_now();
+
+    for override_ in raw.overrides.unwrap_or_default() {
+        if let Some(min_prompt_tokens) = override_.min_prompt_tokens {
+            overrides.push(PricingOverride {
+                min_prompt_tokens,
+                prompt_per_token: parse_optional_price(override_.prompt.as_deref()),
+                completion_per_token: parse_optional_price(override_.completion.as_deref()),
+                cache_read_per_token: parse_optional_price(override_.input_cache_read.as_deref()),
+                cache_write_per_token: parse_optional_price(override_.input_cache_write.as_deref()),
+            });
+            continue;
+        }
+        let active = match (override_.utc_start, override_.utc_end, now_minutes) {
+            (Some(start), Some(end), Some(now)) => utc_window_active(start, end, now),
+            _ => false,
+        };
+        if active {
+            prompt_per_token =
+                parse_optional_price(override_.prompt.as_deref()).unwrap_or(prompt_per_token);
+            completion_per_token = parse_optional_price(override_.completion.as_deref())
+                .unwrap_or(completion_per_token);
+            cache_read_per_token = parse_optional_price(override_.input_cache_read.as_deref())
+                .or(cache_read_per_token);
+            cache_write_per_token = parse_optional_price(override_.input_cache_write.as_deref())
+                .or(cache_write_per_token);
+        }
+    }
+
+    Pricing {
+        prompt_per_token,
+        completion_per_token,
+        request: parse_price(raw.request.as_deref()),
+        discount: raw.discount.unwrap_or(0.0).clamp(0.0, 1.0),
+        cache_read_per_token,
+        cache_write_per_token,
+        overrides,
+    }
 }
 
 fn normalize_latency_seconds(mut latency: Percentiles) -> Percentiles {
@@ -411,47 +490,7 @@ impl OpenRouterEndpoint {
             context_length: self.context_length,
             max_prompt_tokens: self.max_prompt_tokens,
             max_completion_tokens: self.max_completion_tokens,
-            pricing: Pricing {
-                prompt_per_token: parse_price(self.pricing.prompt.as_deref()),
-                completion_per_token: parse_price(self.pricing.completion.as_deref()),
-                request: parse_price(self.pricing.request.as_deref()),
-                discount: self.pricing.discount.unwrap_or(0.0).clamp(0.0, 1.0),
-                cache_read_per_token: self
-                    .pricing
-                    .input_cache_read
-                    .as_deref()
-                    .and_then(|value| value.parse().ok()),
-                cache_write_per_token: self
-                    .pricing
-                    .input_cache_write
-                    .as_deref()
-                    .and_then(|value| value.parse().ok()),
-                overrides: self
-                    .pricing
-                    .overrides
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|override_| PricingOverride {
-                        min_prompt_tokens: override_.min_prompt_tokens,
-                        prompt_per_token: override_
-                            .prompt
-                            .as_deref()
-                            .and_then(|value| value.parse().ok()),
-                        completion_per_token: override_
-                            .completion
-                            .as_deref()
-                            .and_then(|value| value.parse().ok()),
-                        cache_read_per_token: override_
-                            .input_cache_read
-                            .as_deref()
-                            .and_then(|value| value.parse().ok()),
-                        cache_write_per_token: override_
-                            .input_cache_write
-                            .as_deref()
-                            .and_then(|value| value.parse().ok()),
-                    })
-                    .collect(),
-            },
+            pricing: normalize_pricing(self.pricing),
             stats: EndpointStats {
                 latency_seconds: normalize_latency_seconds(
                     self.latency_last_30m.unwrap_or_default(),
@@ -838,5 +877,38 @@ mod tests {
         });
         assert_eq!(normalized.p50, Some(0.25));
         assert_eq!(normalized.p75, Some(0.35));
+    }
+
+    #[test]
+    fn utc_pricing_windows_handle_day_and_wraparound() {
+        assert!(utc_window_active(0, 1400, 13 * 60 + 59));
+        assert!(!utc_window_active(0, 1400, 14 * 60));
+        assert!(utc_window_active(1400, 0, 23 * 60 + 59));
+        assert!(!utc_window_active(1400, 0, 13 * 60 + 59));
+    }
+
+    #[test]
+    fn accepts_time_of_day_pricing_override_shape() -> Result<(), serde_json::Error> {
+        let raw = json!({
+            "context_length": 128000,
+            "model_id": "deepseek/deepseek-v4.1-flash",
+            "name": "Alibaba: DeepSeek V4.1 Flash",
+            "pricing": {
+                "prompt": "0.0000003", "completion": "0.0000012",
+                "input_cache_read": "0.00000003", "discount": 0,
+                "overrides": [
+                    {"utc_start": 0, "utc_end": 1400, "prompt": "0.0000003", "completion": "0.0000012", "input_cache_read": "0.00000003"},
+                    {"utc_start": 1400, "utc_end": 0, "prompt": "0.00000015", "completion": "0.0000006", "input_cache_read": "0.000000015"}
+                ]
+            },
+            "provider_name": "Alibaba", "status": 0,
+            "supported_parameters": ["reasoning", "response_format", "structured_outputs"],
+            "supports_implicit_caching": true, "tag": "alibaba", "uptime_last_30m": 99.9
+        });
+        let endpoint: OpenRouterEndpoint = serde_json::from_value(raw)?;
+        let normalized = endpoint.normalize("deepseek/deepseek-v4.1-flash");
+        assert!(normalized.pricing.prompt_per_token > 0.0);
+        assert!(normalized.pricing.completion_per_token > 0.0);
+        Ok(())
     }
 }
