@@ -247,10 +247,16 @@ impl Default for RequestRequirements {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub model: String,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
     pub prompt: String,
     pub expected_output_tokens: u64,
+    #[serde(default)]
     pub prompt_tokens: Option<u64>,
+    #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
     pub requirements: RequestRequirements,
 }
 
@@ -263,10 +269,12 @@ impl InferenceRequest {
     ) -> Self {
         Self {
             model: model.into(),
+            system_prompt: None,
             prompt: prompt.into(),
             expected_output_tokens,
             prompt_tokens: None,
             max_output_tokens: None,
+            temperature: None,
             requirements: RequestRequirements::default(),
         }
     }

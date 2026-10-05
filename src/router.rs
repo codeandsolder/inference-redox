@@ -126,9 +126,13 @@ pub fn build_route_plan(
     request: &InferenceRequest,
     endpoints: Vec<Endpoint>,
 ) -> Result<RoutePlan, ProviderError> {
-    let prompt_tokens = request
-        .prompt_tokens
-        .unwrap_or_else(|| approximate_prompt_tokens(&request.prompt));
+    let prompt_tokens = request.prompt_tokens.unwrap_or_else(|| {
+        let system_tokens = request
+            .system_prompt
+            .as_deref()
+            .map_or(0, approximate_prompt_tokens);
+        system_tokens.saturating_add(approximate_prompt_tokens(&request.prompt))
+    });
     if request
         .max_output_tokens
         .is_some_and(|maximum| maximum < request.expected_output_tokens)

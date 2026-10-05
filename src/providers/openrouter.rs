@@ -187,10 +187,12 @@ impl OpenRouter {
     ) -> Value {
         let mut object = serde_json::Map::new();
         object.insert("model".to_owned(), json!(request.model));
-        object.insert(
-            "messages".to_owned(),
-            json!([{"role": "user", "content": request.prompt}]),
-        );
+        let mut messages = Vec::with_capacity(2);
+        if let Some(system_prompt) = request.system_prompt.as_ref() {
+            messages.push(json!({"role": "system", "content": system_prompt}));
+        }
+        messages.push(json!({"role": "user", "content": request.prompt}));
+        object.insert("messages".to_owned(), Value::Array(messages));
         if let Some(maximum) = request.max_output_tokens {
             let use_completion_name = candidates.first().is_some_and(|candidate| {
                 candidate
@@ -265,11 +267,22 @@ impl OpenRouter {
         if let Some(schema) = request.requirements.response_schema.as_ref() {
             object.insert("response_format".to_owned(), Self::response_format(schema));
         }
+        if let Some(temperature) = request.temperature {
+            object.insert("temperature".to_owned(), json!(temperature));
+        }
         if request.requirements.reasoning != ReasoningEffort::None {
             object.insert(
                 "reasoning".to_owned(),
                 json!({"effort": request.requirements.reasoning.as_str()}),
             );
+        } else if candidates.iter().all(|candidate| {
+            candidate
+                .endpoint
+                .capabilities
+                .supported_parameters
+                .contains("reasoning")
+        }) {
+            object.insert("reasoning".to_owned(), json!({"enabled": false}));
         }
         Value::Object(object)
     }
@@ -574,10 +587,12 @@ mod tests {
     fn compiles_openrouter_provider_order_and_features() {
         let request = InferenceRequest {
             model: "openai/example".to_owned(),
+            system_prompt: Some("system".to_owned()),
             prompt: "hello".to_owned(),
             expected_output_tokens: 42,
             prompt_tokens: Some(5),
             max_output_tokens: None,
+            temperature: Some(0.0),
             requirements: crate::RequestRequirements {
                 response_schema: Some(ResponseSchema::JsonSchema {
                     name: "answer".to_owned(),
@@ -625,6 +640,15 @@ mod tests {
         );
         assert!(body.get("max_completion_tokens").is_none());
         assert!(body.get("max_tokens").is_none());
+        assert_eq!(
+            body.pointer("/messages/0/role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            body.pointer("/messages/1/role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(body.get("temperature").and_then(Value::as_f64), Some(0.0));
         assert_eq!(
             body.pointer("/reasoning/effort").and_then(Value::as_str),
             Some("low")
