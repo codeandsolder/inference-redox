@@ -289,6 +289,31 @@ impl OpenRouter {
             || status.is_server_error()
     }
 
+    fn embedded_error_retryable(error: &Value) -> bool {
+        let code = error.get("code").and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
+        });
+        if code.is_some_and(|code| code == 408 || code == 429 || code >= 500) {
+            return true;
+        }
+
+        error
+            .pointer("/metadata/error_type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "provider_unavailable"
+                        | "rate_limit_exceeded"
+                        | "server_error"
+                        | "service_unavailable"
+                        | "timeout"
+                )
+            })
+    }
+
     fn next_backoff(current: Duration, max: Duration) -> Duration {
         current.saturating_mul(2).min(max)
     }
@@ -588,13 +613,32 @@ impl InferenceProvider for OpenRouter {
                             .json()
                             .await
                             .map_err(|error| ProviderError::Response(error.to_string()))?;
-                        let content = raw
+                        if let Some(error) = raw.get("error") {
+                            let detail = format!("OpenRouter API error: {error}");
+                            if !Self::embedded_error_retryable(error) {
+                                return Err(ProviderError::Request(detail));
+                            }
+                            last_error = Some(detail);
+                            continue;
+                        }
+                        let Some(content) = raw
                             .pointer("/choices/0/message/content")
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned();
+                        else {
+                            last_error = Some(
+                                "OpenRouter success response omitted choices[0].message.content"
+                                    .to_owned(),
+                            );
+                            continue;
+                        };
+                        if content.is_empty() {
+                            last_error = Some(
+                                "OpenRouter success response returned empty message content".to_owned(),
+                            );
+                            continue;
+                        }
                         return Ok(InferenceResponse {
-                            content,
+                            content: content.to_owned(),
                             model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
                             provider: raw
                                 .get("provider")
@@ -639,6 +683,23 @@ impl InferenceProvider for OpenRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_embedded_openrouter_errors() {
+        assert!(OpenRouter::embedded_error_retryable(&json!({
+            "code": 502,
+            "message": "Flex processing is temporarily unavailable",
+            "metadata": {"error_type": "provider_unavailable"}
+        })));
+        assert!(OpenRouter::embedded_error_retryable(&json!({
+            "code": "429",
+            "message": "rate limited"
+        })));
+        assert!(!OpenRouter::embedded_error_retryable(&json!({
+            "code": 400,
+            "message": "bad request"
+        })));
+    }
 
     #[test]
     fn compiles_openrouter_provider_order_and_features() {
