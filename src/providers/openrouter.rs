@@ -633,7 +633,8 @@ impl InferenceProvider for OpenRouter {
                         };
                         if content.is_empty() {
                             last_error = Some(
-                                "OpenRouter success response returned empty message content".to_owned(),
+                                "OpenRouter success response returned empty message content"
+                                    .to_owned(),
                             );
                             continue;
                         }
