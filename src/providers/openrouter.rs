@@ -10,11 +10,12 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::{
-    ArtificialAnalysisBenchmarks, DesignArenaBenchmark, Endpoint, EndpointCapabilities,
-    EndpointStats, InferenceProvider, InferenceRequest, InferenceResponse, ModelArchitecture,
-    ModelBenchmarks, ModelCatalog, ModelCatalogEntry, ModelLookup, ModelReasoning, ModelRouteClass,
-    ModelTopProvider, Percentiles, Pricing, PricingOverride, ProviderError, ReasoningEffort,
-    ReasoningSupport, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan,
+    ArtificialAnalysisBenchmarks, BatchInferenceItem, BatchJob, DesignArenaBenchmark, Endpoint,
+    EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest, InferenceResponse,
+    ModelArchitecture, ModelBenchmarks, ModelCatalog, ModelCatalogEntry, ModelLookup,
+    ModelReasoning, ModelRouteClass, ModelTopProvider, Percentiles, Pricing, PricingOverride,
+    ProviderError, ReasoningEffort, ReasoningSupport, ResponseSchema, RetryPolicy, RouteCandidate,
+    RoutePlan,
 };
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -286,6 +287,225 @@ impl OpenRouter {
             object.insert("reasoning".to_owned(), json!({"enabled": false}));
         }
         Value::Object(object)
+    }
+
+    fn batch_base_model(batch_model: &str) -> Result<&str, ProviderError> {
+        batch_model.strip_suffix(":batch").ok_or_else(|| {
+            ProviderError::InvalidRequest(format!(
+                "OpenRouter batch submission requires a :batch model route, got {batch_model}"
+            ))
+        })
+    }
+
+    fn compile_batch_item_body(request: &InferenceRequest, model: &str) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert("model".to_owned(), json!(model));
+        let mut messages = Vec::with_capacity(2);
+        if let Some(system_prompt) = request.system_prompt.as_ref() {
+            messages.push(json!({"role": "system", "content": system_prompt}));
+        }
+        messages.push(json!({"role": "user", "content": request.prompt}));
+        object.insert("messages".to_owned(), Value::Array(messages));
+        if let Some(maximum) = request.max_output_tokens {
+            object.insert("max_tokens".to_owned(), json!(maximum));
+        }
+        if let Some(schema) = request.requirements.response_schema.as_ref() {
+            object.insert("response_format".to_owned(), Self::response_format(schema));
+        }
+        if let Some(temperature) = request.temperature {
+            object.insert("temperature".to_owned(), json!(temperature));
+        }
+        if request.requirements.reasoning != ReasoningEffort::None {
+            object.insert(
+                "reasoning".to_owned(),
+                json!({"effort": request.requirements.reasoning.as_str()}),
+            );
+        }
+        Value::Object(object)
+    }
+
+    fn compile_batch_submission(
+        batch_model: &str,
+        items: &[BatchInferenceItem],
+        provider_only: Option<&str>,
+    ) -> Result<Value, ProviderError> {
+        if items.is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "OpenRouter batch must contain at least one request".to_owned(),
+            ));
+        }
+        let model = Self::batch_base_model(batch_model)?;
+        let mut custom_ids = BTreeSet::new();
+        let requests = items
+            .iter()
+            .map(|item| {
+                if item.custom_id.trim().is_empty() {
+                    return Err(ProviderError::InvalidRequest(
+                        "batch custom_id must not be empty".to_owned(),
+                    ));
+                }
+                if !custom_ids.insert(item.custom_id.as_str()) {
+                    return Err(ProviderError::InvalidRequest(format!(
+                        "duplicate batch custom_id: {}",
+                        item.custom_id
+                    )));
+                }
+                Ok(json!({
+                    "custom_id": item.custom_id,
+                    "body": Self::compile_batch_item_body(&item.request, model),
+                }))
+            })
+            .collect::<Result<Vec<_>, ProviderError>>()?;
+        let mut body = serde_json::Map::new();
+        body.insert("endpoint".to_owned(), json!("/v1/chat/completions"));
+        body.insert("model".to_owned(), json!(model));
+        if let Some(provider) = provider_only {
+            if provider.trim().is_empty() {
+                return Err(ProviderError::InvalidRequest(
+                    "batch provider must not be empty".to_owned(),
+                ));
+            }
+            body.insert(
+                "provider".to_owned(),
+                json!({"only": [provider], "allow_fallbacks": false}),
+            );
+        }
+        body.insert("requests".to_owned(), Value::Array(requests));
+        Ok(Value::Object(body))
+    }
+
+    fn normalize_batch(raw: Value) -> Result<BatchJob, ProviderError> {
+        let id = raw
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Response("batch response omitted id".to_owned()))?
+            .to_owned();
+        let status = raw
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Response("batch response omitted status".to_owned()))?
+            .to_owned();
+        let results = raw.get("results").and_then(Value::as_array).cloned();
+        Ok(BatchJob {
+            id,
+            status,
+            results,
+            raw,
+        })
+    }
+
+    /// Submit asynchronous `OpenRouter` batch work. `batch_model` must be a catalog `:batch` route.
+    ///
+    /// # Errors
+    /// Returns an error for invalid batch input or an unsuccessful API response.
+    pub async fn submit_batch(
+        &self,
+        batch_model: &str,
+        items: &[BatchInferenceItem],
+    ) -> Result<BatchJob, ProviderError> {
+        let body = Self::compile_batch_submission(batch_model, items, None)?;
+        let response = self
+            .request(reqwest::Method::POST, format!("{}/batches", self.base_url))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Request(format!("HTTP {status}: {body}")));
+        }
+        let raw: Value = response
+            .json()
+            .await
+            .map_err(|error| ProviderError::Response(error.to_string()))?;
+        Self::normalize_batch(raw)
+    }
+
+    /// Submit a batch pinned to one `OpenRouter` provider slug.
+    ///
+    /// # Errors
+    /// Returns an error for invalid input or when the pinned provider has no eligible batch route.
+    pub async fn submit_batch_to_provider(
+        &self,
+        batch_model: &str,
+        provider: &str,
+        items: &[BatchInferenceItem],
+    ) -> Result<BatchJob, ProviderError> {
+        let body = Self::compile_batch_submission(batch_model, items, Some(provider))?;
+        let response = self
+            .request(reqwest::Method::POST, format!("{}/batches", self.base_url))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Request(format!("HTTP {status}: {body}")));
+        }
+        let raw: Value = response
+            .json()
+            .await
+            .map_err(|error| ProviderError::Response(error.to_string()))?;
+        Self::normalize_batch(raw)
+    }
+
+    /// Fetch current asynchronous batch state and inlined results when completed.
+    ///
+    /// # Errors
+    /// Returns an error when the batch cannot be fetched or decoded.
+    pub async fn batch(&self, batch_id: &str) -> Result<BatchJob, ProviderError> {
+        if batch_id.trim().is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "batch id must not be empty".to_owned(),
+            ));
+        }
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                format!("{}/batches/{batch_id}", self.base_url),
+            )
+            .send()
+            .await
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Request(format!("HTTP {status}: {body}")));
+        }
+        let raw: Value = response
+            .json()
+            .await
+            .map_err(|error| ProviderError::Response(error.to_string()))?;
+        Self::normalize_batch(raw)
+    }
+
+    /// Delete retained `OpenRouter` batch inputs/results. This is also the cleanup primitive for
+    /// jobs no longer needed by a standing-task queue.
+    ///
+    /// # Errors
+    /// Returns an error when `OpenRouter` rejects the delete request.
+    pub async fn delete_batch(&self, batch_id: &str) -> Result<(), ProviderError> {
+        if batch_id.trim().is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "batch id must not be empty".to_owned(),
+            ));
+        }
+        let response = self
+            .request(
+                reqwest::Method::DELETE,
+                format!("{}/batches/{batch_id}", self.base_url),
+            )
+            .send()
+            .await
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Request(format!("HTTP {status}: {body}")));
+        }
+        Ok(())
     }
 
     fn retryable_status(status: StatusCode) -> bool {
@@ -756,6 +976,7 @@ impl OpenRouterEndpoint {
             id,
             provider: self.provider_name.unwrap_or_else(|| "unknown".to_owned()),
             model: self.model_id.unwrap_or_else(|| requested_model.to_owned()),
+            route_class: catalog_route_class(requested_model).unwrap_or(ModelRouteClass::Standard),
             display_name: self.name.unwrap_or_else(|| requested_model.to_owned()),
             quantization: self.quantization,
             status: self.status.unwrap_or(0),
@@ -996,6 +1217,7 @@ mod tests {
             id: "fast-provider/fp8".to_owned(),
             provider: "Fast Provider".to_owned(),
             model: request.model.clone(),
+            route_class: ModelRouteClass::Standard,
             display_name: "Fast".to_owned(),
             quantization: Some("fp8".to_owned()),
             status: 0,
@@ -1047,6 +1269,95 @@ mod tests {
                 .and_then(Value::as_str),
             Some("json_schema")
         );
+    }
+
+    #[test]
+    fn compiles_documented_batch_submission_shape() -> Result<(), ProviderError> {
+        let mut request = InferenceRequest::new("ignored/by/batch", "summarize", 64);
+        request.system_prompt = Some("datasheet parser".to_owned());
+        request.max_output_tokens = Some(128);
+        request.requirements.response_schema = Some(ResponseSchema::JsonObject);
+        let body = OpenRouter::compile_batch_submission(
+            "openai/gpt-6-luna:batch",
+            &[BatchInferenceItem {
+                custom_id: "sheet-1".to_owned(),
+                request,
+            }],
+            None,
+        )?;
+        assert_eq!(
+            body.get("endpoint").and_then(Value::as_str),
+            Some("/v1/chat/completions")
+        );
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("openai/gpt-6-luna")
+        );
+        assert_eq!(
+            body.pointer("/requests/0/body/model")
+                .and_then(Value::as_str),
+            Some("openai/gpt-6-luna")
+        );
+        assert_eq!(
+            body.pointer("/requests/0/body/response_format/type")
+                .and_then(Value::as_str),
+            Some("json_object")
+        );
+        let pinned = OpenRouter::compile_batch_submission(
+            "openai/gpt-6-luna:batch",
+            &[BatchInferenceItem {
+                custom_id: "sheet-2".to_owned(),
+                request: InferenceRequest::new("ignored", "summarize", 64),
+            }],
+            Some("azure"),
+        )?;
+        assert_eq!(
+            pinned.pointer("/provider/only/0").and_then(Value::as_str),
+            Some("azure")
+        );
+        assert_eq!(
+            pinned
+                .pointer("/provider/allow_fallbacks")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_submission_requires_unique_ids_and_batch_route() {
+        let request = InferenceRequest::new("x", "x", 1);
+        let duplicate = vec![
+            BatchInferenceItem {
+                custom_id: "same".to_owned(),
+                request: request.clone(),
+            },
+            BatchInferenceItem {
+                custom_id: "same".to_owned(),
+                request,
+            },
+        ];
+        assert!(matches!(
+            OpenRouter::compile_batch_submission("openai/gpt-6-luna:batch", &duplicate, None),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            OpenRouter::compile_batch_submission("openai/gpt-6-luna", &duplicate[..1], None),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn normalizes_terminal_batch_state() -> Result<(), ProviderError> {
+        let batch = OpenRouter::normalize_batch(json!({
+            "id": "batch-1",
+            "status": "completed",
+            "results": [{"custom_id": "sheet-1", "response": {"status_code": 200}}]
+        }))?;
+        assert!(batch.is_terminal());
+        assert!(batch.is_success());
+        assert_eq!(batch.results.as_ref().map(Vec::len), Some(1));
+        Ok(())
     }
 
     #[test]
@@ -1189,6 +1500,7 @@ mod tests {
             id: "openai/flex".to_owned(),
             provider: "OpenAI".to_owned(),
             model: request.model.clone(),
+            route_class: ModelRouteClass::Standard,
             display_name: "Flex".to_owned(),
             quantization: None,
             status: 0,
@@ -1235,6 +1547,7 @@ mod tests {
             id: "fast/fp8".to_owned(),
             provider: "Fast".to_owned(),
             model: request.model.clone(),
+            route_class: ModelRouteClass::Standard,
             display_name: "Fast".to_owned(),
             quantization: Some("fp8".to_owned()),
             status: 0,

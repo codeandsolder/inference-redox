@@ -343,6 +343,7 @@ mod tests {
             id: id.to_owned(),
             provider: "provider".to_owned(),
             model: model.to_owned(),
+            route_class: crate::ModelRouteClass::Standard,
             display_name: id.to_owned(),
             quantization: None,
             status: 0,

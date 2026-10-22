@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use inference_redox::providers::{nvidia::NvidiaNim, openrouter::OpenRouter};
 use inference_redox::{
-    InferenceProvider, InferenceRequest, ModelCatalog, ProviderError, RetryPolicy, RoutingStrategy,
+    BatchInferenceItem, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
+    ProviderError, RetryPolicy, RoutingStrategy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,16 +15,21 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Operation {
     Infer,
     Route,
+    InferPool,
+    RoutePool,
     Models,
     ResolveModel,
+    SubmitBatch,
+    BatchStatus,
+    DeleteBatch,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 struct WireRetryPolicy {
     max_attempts: Option<u32>,
     initial_backoff_ms: Option<u64>,
@@ -53,6 +59,14 @@ struct WireRequest {
     request: Option<InferenceRequest>,
     #[serde(default)]
     query: Option<String>,
+    #[serde(default)]
+    batch_model: Option<String>,
+    #[serde(default)]
+    batch_items: Option<Vec<BatchInferenceItem>>,
+    #[serde(default)]
+    batch_provider: Option<String>,
+    #[serde(default)]
+    batch_id: Option<String>,
     #[serde(default)]
     fastest_response_cheap: Option<f64>,
     retry: Option<WireRetryPolicy>,
@@ -88,6 +102,15 @@ impl Providers {
         }
         Ok(catalog)
     }
+
+    fn pool(&self) -> InferencePool {
+        let mut pool = InferencePool::new();
+        pool.register("openrouter", Arc::clone(&self.openrouter));
+        if let Some(nvidia) = self.nvidia.as_ref() {
+            pool.register("nvidia", Arc::clone(nvidia));
+        }
+        pool
+    }
 }
 
 async fn write_json<T: Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
@@ -112,21 +135,17 @@ async fn write_error(stdout: &Arc<Mutex<tokio::io::Stdout>>, id: Value, error: i
     .await;
 }
 
-async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, request: WireRequest) {
-    let WireRequest {
-        id,
-        op,
-        request,
-        query,
-        fastest_response_cheap,
-        retry,
-    } = request;
-
+async fn handle_catalog_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let WireRequest { id, op, query, .. } = wire;
     match op {
         Operation::Models => match providers.catalog().await {
             Ok(catalog) => {
                 write_json(
-                    &stdout,
+                    stdout,
                     &WireSuccess {
                         id,
                         ok: true,
@@ -135,17 +154,17 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
                 )
                 .await;
             }
-            Err(error) => write_error(&stdout, id, error.to_string()).await,
+            Err(error) => write_error(stdout, id, error.to_string()).await,
         },
         Operation::ResolveModel => {
             let Some(query) = query else {
-                write_error(&stdout, id, "resolve_model requires query").await;
+                write_error(stdout, id, "resolve_model requires query").await;
                 return;
             };
             match providers.catalog().await {
                 Ok(catalog) => {
                     write_json(
-                        &stdout,
+                        stdout,
                         &WireSuccess {
                             id,
                             ok: true,
@@ -154,62 +173,255 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
                     )
                     .await;
                 }
-                Err(error) => write_error(&stdout, id, error.to_string()).await,
+                Err(error) => write_error(stdout, id, error.to_string()).await,
             }
         }
-        Operation::Route | Operation::Infer => {
-            let Some(request) = request else {
-                write_error(&stdout, id, "route/infer requires request").await;
+        _ => {}
+    }
+}
+
+async fn handle_batch_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let WireRequest {
+        id,
+        op,
+        batch_model,
+        batch_items,
+        batch_provider,
+        batch_id,
+        ..
+    } = wire;
+    match op {
+        Operation::SubmitBatch => {
+            let Some(batch_model) = batch_model else {
+                write_error(stdout, id, "submit_batch requires batch_model").await;
                 return;
             };
-            let Some(multiplier) = fastest_response_cheap else {
-                write_error(&stdout, id, "route/infer requires fastest_response_cheap").await;
+            let Some(batch_items) = batch_items else {
+                write_error(stdout, id, "submit_batch requires batch_items").await;
                 return;
             };
-            let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
-            match op {
-                Operation::Route => {
-                    let result = match providers.openrouter.endpoints(&request.model).await {
-                        Ok(endpoints) => {
-                            inference_redox::build_route_plan(strategy, &request, endpoints)
-                        }
-                        Err(error) => Err(error),
-                    };
-                    match result {
-                        Ok(route) => {
-                            write_json(
-                                &stdout,
-                                &WireSuccess {
-                                    id,
-                                    ok: true,
-                                    result: route,
-                                },
-                            )
-                            .await;
-                        }
-                        Err(error) => write_error(&stdout, id, error.to_string()).await,
-                    }
+            let result = if let Some(provider) = batch_provider.as_deref() {
+                providers
+                    .openrouter
+                    .submit_batch_to_provider(&batch_model, provider, &batch_items)
+                    .await
+            } else {
+                providers
+                    .openrouter
+                    .submit_batch(&batch_model, &batch_items)
+                    .await
+            };
+            match result {
+                Ok(batch) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: batch,
+                        },
+                    )
+                    .await;
                 }
-                Operation::Infer => {
-                    let retry =
-                        retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
-                    match providers.openrouter.infer(strategy, &request, retry).await {
-                        Ok((route, response)) => {
-                            write_json(
-                                &stdout,
-                                &WireSuccess {
-                                    id,
-                                    ok: true,
-                                    result: serde_json::json!({"route": route, "response": response}),
-                                },
-                            )
-                            .await;
-                        }
-                        Err(error) => write_error(&stdout, id, error.to_string()).await,
-                    }
-                }
-                Operation::Models | Operation::ResolveModel => {}
+                Err(error) => write_error(stdout, id, error.to_string()).await,
             }
+        }
+        Operation::BatchStatus => {
+            let Some(batch_id) = batch_id else {
+                write_error(stdout, id, "batch_status requires batch_id").await;
+                return;
+            };
+            match providers.openrouter.batch(&batch_id).await {
+                Ok(batch) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: batch,
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        Operation::DeleteBatch => {
+            let Some(batch_id) = batch_id else {
+                write_error(stdout, id, "delete_batch requires batch_id").await;
+                return;
+            };
+            match providers.openrouter.delete_batch(&batch_id).await {
+                Ok(()) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: serde_json::json!({"deleted": true}),
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_pool_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let WireRequest {
+        id,
+        op,
+        request,
+        fastest_response_cheap,
+        retry,
+        ..
+    } = wire;
+    let Some(request) = request else {
+        write_error(stdout, id, "route_pool/infer_pool requires request").await;
+        return;
+    };
+    let Some(multiplier) = fastest_response_cheap else {
+        write_error(
+            stdout,
+            id,
+            "route_pool/infer_pool requires fastest_response_cheap",
+        )
+        .await;
+        return;
+    };
+    let catalog = match providers.catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            write_error(stdout, id, error.to_string()).await;
+            return;
+        }
+    };
+    let pool = providers.pool();
+    let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
+    match op {
+        Operation::RoutePool => match pool.route(&catalog, strategy, &request).await {
+            Ok(route) => {
+                write_json(
+                    stdout,
+                    &WireSuccess {
+                        id,
+                        ok: true,
+                        result: route,
+                    },
+                )
+                .await;
+            }
+            Err(error) => write_error(stdout, id, error.to_string()).await,
+        },
+        Operation::InferPool => {
+            let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
+            match pool.infer(&catalog, strategy, &request, retry).await {
+                Ok(result) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result,
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_openrouter_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let WireRequest {
+        id,
+        op,
+        request,
+        fastest_response_cheap,
+        retry,
+        ..
+    } = wire;
+    let Some(request) = request else {
+        write_error(stdout, id, "route/infer requires request").await;
+        return;
+    };
+    let Some(multiplier) = fastest_response_cheap else {
+        write_error(stdout, id, "route/infer requires fastest_response_cheap").await;
+        return;
+    };
+    let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
+    match op {
+        Operation::Route => {
+            let result = match providers.openrouter.endpoints(&request.model).await {
+                Ok(endpoints) => inference_redox::build_route_plan(strategy, &request, endpoints),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(route) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: route,
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        Operation::Infer => {
+            let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
+            match providers.openrouter.infer(strategy, &request, retry).await {
+                Ok((route, response)) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: serde_json::json!({"route": route, "response": response}),
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, request: WireRequest) {
+    match request.op {
+        Operation::Models | Operation::ResolveModel => {
+            handle_catalog_operation(&providers, &stdout, request).await;
+        }
+        Operation::SubmitBatch | Operation::BatchStatus | Operation::DeleteBatch => {
+            handle_batch_operation(&providers, &stdout, request).await;
+        }
+        Operation::RoutePool | Operation::InferPool => {
+            handle_pool_operation(&providers, &stdout, request).await;
+        }
+        Operation::Route | Operation::Infer => {
+            handle_openrouter_operation(&providers, &stdout, request).await;
         }
     }
 }
@@ -275,7 +487,10 @@ fn load_api_keys() -> Result<(String, Option<String>), Box<dyn std::error::Error
         .ok_or(
             "OPENROUTER_API_KEY is unset; pass --env-file <path> or set the environment variable",
         )?;
-    let nvidia = environment_key("NVIDIA_API_KEY").or(from_file("NVIDIA_API_KEY")?);
+    let nvidia = environment_key("NVIDIA_API_KEY")
+        .or_else(|| environment_key("NVIDIA_API_key"))
+        .or(from_file("NVIDIA_API_KEY")?)
+        .or(from_file("NVIDIA_API_key")?);
     Ok((openrouter, nvidia))
 }
 
@@ -331,6 +546,10 @@ mod tests {
         assert_eq!(
             key_from_contents(contents, "NVIDIA_API_KEY").as_deref(),
             Some("nv-key")
+        );
+        assert_eq!(
+            key_from_contents("NVIDIA_API_key=legacy", "NVIDIA_API_key").as_deref(),
+            Some("legacy")
         );
     }
 }

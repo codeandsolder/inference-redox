@@ -90,7 +90,12 @@ This is intentionally not an availability model. A provider can advertise a mode
 
 Capabilities have three independent evidence layers. `adapter_parameters` says what inference-redox can actually encode on the wire; `supported_parameters` is the provider/catalog's nominal claim; versioned conformance observations can verify or reject claims for one execution-surface/provider/model scope. Effective support requires adapter support and either a provider claim or successful probe, while a failed probe vetoes both. This prevents optimistic provider metadata from advertising features the adapter cannot even send yet. Transient HTTP errors remain inconclusive rather than becoming negative capability evidence.
 
-The stdio bridge exposes `models` and `resolve_model` operations alongside `route` and `infer`, so long-lived callers can keep the catalog cache warm and share one normalization layer.
+The stdio bridge exposes `models` and `resolve_model` alongside the existing OpenRouter-only `route` / `infer`. Experimental `route_pool` / `infer_pool` operations resolve canonical identity into native OpenRouter/NVIDIA routes and rank them together; keeping these opt-in avoids changing production callers before direct-provider health/quota learning is mature. Interactive requests admit standard + free routes by default. Batch is opt-in and cannot pass through synchronous `infer_pool`.
+
+
+## Batch execution
+
+Batch is a first-class asynchronous execution class, not a slow synchronous model variant. OpenRouter `:batch` catalog routes participate in cost/capability planning only when the request explicitly admits `batch`. `OpenRouter::submit_batch` strips the catalog suffix to the underlying model, submits independent custom-ID requests to `/batches`, and exposes status/result fetch plus deletion. The stdio bridge mirrors this as `submit_batch`, `batch_status`, and `delete_batch`. Inputs are compiled through the same normalized chat/system/schema/reasoning request model, but synchronous inference rejects batch admission rather than pretending an asynchronous job is a completion.
 
 ## Provider architecture
 

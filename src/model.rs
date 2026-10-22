@@ -4,6 +4,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ModelRouteClass;
+
 #[allow(clippy::cast_precision_loss)]
 fn tokens_as_f64(tokens: u64) -> f64 {
     tokens as f64
@@ -250,6 +252,7 @@ pub struct Endpoint {
     pub id: String,
     pub provider: String,
     pub model: String,
+    pub route_class: ModelRouteClass,
     pub display_name: String,
     pub quantization: Option<String>,
     pub status: i32,
@@ -264,15 +267,22 @@ pub struct Endpoint {
 /// Feature constraints applied before route ranking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestRequirements {
+    #[serde(default = "default_allowed_route_classes")]
+    pub allowed_route_classes: BTreeSet<ModelRouteClass>,
     pub response_schema: Option<ResponseSchema>,
     pub reasoning: ReasoningEffort,
     pub required_parameters: BTreeSet<String>,
     pub minimum_uptime_30m: Option<f64>,
 }
 
+fn default_allowed_route_classes() -> BTreeSet<ModelRouteClass> {
+    BTreeSet::from([ModelRouteClass::Standard, ModelRouteClass::Free])
+}
+
 impl Default for RequestRequirements {
     fn default() -> Self {
         Self {
+            allowed_route_classes: default_allowed_route_classes(),
             response_schema: None,
             reasoning: ReasoningEffort::None,
             required_parameters: BTreeSet::new(),

@@ -220,6 +220,7 @@ impl InferenceProvider for NvidiaNim {
             id: "nvidia".to_owned(),
             provider: "NVIDIA NIM".to_owned(),
             model: model.to_owned(),
+            route_class: ModelRouteClass::Free,
             display_name: model.to_owned(),
             quantization: None,
             status: 0,

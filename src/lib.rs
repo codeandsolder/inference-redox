@@ -1,14 +1,17 @@
 #![doc = "Provider-agnostic inference routing with shape-aware endpoint selection."]
 
+mod batch;
 mod catalog;
 mod conformance;
 mod inventory;
 mod model;
+mod pool;
 mod provider;
 mod router;
 
 pub mod providers;
 
+pub use batch::{BatchInferenceItem, BatchJob};
 pub use catalog::{
     ArtificialAnalysisBenchmarks, DesignArenaBenchmark, ModelArchitecture, ModelBenchmarks,
     ModelCatalog, ModelCatalogEntry, ModelLookup, ModelMatchKind, ModelReasoning, ModelRouteClass,
@@ -26,5 +29,6 @@ pub use model::{
     InferenceResponse, Percentiles, Pricing, PricingOverride, ReasoningEffort, ReasoningSupport,
     RequestRequirements, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy,
 };
+pub use pool::{InferencePool, PooledInferenceResponse};
 pub use provider::{InferenceProvider, ProviderError};
 pub use router::{approximate_prompt_tokens, build_route_plan};

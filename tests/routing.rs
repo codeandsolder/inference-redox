@@ -14,6 +14,7 @@ fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f6
         id: id.to_owned(),
         provider: id.to_owned(),
         model: "x/model".to_owned(),
+        route_class: inference_redox::ModelRouteClass::Standard,
         display_name: id.to_owned(),
         quantization: None,
         status: 0,
@@ -325,5 +326,29 @@ fn expected_output_is_not_a_hard_limit() -> Result<(), inference_redox::Provider
         ),
         Err(inference_redox::ProviderError::InvalidRequest(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn missing_route_class_policy_deserializes_to_interactive_default() -> Result<(), serde_json::Error>
+{
+    let request: InferenceRequest = serde_json::from_value(json!({
+        "model": "x/model",
+        "prompt": "x",
+        "expected_output_tokens": 8,
+        "requirements": {
+            "response_schema": null,
+            "reasoning": "none",
+            "required_parameters": [],
+            "minimum_uptime_30m": null
+        }
+    }))?;
+    assert_eq!(
+        request.requirements.allowed_route_classes,
+        BTreeSet::from([
+            inference_redox::ModelRouteClass::Standard,
+            inference_redox::ModelRouteClass::Free,
+        ])
+    );
     Ok(())
 }

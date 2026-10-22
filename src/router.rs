@@ -14,7 +14,12 @@ pub fn approximate_prompt_tokens(prompt: &str) -> u64 {
 }
 
 fn supports_request(endpoint: &Endpoint, request: &InferenceRequest, prompt_tokens: u64) -> bool {
-    if endpoint.status < 0 {
+    if endpoint.status < 0
+        || !request
+            .requirements
+            .allowed_route_classes
+            .contains(&endpoint.route_class)
+    {
         return false;
     }
     let output_capacity = request
