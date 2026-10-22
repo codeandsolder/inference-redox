@@ -13,7 +13,23 @@ pub fn approximate_prompt_tokens(prompt: &str) -> u64 {
     bytes.div_ceil(4).max(1)
 }
 
-fn supports_request(endpoint: &Endpoint, request: &InferenceRequest, prompt_tokens: u64) -> bool {
+/// Resolve the prompt-token estimate used consistently by routing and quota admission.
+#[must_use]
+pub fn request_prompt_tokens(request: &InferenceRequest) -> u64 {
+    request.prompt_tokens.unwrap_or_else(|| {
+        let system_tokens = request
+            .system_prompt
+            .as_deref()
+            .map_or(0, approximate_prompt_tokens);
+        system_tokens.saturating_add(approximate_prompt_tokens(&request.prompt))
+    })
+}
+
+pub(crate) fn supports_request(
+    endpoint: &Endpoint,
+    request: &InferenceRequest,
+    prompt_tokens: u64,
+) -> bool {
     if endpoint.status < 0
         || !request
             .requirements
@@ -134,13 +150,7 @@ pub fn build_route_plan(
     request: &InferenceRequest,
     endpoints: Vec<Endpoint>,
 ) -> Result<RoutePlan, ProviderError> {
-    let prompt_tokens = request.prompt_tokens.unwrap_or_else(|| {
-        let system_tokens = request
-            .system_prompt
-            .as_deref()
-            .map_or(0, approximate_prompt_tokens);
-        system_tokens.saturating_add(approximate_prompt_tokens(&request.prompt))
-    });
+    let prompt_tokens = request_prompt_tokens(request);
     if request
         .max_output_tokens
         .is_some_and(|maximum| maximum < request.expected_output_tokens)

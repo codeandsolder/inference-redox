@@ -2,11 +2,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
+use crate::router::supports_request;
 use crate::{
     InferenceProvider, InferenceRequest, InferenceResponse, ModelCatalog, ModelLookup,
-    ModelRouteClass, ProviderError, RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy,
-    build_route_plan,
+    ModelRouteClass, ProviderError, QuotaAdmission, QuotaAdmissionReport, QuotaAwareRoutePlan,
+    QuotaDemand, QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy, RouteCandidate,
+    RoutePlan, RoutingStrategy, build_route_plan, request_prompt_tokens,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,6 +39,17 @@ pub struct PooledInferenceResponse {
     pub plan: RoutePlan,
     pub selected: RouteCandidate,
     pub response: InferenceResponse,
+}
+
+#[derive(Debug, Error)]
+pub enum QuotaRoutingError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error("no quota-admissible endpoint for {model}")]
+    NoQuotaAdmissible {
+        model: String,
+        reports: Box<Vec<QuotaAdmissionReport>>,
+    },
 }
 
 impl InferencePool {
@@ -156,6 +170,54 @@ impl InferencePool {
     ) -> Result<RoutePlan, ProviderError> {
         let endpoints = self.endpoints(catalog, request).await?;
         build_route_plan(strategy, request, endpoints)
+    }
+
+    /// Build a route plan after quota filtering, before computing the request cost floor.
+    ///
+    /// # Errors
+    /// Returns provider/routing errors normally, or a quota-specific failure carrying every
+    /// shape-eligible route's admission report when quota removes all candidates.
+    pub async fn route_with_quota(
+        &self,
+        catalog: &ModelCatalog,
+        strategy: RoutingStrategy,
+        request: &InferenceRequest,
+        ledger: &QuotaLedger,
+        unknown_policy: QuotaUnknownPolicy,
+        now_unix: u64,
+    ) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
+        let endpoints = self.endpoints(catalog, request).await?;
+        let prompt_tokens = request_prompt_tokens(request);
+        let demand = QuotaDemand::for_request(request, prompt_tokens);
+        let mut quota_reports = Vec::new();
+        let mut admitted = Vec::new();
+        for endpoint in endpoints
+            .into_iter()
+            .filter(|endpoint| supports_request(endpoint, request, prompt_tokens))
+        {
+            let report =
+                ledger.evaluate(&QuotaRouteKey::from_endpoint(&endpoint), demand, now_unix);
+            let keep = match report.admission {
+                QuotaAdmission::Admitted => true,
+                QuotaAdmission::Indeterminate => unknown_policy == QuotaUnknownPolicy::Allow,
+                QuotaAdmission::Rejected => false,
+            };
+            if keep {
+                admitted.push(endpoint);
+            }
+            quota_reports.push(report);
+        }
+        if admitted.is_empty() {
+            return Err(QuotaRoutingError::NoQuotaAdmissible {
+                model: request.model.clone(),
+                reports: Box::new(quota_reports),
+            });
+        }
+        let plan = build_route_plan(strategy, request, admitted)?;
+        Ok(QuotaAwareRoutePlan {
+            plan,
+            quota_reports,
+        })
     }
 
     /// Execute a synchronous request across ranked standard/free routes, failing over across
@@ -542,6 +604,145 @@ mod tests {
             .await?;
         assert_eq!(result.selected.endpoint.source, "openrouter");
         assert_eq!(result.response.provider.as_deref(), Some("openrouter"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quota_filter_removes_exhausted_cheapest_before_cost_floor()
+    -> Result<(), QuotaRoutingError> {
+        let mut pool = InferencePool::new();
+        pool.register_credential(
+            "nvidia",
+            "cheap-exhausted",
+            Arc::new(MockProvider {
+                source: "nvidia",
+                price: 0.0,
+                fail_execute: false,
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }),
+        );
+        pool.register_credential(
+            "nvidia",
+            "expensive-healthy",
+            Arc::new(MockProvider {
+                source: "nvidia",
+                price: 1e-6,
+                fail_execute: false,
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }),
+        );
+
+        let cheap_route = QuotaRouteKey {
+            source: "nvidia".to_owned(),
+            credential: Some("cheap-exhausted".to_owned()),
+            provider: "nvidia".to_owned(),
+            model: "vendor/native-model".to_owned(),
+        };
+        let expensive_route = QuotaRouteKey {
+            source: "nvidia".to_owned(),
+            credential: Some("expensive-healthy".to_owned()),
+            provider: "nvidia".to_owned(),
+            model: "vendor/native-model".to_owned(),
+        };
+        let cheap_resource = crate::QuotaResource::finite(
+            "cheap/rpd",
+            crate::QuotaScope::Account,
+            crate::QuotaMetric::Requests,
+            1,
+            0,
+        );
+        let cheap_id = cheap_resource.id.clone();
+        let expensive_resource = crate::QuotaResource::finite(
+            "expensive/rpd",
+            crate::QuotaScope::Account,
+            crate::QuotaMetric::Requests,
+            100,
+            100,
+        );
+        let expensive_id = expensive_resource.id.clone();
+        let mut graph = crate::QuotaGraph::new();
+        graph.insert_resource(cheap_resource);
+        graph.insert_resource(expensive_resource);
+        assert!(graph.bind(cheap_route, &cheap_id));
+        assert!(graph.bind(expensive_route, &expensive_id));
+        let ledger = QuotaLedger::new(graph);
+        let request = InferenceRequest::new("vendor/model", "hi", 8);
+
+        let result = pool
+            .route_with_quota(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                &ledger,
+                QuotaUnknownPolicy::Reject,
+                100,
+            )
+            .await?;
+        assert_eq!(result.plan.candidates.len(), 1);
+        assert_eq!(
+            result.plan.candidates[0].endpoint.credential.as_deref(),
+            Some("expensive-healthy")
+        );
+        assert!(result.plan.cheapest_cost_usd > 0.0);
+        assert!(result.quota_reports.iter().any(|report| {
+            report.route.credential.as_deref() == Some("cheap-exhausted")
+                && report.admission == QuotaAdmission::Rejected
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_quota_policy_is_explicit() -> Result<(), QuotaRoutingError> {
+        let mut pool = InferencePool::new();
+        pool.register_credential(
+            "nvidia",
+            "unmeasured",
+            Arc::new(MockProvider {
+                source: "nvidia",
+                price: 0.0,
+                fail_execute: false,
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }),
+        );
+        let request = InferenceRequest::new("vendor/model", "hi", 8);
+        let ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let permissive = pool
+            .route_with_quota(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                &ledger,
+                QuotaUnknownPolicy::Allow,
+                100,
+            )
+            .await?;
+        assert_eq!(permissive.plan.candidates.len(), 1);
+        assert_eq!(
+            permissive.quota_reports[0].admission,
+            QuotaAdmission::Indeterminate
+        );
+
+        let strict = pool
+            .route_with_quota(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                &ledger,
+                QuotaUnknownPolicy::Reject,
+                100,
+            )
+            .await;
+        match strict {
+            Err(QuotaRoutingError::NoQuotaAdmissible { reports, .. }) => {
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0].admission, QuotaAdmission::Indeterminate);
+            }
+            other => {
+                return Err(QuotaRoutingError::Provider(ProviderError::Response(
+                    format!("unexpected strict quota result: {other:?}"),
+                )));
+            }
+        }
         Ok(())
     }
 

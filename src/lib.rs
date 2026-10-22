@@ -30,11 +30,11 @@ pub use model::{
     InferenceResponse, Percentiles, Pricing, PricingOverride, ReasoningEffort, ReasoningSupport,
     RequestRequirements, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy,
 };
-pub use pool::{InferencePool, PooledInferenceResponse};
+pub use pool::{InferencePool, PooledInferenceResponse, QuotaRoutingError};
 pub use provider::{InferenceProvider, ProviderError};
 pub use quota::{
-    QuotaAdmission, QuotaAdmissionReport, QuotaAmount, QuotaCheck, QuotaCheckStatus, QuotaDemand,
-    QuotaGraph, QuotaLedger, QuotaMetric, QuotaReservationId, QuotaResource, QuotaResourceId,
-    QuotaRouteKey, QuotaScope,
+    QuotaAdmission, QuotaAdmissionReport, QuotaAmount, QuotaAwareRoutePlan, QuotaCheck,
+    QuotaCheckStatus, QuotaDemand, QuotaGraph, QuotaLedger, QuotaMetric, QuotaReservationId,
+    QuotaResource, QuotaResourceId, QuotaRouteKey, QuotaScope, QuotaUnknownPolicy,
 };
-pub use router::{approximate_prompt_tokens, build_route_plan};
+pub use router::{approximate_prompt_tokens, build_route_plan, request_prompt_tokens};

@@ -187,11 +187,29 @@ pub enum QuotaAdmission {
     Rejected,
 }
 
+/// How routing treats routes whose quota is not currently knowable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaUnknownPolicy {
+    /// Preserve legacy/experimental behavior while still excluding known-exhausted routes.
+    #[default]
+    Allow,
+    /// Require every bound quota resource to have known sufficient capacity.
+    Reject,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaAdmissionReport {
     pub route: QuotaRouteKey,
     pub admission: QuotaAdmission,
     pub checks: Vec<QuotaCheck>,
+}
+
+/// Ranked route plan plus the quota evidence considered before the cost floor was computed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaAwareRoutePlan {
+    pub plan: crate::RoutePlan,
+    pub quota_reports: Vec<QuotaAdmissionReport>,
 }
 
 /// Provider-independent quota topology. Sharing one resource ID between routes expresses a

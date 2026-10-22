@@ -105,6 +105,10 @@ Execution instances are keyed separately by provider source and an opaque creden
 
 Finite, unknown, and explicitly unlimited quota are separate states. Unknown limits or unknown credit cost produce an `Indeterminate` admission result rather than being treated as infinity. Provider reset timestamps are observation boundaries: once a reported reset time passes, the observation becomes unknown until refreshed instead of assuming every provider refills the same way. `QuotaLedger` reserves finite headroom for concurrent work, releases unaccepted requests, and commits actual token/credit usage when available.
 
+`InferencePool::route_with_quota` is the first routing integration. It applies ordinary model/capability/shape filtering, then quota admission, and only then computes the cheapest-cost band. Known-exhausted routes therefore cannot pin the cost floor; an exhausted $0 route is removed before a healthy paid route is compared. `QuotaUnknownPolicy::Allow` preserves experimental/unmeasured routes while excluding known exhaustion, whereas `Reject` requires known sufficient quota and returns the per-route admission reports when nothing survives.
+
+Mutable reservation/commit is intentionally not automatic inside `infer_pool` yet. The current generic provider error surface does not reliably distinguish "request never left the client" from "upstream accepted/charged work and then failed"; guessing that boundary would make quota accounting look precise while being wrong. The ledger API exists independently so execution can adopt it once adapters expose that phase explicitly.
+
 ## Provider architecture
 
 Implement `InferenceProvider` for another service. The adapter owns endpoint discovery and exact request/response grammar; core routing stays independent of OpenAI-compatible assumptions. OpenRouter and direct NVIDIA NIM both implement the trait. NVIDIA currently normalizes plain chat/system prompts, max tokens, temperature and JSON response formats; reasoning/tool dialects remain deliberately unavailable until normalized and conformance-tested.
