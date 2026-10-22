@@ -31,7 +31,10 @@ pub use model::{
     RequestRequirements, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy,
     TokenUsage,
 };
-pub use pool::{InferencePool, PooledInferenceResponse, QuotaRoutingError};
+pub use pool::{
+    InferencePool, PooledInferenceResponse, QuotaExecutionContext, QuotaInferenceError,
+    QuotaPooledInferenceResponse, QuotaRoutingError,
+};
 pub use provider::{ExecutionFailurePhase, InferenceProvider, ProviderError};
 pub use quota::{
     QuotaAdmission, QuotaAdmissionReport, QuotaAmount, QuotaAwareRoutePlan, QuotaCheck,

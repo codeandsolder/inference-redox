@@ -283,6 +283,7 @@ pub struct QuotaReservationId(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveReservation {
     charges: BTreeMap<QuotaResourceId, u64>,
+    resources: BTreeSet<QuotaResourceId>,
 }
 
 /// Local reservation/consumption ledger over provider observations.
@@ -394,13 +395,39 @@ impl QuotaLedger {
         demand: QuotaDemand,
         now_unix: u64,
     ) -> Result<QuotaReservationId, Box<QuotaAdmissionReport>> {
+        self.reserve_with_policy(route, demand, now_unix, QuotaUnknownPolicy::Reject)
+    }
+
+    /// Reserve every known finite demand while optionally allowing unknown buckets to proceed.
+    /// Unknown bound resources are retained in the reservation so post-call accounting can update
+    /// them from actual usage or invalidate stale finite observations after ambiguous failures.
+    ///
+    /// # Errors
+    /// Returns the explainable admission report on known exhaustion, or on any unknown check when
+    /// `unknown_policy` is `Reject`.
+    pub fn reserve_with_policy(
+        &mut self,
+        route: &QuotaRouteKey,
+        demand: QuotaDemand,
+        now_unix: u64,
+        unknown_policy: QuotaUnknownPolicy,
+    ) -> Result<QuotaReservationId, Box<QuotaAdmissionReport>> {
         let report = self.evaluate(route, demand, now_unix);
-        if report.admission != QuotaAdmission::Admitted {
+        let rejected = report.admission == QuotaAdmission::Rejected
+            || (report.admission == QuotaAdmission::Indeterminate
+                && unknown_policy == QuotaUnknownPolicy::Reject);
+        if rejected {
             return Err(Box::new(report));
         }
+        let resources = report
+            .checks
+            .iter()
+            .map(|check| check.resource_id.clone())
+            .collect();
         let mut charges = BTreeMap::new();
         for check in &report.checks {
-            if matches!(check.available, QuotaAmount::Finite(_))
+            if check.status == QuotaCheckStatus::Satisfied
+                && matches!(check.available, QuotaAmount::Finite(_))
                 && let Some(amount) = check.demand
             {
                 charges.insert(check.resource_id.clone(), amount);
@@ -409,7 +436,8 @@ impl QuotaLedger {
         }
         let id = QuotaReservationId(self.next_reservation);
         self.next_reservation = self.next_reservation.saturating_add(1);
-        self.active.insert(id, ActiveReservation { charges });
+        self.active
+            .insert(id, ActiveReservation { charges, resources });
         Ok(id)
     }
 
@@ -433,7 +461,8 @@ impl QuotaLedger {
             return false;
         };
         self.unreserve(&active.charges);
-        for (resource_id, reserved_amount) in active.charges {
+        for resource_id in active.resources {
+            let reserved_amount = active.charges.get(&resource_id).copied();
             let Some(resource) = self.graph.resource_mut(&resource_id) else {
                 continue;
             };
@@ -446,9 +475,15 @@ impl QuotaLedger {
             }
             let consumed = actual
                 .and_then(|demand| demand.amount(resource.metric))
-                .unwrap_or(reserved_amount);
-            if let QuotaAmount::Finite(remaining) = resource.remaining {
-                resource.remaining = QuotaAmount::Finite(remaining.saturating_sub(consumed));
+                .or(reserved_amount);
+            match (resource.remaining, consumed) {
+                (QuotaAmount::Finite(remaining), Some(consumed)) => {
+                    resource.remaining = QuotaAmount::Finite(remaining.saturating_sub(consumed));
+                }
+                (QuotaAmount::Finite(_), None) => {
+                    resource.remaining = QuotaAmount::Unknown;
+                }
+                (QuotaAmount::Unknown | QuotaAmount::Unlimited, _) => {}
             }
         }
         true
@@ -601,6 +636,94 @@ mod tests {
                 .evaluate(&route, QuotaDemand::for_request(&bounded), 100)
                 .admission,
             QuotaAdmission::Admitted
+        );
+    }
+
+    #[test]
+    fn permissive_reservation_tracks_unknown_bucket_for_post_call_accounting() {
+        let route = route("key");
+        let requests = QuotaResource::finite(
+            "provider/rpd",
+            QuotaScope::Account,
+            QuotaMetric::Requests,
+            10,
+            10,
+        );
+        let requests_id = requests.id.clone();
+        let tokens = QuotaResource::finite(
+            "provider/tpd",
+            QuotaScope::Account,
+            QuotaMetric::TotalTokens,
+            1_000,
+            1_000,
+        );
+        let tokens_id = tokens.id.clone();
+        let mut graph = QuotaGraph::new();
+        graph.insert_resource(requests);
+        graph.insert_resource(tokens);
+        assert!(graph.bind(route.clone(), &requests_id));
+        assert!(graph.bind(route.clone(), &tokens_id));
+        let mut ledger = QuotaLedger::new(graph);
+        let demand = QuotaDemand {
+            requests: 1,
+            concurrent_requests: 1,
+            ..QuotaDemand::default()
+        };
+        let reservation =
+            match ledger.reserve_with_policy(&route, demand, 100, QuotaUnknownPolicy::Allow) {
+                Ok(id) => id,
+                Err(report) => return assert_eq!(report.admission, QuotaAdmission::Admitted),
+            };
+        assert!(ledger.commit(reservation, None, 100));
+        assert_eq!(
+            ledger.graph().resource(&requests_id).map(|r| r.remaining),
+            Some(QuotaAmount::Finite(9))
+        );
+        assert_eq!(
+            ledger.graph().resource(&tokens_id).map(|r| r.remaining),
+            Some(QuotaAmount::Unknown)
+        );
+    }
+
+    #[test]
+    fn successful_actual_usage_updates_previously_unbounded_token_demand() {
+        let route = route("key");
+        let tokens = QuotaResource::finite(
+            "provider/tpd",
+            QuotaScope::Account,
+            QuotaMetric::TotalTokens,
+            1_000,
+            1_000,
+        );
+        let tokens_id = tokens.id.clone();
+        let mut graph = QuotaGraph::new();
+        graph.insert_resource(tokens);
+        assert!(graph.bind(route.clone(), &tokens_id));
+        let mut ledger = QuotaLedger::new(graph);
+        let request = InferenceRequest::new("model", "prompt", 8);
+        let demand = QuotaDemand::for_request(&request);
+        let reservation =
+            match ledger.reserve_with_policy(&route, demand, 100, QuotaUnknownPolicy::Allow) {
+                Ok(id) => id,
+                Err(report) => return assert_eq!(report.admission, QuotaAdmission::Admitted),
+            };
+        let response = crate::InferenceResponse {
+            content: "ok".to_owned(),
+            model: None,
+            provider: None,
+            usage_cost_usd: None,
+            usage: crate::TokenUsage {
+                input_tokens: Some(21),
+                output_tokens: Some(60),
+                total_tokens: Some(81),
+                reasoning_tokens: Some(56),
+            },
+            raw: serde_json::Value::Null,
+        };
+        assert!(ledger.commit(reservation, Some(demand.with_actual_usage(&response)), 100));
+        assert_eq!(
+            ledger.graph().resource(&tokens_id).map(|r| r.remaining),
+            Some(QuotaAmount::Finite(919))
         );
     }
 
