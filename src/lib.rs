@@ -29,6 +29,7 @@ pub use model::{
     EffectivePricing, Endpoint, EndpointCapabilities, EndpointStats, InferenceRequest,
     InferenceResponse, Percentiles, Pricing, PricingOverride, ReasoningEffort, ReasoningSupport,
     RequestRequirements, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy,
+    TokenUsage,
 };
 pub use pool::{InferencePool, PooledInferenceResponse, QuotaRoutingError};
 pub use provider::{ExecutionFailurePhase, InferenceProvider, ProviderError};

@@ -376,6 +376,36 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Normalized token accounting reported by an upstream response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    pub(crate) fn from_openai_compatible(raw: &Value) -> Self {
+        let usage = raw.get("usage").unwrap_or(&Value::Null);
+        Self {
+            input_tokens: usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens"))
+                .and_then(Value::as_u64),
+            output_tokens: usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
+                .and_then(Value::as_u64),
+            total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+            reasoning_tokens: usage
+                .pointer("/completion_tokens_details/reasoning_tokens")
+                .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
+                .and_then(Value::as_u64),
+        }
+    }
+}
+
 /// Normalized inference response. `raw` preserves provider-specific response metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InferenceResponse {
@@ -383,5 +413,47 @@ pub struct InferenceResponse {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub usage_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub usage: TokenUsage,
     pub raw: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalizes_openai_style_usage_and_reasoning_tokens() {
+        let raw = json!({
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 33,
+                "total_tokens": 44,
+                "completion_tokens_details": {"reasoning_tokens": 29}
+            }
+        });
+        let usage = TokenUsage::from_openai_compatible(&raw);
+        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.output_tokens, Some(33));
+        assert_eq!(usage.total_tokens, Some(44));
+        assert_eq!(usage.reasoning_tokens, Some(29));
+    }
+
+    #[test]
+    fn normalizes_responses_style_token_names() {
+        let raw = json!({
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 7,
+                "total_tokens": 12,
+                "output_tokens_details": {"reasoning_tokens": 3}
+            }
+        });
+        let usage = TokenUsage::from_openai_compatible(&raw);
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.total_tokens, Some(12));
+        assert_eq!(usage.reasoning_tokens, Some(3));
+    }
 }

@@ -13,6 +13,7 @@ use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest,
     InferenceResponse, ModelCatalog, ModelRouteClass, NativeModelRecord, Pricing, ProviderError,
     ProviderInventory, ReasoningEffort, ReasoningSupport, ResponseSchema, RetryPolicy, RoutePlan,
+    TokenUsage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
@@ -322,6 +323,7 @@ impl InferenceProvider for NvidiaNim {
                         model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
                         provider: Some("nvidia".to_owned()),
                         usage_cost_usd: Some(0.0),
+                        usage: TokenUsage::from_openai_compatible(&raw),
                         raw,
                     });
                 }

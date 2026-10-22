@@ -121,8 +121,10 @@ impl QuotaRouteKey {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaDemand {
     pub requests: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    /// Known prompt-token demand. `None` means the router only has an estimate, not a safe bound.
+    pub input_tokens: Option<u64>,
+    /// Known output-token upper bound. `None` means only an expectation is available.
+    pub output_tokens: Option<u64>,
     /// Provider-native integer credit units; adapters own scaling/conversion semantics.
     pub credits: Option<u64>,
     pub concurrent_requests: u64,
@@ -130,13 +132,11 @@ pub struct QuotaDemand {
 
 impl QuotaDemand {
     #[must_use]
-    pub fn for_request(request: &InferenceRequest, prompt_tokens: u64) -> Self {
+    pub fn for_request(request: &InferenceRequest) -> Self {
         Self {
             requests: 1,
-            input_tokens: prompt_tokens,
-            output_tokens: request
-                .max_output_tokens
-                .unwrap_or(request.expected_output_tokens),
+            input_tokens: request.prompt_tokens,
+            output_tokens: request.max_output_tokens,
             credits: None,
             concurrent_requests: 1,
         }
@@ -148,12 +148,27 @@ impl QuotaDemand {
         self
     }
 
+    /// Replace request estimates with provider-reported token counts where they are available.
+    #[must_use]
+    pub fn with_actual_usage(mut self, response: &crate::InferenceResponse) -> Self {
+        if let Some(tokens) = response.usage.input_tokens {
+            self.input_tokens = Some(tokens);
+        }
+        if let Some(tokens) = response.usage.output_tokens {
+            self.output_tokens = Some(tokens);
+        }
+        self
+    }
+
     fn amount(self, metric: QuotaMetric) -> Option<u64> {
         match metric {
             QuotaMetric::Requests => Some(self.requests),
-            QuotaMetric::InputTokens => Some(self.input_tokens),
-            QuotaMetric::OutputTokens => Some(self.output_tokens),
-            QuotaMetric::TotalTokens => Some(self.input_tokens.saturating_add(self.output_tokens)),
+            QuotaMetric::InputTokens => self.input_tokens,
+            QuotaMetric::OutputTokens => self.output_tokens,
+            QuotaMetric::TotalTokens => self
+                .input_tokens
+                .zip(self.output_tokens)
+                .map(|(input, output)| input.saturating_add(output)),
             QuotaMetric::Credits => self.credits,
             QuotaMetric::ConcurrentRequests => Some(self.concurrent_requests),
         }
@@ -556,6 +571,40 @@ mod tests {
     }
 
     #[test]
+    fn token_quota_requires_explicit_bounds_not_router_estimates() {
+        let route = route("key");
+        let resource = QuotaResource::finite(
+            "provider/tpm",
+            QuotaScope::Account,
+            QuotaMetric::TotalTokens,
+            1_000,
+            1_000,
+        );
+        let id = resource.id.clone();
+        let mut graph = QuotaGraph::new();
+        graph.insert_resource(resource);
+        assert!(graph.bind(route.clone(), &id));
+        let ledger = QuotaLedger::new(graph);
+
+        let request = InferenceRequest::new("model", "tiny prompt", 8);
+        let unknown = QuotaDemand::for_request(&request);
+        assert_eq!(
+            ledger.evaluate(&route, unknown, 100).admission,
+            QuotaAdmission::Indeterminate
+        );
+
+        let mut bounded = request;
+        bounded.prompt_tokens = Some(21);
+        bounded.max_output_tokens = Some(256);
+        assert_eq!(
+            ledger
+                .evaluate(&route, QuotaDemand::for_request(&bounded), 100)
+                .admission,
+            QuotaAdmission::Admitted
+        );
+    }
+
+    #[test]
     fn passed_reset_timestamp_makes_observation_unknown() {
         let route = route("key");
         let mut resource = QuotaResource::finite(
@@ -571,8 +620,8 @@ mod tests {
         graph.insert_resource(resource);
         assert!(graph.bind(route.clone(), &id));
         let demand = QuotaDemand {
-            input_tokens: 100,
-            output_tokens: 100,
+            input_tokens: Some(100),
+            output_tokens: Some(100),
             ..QuotaDemand::default()
         };
         let ledger = QuotaLedger::new(graph);
@@ -646,8 +695,8 @@ mod tests {
         assert!(graph.bind(route.clone(), &concurrent_id));
         let mut ledger = QuotaLedger::new(graph);
         let reserved = QuotaDemand {
-            input_tokens: 100,
-            output_tokens: 100,
+            input_tokens: Some(100),
+            output_tokens: Some(100),
             concurrent_requests: 1,
             ..QuotaDemand::default()
         };
@@ -656,8 +705,8 @@ mod tests {
             Err(report) => return assert_eq!(report.admission, QuotaAdmission::Admitted),
         };
         let actual = QuotaDemand {
-            input_tokens: 80,
-            output_tokens: 20,
+            input_tokens: Some(80),
+            output_tokens: Some(20),
             concurrent_requests: 1,
             ..QuotaDemand::default()
         };
@@ -671,6 +720,8 @@ mod tests {
                 .evaluate(
                     &route,
                     QuotaDemand {
+                        input_tokens: Some(0),
+                        output_tokens: Some(0),
                         concurrent_requests: 1,
                         ..QuotaDemand::default()
                     },

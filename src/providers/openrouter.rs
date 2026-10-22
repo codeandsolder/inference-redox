@@ -15,7 +15,7 @@ use crate::{
     InferenceRequest, InferenceResponse, ModelArchitecture, ModelBenchmarks, ModelCatalog,
     ModelCatalogEntry, ModelLookup, ModelReasoning, ModelRouteClass, ModelTopProvider, Percentiles,
     Pricing, PricingOverride, ProviderError, ReasoningEffort, ReasoningSupport, ResponseSchema,
-    RetryPolicy, RouteCandidate, RoutePlan,
+    RetryPolicy, RouteCandidate, RoutePlan, TokenUsage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -600,6 +600,7 @@ impl OpenRouter {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             usage_cost_usd: raw.pointer("/usage/cost").and_then(Value::as_f64),
+            usage: TokenUsage::from_openai_compatible(&raw),
             raw,
         })
     }

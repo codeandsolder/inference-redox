@@ -188,7 +188,7 @@ impl InferencePool {
     ) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
         let endpoints = self.endpoints(catalog, request).await?;
         let prompt_tokens = request_prompt_tokens(request);
-        let demand = QuotaDemand::for_request(request, prompt_tokens);
+        let demand = QuotaDemand::for_request(request);
         let mut quota_reports = Vec::new();
         let mut admitted = Vec::new();
         for endpoint in endpoints
@@ -352,6 +352,7 @@ mod tests {
                 model: Some(request.model.clone()),
                 provider: Some(self.source.to_owned()),
                 usage_cost_usd: None,
+                usage: crate::TokenUsage::default(),
                 raw: json!({"native_model": request.model, "mock_price": self.price}),
             })
         }
