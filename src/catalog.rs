@@ -52,7 +52,8 @@ pub struct ModelBenchmarks {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCatalogEntry {
-    /// Routable identifier in the source catalog, for example `openai/gpt-6-luna:batch`.
+    /// Routable identifier in the source catalog. Catalog adapters may retain only route
+    /// variants that matter cross-provider (currently base and `:free` for `OpenRouter`).
     pub id: String,
     /// Identity of the underlying model/version independent of a source-specific route variant.
     pub canonical_id: String,
@@ -64,6 +65,7 @@ pub struct ModelCatalogEntry {
     pub architecture: ModelArchitecture,
     pub pricing: Pricing,
     pub top_provider: ModelTopProvider,
+    /// Model-level nominal parameter claims from the metadata authority.
     pub supported_parameters: BTreeSet<String>,
     pub reasoning: ModelReasoning,
     pub benchmarks: ModelBenchmarks,
@@ -255,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_slug_groups_route_variants() -> Result<(), &'static str> {
+    fn canonical_slug_groups_base_and_free_variants() -> Result<(), &'static str> {
         let catalog = ModelCatalog {
             models: vec![
                 entry(
@@ -264,13 +266,13 @@ mod tests {
                     "OpenAI: GPT-6 Luna",
                 ),
                 entry(
-                    "openai/gpt-6-luna:batch",
+                    "openai/gpt-6-luna:free",
                     "openai/gpt-6-luna-20260922",
-                    "OpenAI: GPT-6 Luna (batch)",
+                    "OpenAI: GPT-6 Luna (free)",
                 ),
             ],
         };
-        let ModelLookup::Resolved { model } = catalog.resolve("openai/gpt-6-luna:batch") else {
+        let ModelLookup::Resolved { model } = catalog.resolve("openai/gpt-6-luna:free") else {
             return Err("expected route variant to resolve");
         };
         assert_eq!(model.canonical_id, "openai/gpt-6-luna-20260922");

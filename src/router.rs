@@ -39,49 +39,43 @@ fn supports_request(endpoint: &Endpoint, request: &InferenceRequest, prompt_toke
     {
         return false;
     }
-    if !request
-        .requirements
-        .required_parameters
-        .is_subset(&endpoint.capabilities.supported_parameters)
+    if !endpoint
+        .capabilities
+        .supports_parameters(&request.requirements.required_parameters)
     {
         return false;
     }
     match request.requirements.response_schema.as_ref() {
         None => {}
         Some(ResponseSchema::JsonObject) => {
-            if !endpoint
-                .capabilities
-                .supported_parameters
-                .contains("response_format")
-            {
+            if !endpoint.capabilities.supports_parameter("response_format") {
                 return false;
             }
         }
         Some(ResponseSchema::JsonSchema { strict, .. }) => {
-            if !endpoint
-                .capabilities
-                .supported_parameters
-                .contains("response_format")
-            {
+            if !endpoint.capabilities.supports_parameter("response_format") {
                 return false;
             }
             if *strict
                 && !endpoint
                     .capabilities
-                    .supported_parameters
-                    .contains("structured_outputs")
+                    .supports_parameter("structured_outputs")
             {
                 return false;
             }
         }
     }
-    if request.requirements.reasoning != ReasoningEffort::None
-        && !endpoint
-            .capabilities
-            .reasoning
-            .supports(request.requirements.reasoning)
-    {
-        return false;
+    if request.requirements.reasoning != ReasoningEffort::None {
+        let parameter_supported = endpoint.capabilities.supports_parameter("reasoning")
+            || endpoint.capabilities.supports_parameter("reasoning_effort");
+        if !parameter_supported
+            || !endpoint
+                .capabilities
+                .reasoning
+                .supports(request.requirements.reasoning)
+        {
+            return false;
+        }
     }
     true
 }

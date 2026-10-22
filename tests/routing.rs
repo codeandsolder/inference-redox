@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use inference_redox::{
     Endpoint, EndpointCapabilities, EndpointStats, InferenceRequest, Percentiles, Pricing,
     ReasoningEffort, ReasoningSupport, RequestRequirements, ResponseSchema, RoutingStrategy,
@@ -42,6 +44,8 @@ fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f6
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            verified_parameters: BTreeSet::new(),
+            rejected_parameters: BTreeSet::new(),
             reasoning: ReasoningSupport::GatewayNormalized,
             supports_implicit_caching: true,
         },
@@ -128,6 +132,91 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
     )?;
     assert_eq!(plan.candidates.len(), 1);
     assert_eq!(plan.candidates[0].endpoint.id, "capable");
+    Ok(())
+}
+
+#[test]
+fn rejected_parameter_overrides_nominal_provider_claim() {
+    let mut lying = endpoint("optimistic-provider", 1e-6, 1e-6, 0.1, 100.0);
+    lying
+        .capabilities
+        .rejected_parameters
+        .insert("structured_outputs".to_owned());
+
+    let mut request = InferenceRequest::new("x/model", "x", 100);
+    request.prompt_tokens = Some(100);
+    request.requirements = RequestRequirements {
+        response_schema: Some(ResponseSchema::JsonSchema {
+            name: "x".into(),
+            schema: json!({"type":"object"}),
+            strict: true,
+        }),
+        ..RequestRequirements::default()
+    };
+
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![lying],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+}
+
+#[test]
+fn rejected_reasoning_claim_overrides_nominal_metadata() {
+    let mut lying = endpoint("optimistic-reasoning", 1e-6, 1e-6, 0.1, 100.0);
+    lying
+        .capabilities
+        .rejected_parameters
+        .insert("reasoning".to_owned());
+    lying.capabilities.reasoning = ReasoningSupport::GatewayNormalized;
+
+    let mut request = InferenceRequest::new("x/model", "x", 100);
+    request.prompt_tokens = Some(100);
+    request.requirements.reasoning = ReasoningEffort::High;
+
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![lying],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+}
+
+#[test]
+fn verified_parameter_can_fill_missing_provider_claim() -> Result<(), inference_redox::ProviderError>
+{
+    let mut understated = endpoint("understated-provider", 1e-6, 1e-6, 0.1, 100.0);
+    understated
+        .capabilities
+        .supported_parameters
+        .remove("structured_outputs");
+    understated
+        .capabilities
+        .verified_parameters
+        .insert("structured_outputs".to_owned());
+
+    let mut request = InferenceRequest::new("x/model", "x", 100);
+    request.prompt_tokens = Some(100);
+    request.requirements = RequestRequirements {
+        response_schema: Some(ResponseSchema::JsonSchema {
+            name: "x".into(),
+            schema: json!({"type":"object"}),
+            strict: true,
+        }),
+        ..RequestRequirements::default()
+    };
+
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![understated],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
     Ok(())
 }
 

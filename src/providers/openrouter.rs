@@ -204,8 +204,7 @@ impl OpenRouter {
                 candidate
                     .endpoint
                     .capabilities
-                    .supported_parameters
-                    .contains("max_completion_tokens")
+                    .supports_parameter("max_completion_tokens")
             });
             let key = if use_completion_name {
                 "max_completion_tokens"
@@ -285,8 +284,7 @@ impl OpenRouter {
             candidate
                 .endpoint
                 .capabilities
-                .supported_parameters
-                .contains("reasoning")
+                .supports_parameter("reasoning")
         }) {
             object.insert("reasoning".to_owned(), json!({"enabled": false}));
         }
@@ -363,6 +361,7 @@ impl OpenRouter {
                 models: envelope
                     .data
                     .into_iter()
+                    .filter(|model| keep_catalog_route_variant(&model.id))
                     .map(OpenRouterModel::normalize)
                     .collect(),
             })
@@ -529,6 +528,12 @@ struct OpenRouterPricingOverride {
     input_cache_read: Option<String>,
     #[serde(alias = "cache_write")]
     input_cache_write: Option<String>,
+}
+
+fn keep_catalog_route_variant(model_id: &str) -> bool {
+    model_id
+        .rsplit_once(':')
+        .is_none_or(|(_, route_variant)| route_variant == "free")
 }
 
 fn parse_price(value: Option<&str>) -> f64 {
@@ -761,6 +766,8 @@ impl OpenRouterEndpoint {
             },
             capabilities: EndpointCapabilities {
                 supported_parameters: parameters,
+                verified_parameters: BTreeSet::new(),
+                rejected_parameters: BTreeSet::new(),
                 reasoning,
                 supports_implicit_caching: self.supports_implicit_caching.unwrap_or(false),
             },
@@ -1020,6 +1027,19 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_keeps_only_base_and_free_route_variants() {
+        assert!(keep_catalog_route_variant(
+            "nvidia/nemotron-3-ultra-550b-a55b"
+        ));
+        assert!(keep_catalog_route_variant(
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        ));
+        assert!(!keep_catalog_route_variant("openai/gpt-6-luna:batch"));
+        assert!(!keep_catalog_route_variant("openai/gpt-6-luna:floor"));
+        assert!(!keep_catalog_route_variant("openai/gpt-6-luna:nitro"));
+    }
+
+    #[test]
     fn normalizes_model_identity_reasoning_and_benchmarks() -> Result<(), serde_json::Error> {
         let raw = json!({
             "id": "openai/gpt-6-luna:batch",
@@ -1120,6 +1140,14 @@ mod tests {
             normalized.pricing.effective(300_000).cache_read_per_token,
             Some(0.000_000_01)
         );
+        assert!(
+            normalized
+                .capabilities
+                .supported_parameters
+                .contains("structured_outputs")
+        );
+        assert!(normalized.capabilities.verified_parameters.is_empty());
+        assert!(normalized.capabilities.rejected_parameters.is_empty());
         Ok(())
     }
 

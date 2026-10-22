@@ -179,15 +179,44 @@ pub enum ResponseSchema {
 /// Normalized endpoint capabilities used before routing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointCapabilities {
+    /// Provider/catalog claims. These are nominal until conformance-tested.
     pub supported_parameters: BTreeSet<String>,
+    /// Parameters observed to work on this provider/model route.
+    #[serde(default)]
+    pub verified_parameters: BTreeSet<String>,
+    /// Parameters observed to fail despite provider/catalog claims.
+    #[serde(default)]
+    pub rejected_parameters: BTreeSet<String>,
     pub reasoning: ReasoningSupport,
     pub supports_implicit_caching: bool,
+}
+
+impl EndpointCapabilities {
+    /// Effective parameter support, with observations overriding nominal claims.
+    #[must_use]
+    pub fn supports_parameter(&self, parameter: &str) -> bool {
+        if self.rejected_parameters.contains(parameter) {
+            return false;
+        }
+        self.verified_parameters.contains(parameter)
+            || self.supported_parameters.contains(parameter)
+    }
+
+    /// Whether every requested parameter is currently believed to work.
+    #[must_use]
+    pub fn supports_parameters(&self, parameters: &BTreeSet<String>) -> bool {
+        parameters
+            .iter()
+            .all(|parameter| self.supports_parameter(parameter))
+    }
 }
 
 impl Default for EndpointCapabilities {
     fn default() -> Self {
         Self {
             supported_parameters: BTreeSet::new(),
+            verified_parameters: BTreeSet::new(),
+            rejected_parameters: BTreeSet::new(),
             reasoning: ReasoningSupport::None,
             supports_implicit_caching: false,
         }
