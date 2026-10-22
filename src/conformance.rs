@@ -220,6 +220,7 @@ fn probe_error_detail(error: &ProviderError) -> String {
             ProviderError::InvalidStrategy(_) => "invalid strategy".to_owned(),
             ProviderError::Catalog(_) => "catalog error".to_owned(),
             ProviderError::Request(_) => "request error".to_owned(),
+            ProviderError::Execution { .. } => "execution error".to_owned(),
             ProviderError::Response(_) => "response error".to_owned(),
         },
         |status| format!("HTTP {status}"),
@@ -231,6 +232,7 @@ fn probe_http_status(error: &ProviderError) -> Option<u16> {
         ProviderError::Catalog(text)
         | ProviderError::Request(text)
         | ProviderError::Response(text) => text,
+        ProviderError::Execution { detail, .. } => detail,
         ProviderError::NoEligibleEndpoint(_)
         | ProviderError::InvalidRequest(_)
         | ProviderError::InvalidStrategy(_) => return None,
@@ -506,9 +508,10 @@ mod tests {
 
     #[test]
     fn probe_error_detail_drops_provider_response_body() {
-        let error = ProviderError::Request(
-            "HTTP 429 Too Many Requests: {\"user_id\":\"secret-ish\"}".to_owned(),
-        );
+        let error = ProviderError::Execution {
+            phase: crate::ExecutionFailurePhase::ResponseReceived,
+            detail: "HTTP 429 Too Many Requests: {\"user_id\":\"secret-ish\"}".to_owned(),
+        };
         assert_eq!(probe_error_detail(&error), "HTTP 429");
         assert_eq!(
             classify_probe_error(&error),

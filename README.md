@@ -107,7 +107,7 @@ Finite, unknown, and explicitly unlimited quota are separate states. Unknown lim
 
 `InferencePool::route_with_quota` is the first routing integration. It applies ordinary model/capability/shape filtering, then quota admission, and only then computes the cheapest-cost band. Known-exhausted routes therefore cannot pin the cost floor; an exhausted $0 route is removed before a healthy paid route is compared. `QuotaUnknownPolicy::Allow` preserves experimental/unmeasured routes while excluding known exhaustion, whereas `Reject` requires known sufficient quota and returns the per-route admission reports when nothing survives.
 
-Mutable reservation/commit is intentionally not automatic inside `infer_pool` yet. The current generic provider error surface does not reliably distinguish "request never left the client" from "upstream accepted/charged work and then failed"; guessing that boundary would make quota accounting look precise while being wrong. The ledger API exists independently so execution can adopt it once adapters expose that phase explicitly.
+Mutable reservation/commit is intentionally not automatic inside `infer_pool` yet. Execution failures now carry `ExecutionFailurePhase`: `TransportUnknown` means a request may already have left the client, while `ResponseReceived` means the provider/gateway definitely answered. This is a certainty boundary, not a billing claim—provider-specific observations still decide what a 429/400/500 actually consumed. Local fake-server tests cover both phases, and conformance diagnostics continue to redact response bodies.
 
 ## Provider architecture
 

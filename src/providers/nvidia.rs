@@ -266,7 +266,7 @@ impl InferenceProvider for NvidiaNim {
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
         if retry.max_attempts == 0 {
-            return Err(ProviderError::Request(
+            return Err(ProviderError::InvalidRequest(
                 "retry.max_attempts must be at least 1".to_owned(),
             ));
         }
@@ -282,6 +282,7 @@ impl InferenceProvider for NvidiaNim {
         let url = format!("{}/chat/completions", self.base_url);
         let mut backoff = retry.initial_backoff;
         let mut last_error = None;
+        let mut last_phase = None;
 
         for attempt in 1..=retry.max_attempts {
             match self
@@ -293,18 +294,28 @@ impl InferenceProvider for NvidiaNim {
                 .await
             {
                 Ok(response) if response.status().is_success() => {
-                    let raw: Value = response
-                        .json()
-                        .await
-                        .map_err(|error| ProviderError::Response(error.to_string()))?;
+                    let raw: Value =
+                        response
+                            .json()
+                            .await
+                            .map_err(|error| ProviderError::Execution {
+                                phase: crate::ExecutionFailurePhase::ResponseReceived,
+                                detail: error.to_string(),
+                            })?;
                     let Some(content) = raw
                         .pointer("/choices/0/message/content")
                         .and_then(Value::as_str)
                     else {
-                        return Err(ProviderError::Response(Self::response_shape_detail(&raw)));
+                        return Err(ProviderError::Execution {
+                            phase: crate::ExecutionFailurePhase::ResponseReceived,
+                            detail: Self::response_shape_detail(&raw),
+                        });
                     };
                     if content.is_empty() {
-                        return Err(ProviderError::Response(Self::response_shape_detail(&raw)));
+                        return Err(ProviderError::Execution {
+                            phase: crate::ExecutionFailurePhase::ResponseReceived,
+                            detail: Self::response_shape_detail(&raw),
+                        });
                     }
                     return Ok(InferenceResponse {
                         content: content.to_owned(),
@@ -319,10 +330,12 @@ impl InferenceProvider for NvidiaNim {
                     let retry_after = Self::retry_after(&response);
                     let text = response.text().await.unwrap_or_default();
                     last_error = Some(format!("HTTP {status}: {text}"));
+                    last_phase = Some(crate::ExecutionFailurePhase::ResponseReceived);
                     if !Self::retryable_status(status) {
-                        return Err(ProviderError::Request(
-                            last_error.unwrap_or_else(|| "request failed".to_owned()),
-                        ));
+                        return Err(ProviderError::Execution {
+                            phase: crate::ExecutionFailurePhase::ResponseReceived,
+                            detail: last_error.unwrap_or_else(|| "request failed".to_owned()),
+                        });
                     }
                     if attempt < retry.max_attempts {
                         let delay = retry_after.unwrap_or(backoff).min(retry.max_backoff);
@@ -332,6 +345,9 @@ impl InferenceProvider for NvidiaNim {
                 }
                 Err(error) => {
                     last_error = Some(error.to_string());
+                    if last_phase.is_none() {
+                        last_phase = Some(crate::ExecutionFailurePhase::TransportUnknown);
+                    }
                     if attempt < retry.max_attempts {
                         sleep(backoff).await;
                         backoff = backoff.saturating_mul(2).min(retry.max_backoff);
@@ -339,9 +355,10 @@ impl InferenceProvider for NvidiaNim {
                 }
             }
         }
-        Err(ProviderError::Request(last_error.unwrap_or_else(|| {
-            "request failed without an error body".to_owned()
-        })))
+        Err(ProviderError::Execution {
+            phase: last_phase.unwrap_or(crate::ExecutionFailurePhase::TransportUnknown),
+            detail: last_error.unwrap_or_else(|| "request failed without an error body".to_owned()),
+        })
     }
 }
 
@@ -377,7 +394,104 @@ impl NvidiaModel {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
     use super::*;
+
+    fn test_plan(model: &str) -> RoutePlan {
+        RoutePlan {
+            prompt_tokens: 1,
+            expected_output_tokens: 8,
+            cheapest_cost_usd: 0.0,
+            cost_ceiling_usd: 0.0,
+            candidates: vec![crate::RouteCandidate {
+                endpoint: Endpoint {
+                    source: "nvidia".to_owned(),
+                    credential: None,
+                    provider_key: "nvidia".to_owned(),
+                    id: "nvidia".to_owned(),
+                    provider: "NVIDIA NIM".to_owned(),
+                    model: model.to_owned(),
+                    route_class: ModelRouteClass::Free,
+                    display_name: model.to_owned(),
+                    quantization: None,
+                    status: 0,
+                    context_length: None,
+                    max_prompt_tokens: None,
+                    max_completion_tokens: None,
+                    pricing: Pricing::default(),
+                    stats: EndpointStats::default(),
+                    capabilities: EndpointCapabilities::default(),
+                },
+                expected_cost_usd: 0.0,
+                expected_response_p75_seconds: None,
+                expected_response_p95_seconds: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn http_error_is_response_received_phase() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let response = b"HTTP/1.1 429 Too Many Requests
+Content-Length: 0
+Connection: close
+
+";
+                let _ = stream.write_all(response);
+                let _ = stream.flush();
+            }
+        });
+        let provider = NvidiaNim::new("test").with_base_url(format!("http://{address}"));
+        let request = InferenceRequest::new("nvidia/example", "hi", 8);
+        let retry = RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        };
+        let error = provider
+            .execute_plan(&request, &test_plan(&request.model), retry)
+            .await
+            .err()
+            .ok_or("expected NVIDIA test request to fail")?;
+        let _ = server.join();
+        assert_eq!(
+            error.execution_phase(),
+            Some(crate::ExecutionFailurePhase::ResponseReceived)
+        );
+        assert!(error.to_string().contains("HTTP 429"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connection_failure_is_transport_unknown_phase()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        let provider = NvidiaNim::new("test").with_base_url(format!("http://{address}"));
+        let request = InferenceRequest::new("nvidia/example", "hi", 8);
+        let retry = RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        };
+        let error = provider
+            .execute_plan(&request, &test_plan(&request.model), retry)
+            .await
+            .err()
+            .ok_or("expected NVIDIA test transport to fail")?;
+        assert_eq!(
+            error.execution_phase(),
+            Some(crate::ExecutionFailurePhase::TransportUnknown)
+        );
+        Ok(())
+    }
 
     #[test]
     fn parses_openai_compatible_nvidia_model_record() -> Result<(), Box<dyn std::error::Error>> {

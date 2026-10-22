@@ -11,11 +11,11 @@ use tokio::time::sleep;
 
 use crate::{
     ArtificialAnalysisBenchmarks, BatchInferenceItem, BatchJob, DesignArenaBenchmark, Endpoint,
-    EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest, InferenceResponse,
-    ModelArchitecture, ModelBenchmarks, ModelCatalog, ModelCatalogEntry, ModelLookup,
-    ModelReasoning, ModelRouteClass, ModelTopProvider, Percentiles, Pricing, PricingOverride,
-    ProviderError, ReasoningEffort, ReasoningSupport, ResponseSchema, RetryPolicy, RouteCandidate,
-    RoutePlan,
+    EndpointCapabilities, EndpointStats, ExecutionFailurePhase, InferenceProvider,
+    InferenceRequest, InferenceResponse, ModelArchitecture, ModelBenchmarks, ModelCatalog,
+    ModelCatalogEntry, ModelLookup, ModelReasoning, ModelRouteClass, ModelTopProvider, Percentiles,
+    Pricing, PricingOverride, ProviderError, ReasoningEffort, ReasoningSupport, ResponseSchema,
+    RetryPolicy, RouteCandidate, RoutePlan,
 };
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -43,6 +43,23 @@ struct CachedEndpoints {
 struct CachedModels {
     fetched_at: Instant,
     catalog: ModelCatalog,
+}
+
+#[derive(Debug)]
+struct OpenRouterAttemptFailure {
+    phase: ExecutionFailurePhase,
+    detail: String,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+impl OpenRouterAttemptFailure {
+    fn into_provider_error(self) -> ProviderError {
+        ProviderError::Execution {
+            phase: self.phase,
+            detail: self.detail,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,6 +523,85 @@ impl OpenRouter {
             return Err(ProviderError::Request(format!("HTTP {status}: {body}")));
         }
         Ok(())
+    }
+
+    async fn execute_batch_once(
+        &self,
+        url: &str,
+        request: &InferenceRequest,
+        plan: &RoutePlan,
+        batch: &[&RouteCandidate],
+    ) -> Result<InferenceResponse, OpenRouterAttemptFailure> {
+        let body = Self::compile_body(request, plan, batch);
+        let response = self
+            .request(reqwest::Method::POST, url.to_owned())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| OpenRouterAttemptFailure {
+                phase: ExecutionFailurePhase::TransportUnknown,
+                detail: error.to_string(),
+                retryable: true,
+                retry_after: None,
+            })?;
+        let status = response.status();
+        let retry_after = Self::retry_after(&response);
+        if !status.is_success() {
+            let retryable = Self::retryable_status(status) || status == StatusCode::NOT_FOUND;
+            let text = response.text().await.unwrap_or_default();
+            return Err(OpenRouterAttemptFailure {
+                phase: ExecutionFailurePhase::ResponseReceived,
+                detail: format!("HTTP {status}: {text}"),
+                retryable,
+                retry_after,
+            });
+        }
+        let raw: Value = response
+            .json()
+            .await
+            .map_err(|error| OpenRouterAttemptFailure {
+                phase: ExecutionFailurePhase::ResponseReceived,
+                detail: error.to_string(),
+                retryable: false,
+                retry_after,
+            })?;
+        if let Some(error) = raw.get("error") {
+            return Err(OpenRouterAttemptFailure {
+                phase: ExecutionFailurePhase::ResponseReceived,
+                detail: format!("OpenRouter API error: {error}"),
+                retryable: Self::embedded_error_retryable(error),
+                retry_after,
+            });
+        }
+        let Some(content) = raw
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+        else {
+            return Err(OpenRouterAttemptFailure {
+                phase: ExecutionFailurePhase::ResponseReceived,
+                detail: "OpenRouter success response omitted choices[0].message.content".to_owned(),
+                retryable: true,
+                retry_after,
+            });
+        };
+        if content.is_empty() {
+            return Err(OpenRouterAttemptFailure {
+                phase: ExecutionFailurePhase::ResponseReceived,
+                detail: "OpenRouter success response returned empty message content".to_owned(),
+                retryable: true,
+                retry_after,
+            });
+        }
+        Ok(InferenceResponse {
+            content: content.to_owned(),
+            model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
+            provider: raw
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            usage_cost_usd: raw.pointer("/usage/cost").and_then(Value::as_f64),
+            raw,
+        })
     }
 
     fn retryable_status(status: StatusCode) -> bool {
@@ -1076,7 +1172,7 @@ impl InferenceProvider for OpenRouter {
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
         if retry.max_attempts == 0 {
-            return Err(ProviderError::Request(
+            return Err(ProviderError::InvalidRequest(
                 "retry.max_attempts must be at least 1".to_owned(),
             ));
         }
@@ -1087,73 +1183,24 @@ impl InferenceProvider for OpenRouter {
         let url = format!("{}/chat/completions", self.base_url);
         let mut backoff = retry.initial_backoff;
         let mut last_error = None;
+        let mut last_phase = None;
 
         for attempt in 1..=retry.max_attempts {
             let mut retry_after = None;
             for batch in &batches {
-                let body = Self::compile_body(request, plan, batch);
-                match self
-                    .request(reqwest::Method::POST, url.clone())
-                    .json(&body)
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status().is_success() => {
-                        let raw: Value = response
-                            .json()
-                            .await
-                            .map_err(|error| ProviderError::Response(error.to_string()))?;
-                        if let Some(error) = raw.get("error") {
-                            let detail = format!("OpenRouter API error: {error}");
-                            if !Self::embedded_error_retryable(error) {
-                                return Err(ProviderError::Request(detail));
-                            }
-                            last_error = Some(detail);
-                            continue;
-                        }
-                        let Some(content) = raw
-                            .pointer("/choices/0/message/content")
-                            .and_then(Value::as_str)
-                        else {
-                            last_error = Some(
-                                "OpenRouter success response omitted choices[0].message.content"
-                                    .to_owned(),
-                            );
-                            continue;
-                        };
-                        if content.is_empty() {
-                            last_error = Some(
-                                "OpenRouter success response returned empty message content"
-                                    .to_owned(),
-                            );
-                            continue;
-                        }
-                        return Ok(InferenceResponse {
-                            content: content.to_owned(),
-                            model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
-                            provider: raw
-                                .get("provider")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                            usage_cost_usd: raw.pointer("/usage/cost").and_then(Value::as_f64),
-                            raw,
-                        });
+                match self.execute_batch_once(&url, request, plan, batch).await {
+                    Ok(response) => return Ok(response),
+                    Err(failure) if !failure.retryable => {
+                        return Err(failure.into_provider_error());
                     }
-                    Ok(response) => {
-                        let status = response.status();
-                        retry_after = Self::retry_after(&response).or(retry_after);
-                        let retryable =
-                            Self::retryable_status(status) || status == StatusCode::NOT_FOUND;
-                        let text = response.text().await.unwrap_or_default();
-                        last_error = Some(format!("HTTP {status}: {text}"));
-                        if !retryable {
-                            return Err(ProviderError::Request(
-                                last_error.unwrap_or_else(|| "request failed".to_owned()),
-                            ));
+                    Err(failure) => {
+                        retry_after = failure.retry_after.or(retry_after);
+                        if last_phase.is_none()
+                            || failure.phase == ExecutionFailurePhase::ResponseReceived
+                        {
+                            last_phase = Some(failure.phase);
                         }
-                    }
-                    Err(error) => {
-                        last_error = Some(error.to_string());
+                        last_error = Some(failure.detail);
                     }
                 }
             }
@@ -1165,9 +1212,10 @@ impl InferenceProvider for OpenRouter {
             backoff = Self::next_backoff(backoff, retry.max_backoff);
         }
 
-        Err(ProviderError::Request(last_error.unwrap_or_else(|| {
-            "request failed without an error body".to_owned()
-        })))
+        Err(ProviderError::Execution {
+            phase: last_phase.unwrap_or(ExecutionFailurePhase::TransportUnknown),
+            detail: last_error.unwrap_or_else(|| "request failed without an error body".to_owned()),
+        })
     }
 }
 
