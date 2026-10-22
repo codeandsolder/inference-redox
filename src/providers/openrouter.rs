@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use crate::{
     ArtificialAnalysisBenchmarks, DesignArenaBenchmark, Endpoint, EndpointCapabilities,
     EndpointStats, InferenceProvider, InferenceRequest, InferenceResponse, ModelArchitecture,
-    ModelBenchmarks, ModelCatalog, ModelCatalogEntry, ModelLookup, ModelReasoning,
+    ModelBenchmarks, ModelCatalog, ModelCatalogEntry, ModelLookup, ModelReasoning, ModelRouteClass,
     ModelTopProvider, Percentiles, Pricing, PricingOverride, ProviderError, ReasoningEffort,
     ReasoningSupport, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan,
 };
@@ -361,8 +361,10 @@ impl OpenRouter {
                 models: envelope
                     .data
                     .into_iter()
-                    .filter(|model| keep_catalog_route_variant(&model.id))
-                    .map(OpenRouterModel::normalize)
+                    .filter_map(|model| {
+                        let route_class = catalog_route_class(&model.id)?;
+                        Some(model.normalize(route_class))
+                    })
                     .collect(),
             })
         }
@@ -530,10 +532,13 @@ struct OpenRouterPricingOverride {
     input_cache_write: Option<String>,
 }
 
-fn keep_catalog_route_variant(model_id: &str) -> bool {
-    model_id
-        .rsplit_once(':')
-        .is_none_or(|(_, route_variant)| route_variant == "free")
+fn catalog_route_class(model_id: &str) -> Option<ModelRouteClass> {
+    match model_id.rsplit_once(':') {
+        None => Some(ModelRouteClass::Standard),
+        Some((_, "free")) => Some(ModelRouteClass::Free),
+        Some((_, "batch")) => Some(ModelRouteClass::Batch),
+        Some(_) => None,
+    }
 }
 
 fn parse_price(value: Option<&str>) -> f64 {
@@ -638,7 +643,7 @@ fn normalize_latency_seconds(mut latency: Percentiles) -> Percentiles {
 }
 
 impl OpenRouterModel {
-    fn normalize(self) -> ModelCatalogEntry {
+    fn normalize(self, route_class: ModelRouteClass) -> ModelCatalogEntry {
         let canonical_id = self
             .canonical_slug
             .clone()
@@ -708,6 +713,7 @@ impl OpenRouterModel {
             });
         ModelCatalogEntry {
             id: self.id,
+            route_class,
             canonical_id,
             name: self.name,
             description: self.description,
@@ -1027,16 +1033,21 @@ mod tests {
     }
 
     #[test]
-    fn model_catalog_keeps_only_base_and_free_route_variants() {
-        assert!(keep_catalog_route_variant(
-            "nvidia/nemotron-3-ultra-550b-a55b"
-        ));
-        assert!(keep_catalog_route_variant(
-            "nvidia/nemotron-3-ultra-550b-a55b:free"
-        ));
-        assert!(!keep_catalog_route_variant("openai/gpt-6-luna:batch"));
-        assert!(!keep_catalog_route_variant("openai/gpt-6-luna:floor"));
-        assert!(!keep_catalog_route_variant("openai/gpt-6-luna:nitro"));
+    fn model_catalog_classifies_standard_free_and_batch_routes() {
+        assert_eq!(
+            catalog_route_class("nvidia/nemotron-3-ultra-550b-a55b"),
+            Some(ModelRouteClass::Standard)
+        );
+        assert_eq!(
+            catalog_route_class("nvidia/nemotron-3-ultra-550b-a55b:free"),
+            Some(ModelRouteClass::Free)
+        );
+        assert_eq!(
+            catalog_route_class("openai/gpt-6-luna:batch"),
+            Some(ModelRouteClass::Batch)
+        );
+        assert_eq!(catalog_route_class("openai/gpt-6-luna:floor"), None);
+        assert_eq!(catalog_route_class("openai/gpt-6-luna:nitro"), None);
     }
 
     #[test]
@@ -1081,8 +1092,9 @@ mod tests {
             }
         });
         let model: OpenRouterModel = serde_json::from_value(raw)?;
-        let normalized = model.normalize();
+        let normalized = model.normalize(ModelRouteClass::Batch);
         assert_eq!(normalized.canonical_id, "openai/gpt-6-luna-20260922");
+        assert_eq!(normalized.route_class, ModelRouteClass::Batch);
         assert!(normalized.aliases.contains("openai/gpt-6-luna:batch"));
         assert_eq!(normalized.top_provider.max_completion_tokens, Some(128_000));
         assert!(normalized.reasoning.supported_efforts.contains("none"));

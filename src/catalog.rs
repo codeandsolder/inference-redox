@@ -50,11 +50,21 @@ pub struct ModelBenchmarks {
     pub design_arena: Vec<DesignArenaBenchmark>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRouteClass {
+    Standard,
+    Free,
+    Batch,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCatalogEntry {
     /// Routable identifier in the source catalog. Catalog adapters may retain only route
-    /// variants that matter cross-provider (currently base and `:free` for `OpenRouter`).
+    /// variants that matter cross-provider (currently standard, `:free`, and `:batch` for `OpenRouter`).
     pub id: String,
+    /// Cross-provider execution/economics class for this catalog route.
+    pub route_class: ModelRouteClass,
     /// Identity of the underlying model/version independent of a source-specific route variant.
     pub canonical_id: String,
     pub name: String,
@@ -89,10 +99,18 @@ pub enum ModelMatchKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModelRoute {
+    pub id: String,
+    pub route_class: ModelRouteClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedModel {
     pub canonical_id: String,
     pub preferred_id: String,
+    /// Compatibility view of route IDs; prefer `routes` when execution class matters.
     pub variants: Vec<String>,
+    pub routes: Vec<ResolvedModelRoute>,
     pub matched_alias: String,
     pub match_kind: ModelMatchKind,
 }
@@ -190,22 +208,35 @@ impl ModelCatalog {
         matched_alias: &str,
         match_kind: ModelMatchKind,
     ) -> Option<ResolvedModel> {
-        let mut variants: Vec<String> = self
+        let mut routes: Vec<ResolvedModelRoute> = self
             .models
             .iter()
             .filter(|model| model.canonical_id == canonical_id)
-            .map(|model| model.id.clone())
+            .map(|model| ResolvedModelRoute {
+                id: model.id.clone(),
+                route_class: model.route_class,
+            })
             .collect();
-        variants.sort();
-        variants.dedup();
-        let preferred_id = variants
+        routes.sort_by(|left, right| left.id.cmp(&right.id));
+        routes.dedup_by(|left, right| left.id == right.id);
+        let preferred_id = routes
             .iter()
-            .min_by_key(|id| (id.contains(':'), id.len(), id.as_str()))?
+            .min_by_key(|route| {
+                let rank = match route.route_class {
+                    ModelRouteClass::Standard => 0_u8,
+                    ModelRouteClass::Free => 1,
+                    ModelRouteClass::Batch => 2,
+                };
+                (rank, route.id.len(), route.id.as_str())
+            })?
+            .id
             .clone();
+        let variants = routes.iter().map(|route| route.id.clone()).collect();
         Some(ResolvedModel {
             canonical_id: canonical_id.to_owned(),
             preferred_id,
             variants,
+            routes,
             matched_alias: matched_alias.to_owned(),
             match_kind,
         })
@@ -235,6 +266,13 @@ mod tests {
     fn entry(id: &str, canonical_id: &str, name: &str) -> ModelCatalogEntry {
         ModelCatalogEntry {
             id: id.to_owned(),
+            route_class: if id.ends_with(":free") {
+                ModelRouteClass::Free
+            } else if id.ends_with(":batch") {
+                ModelRouteClass::Batch
+            } else {
+                ModelRouteClass::Standard
+            },
             canonical_id: canonical_id.to_owned(),
             name: name.to_owned(),
             description: None,
@@ -257,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_slug_groups_base_and_free_variants() -> Result<(), &'static str> {
+    fn canonical_slug_groups_standard_free_and_batch_variants() -> Result<(), &'static str> {
         let catalog = ModelCatalog {
             models: vec![
                 entry(
@@ -270,14 +308,29 @@ mod tests {
                     "openai/gpt-6-luna-20260922",
                     "OpenAI: GPT-6 Luna (free)",
                 ),
+                entry(
+                    "openai/gpt-6-luna:batch",
+                    "openai/gpt-6-luna-20260922",
+                    "OpenAI: GPT-6 Luna (batch)",
+                ),
             ],
         };
-        let ModelLookup::Resolved { model } = catalog.resolve("openai/gpt-6-luna:free") else {
+        let ModelLookup::Resolved { model } = catalog.resolve("openai/gpt-6-luna:batch") else {
             return Err("expected route variant to resolve");
         };
         assert_eq!(model.canonical_id, "openai/gpt-6-luna-20260922");
         assert_eq!(model.preferred_id, "openai/gpt-6-luna");
-        assert_eq!(model.variants.len(), 2);
+        assert_eq!(model.variants.len(), 3);
+        assert_eq!(model.routes.len(), 3);
+        assert!(model.routes.iter().any(|route| {
+            route.id == "openai/gpt-6-luna:batch" && route.route_class == ModelRouteClass::Batch
+        }));
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|entry| entry.route_class == ModelRouteClass::Batch)
+        );
         Ok(())
     }
 

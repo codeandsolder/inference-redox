@@ -9,8 +9,9 @@ pub mod providers;
 
 pub use catalog::{
     ArtificialAnalysisBenchmarks, DesignArenaBenchmark, ModelArchitecture, ModelBenchmarks,
-    ModelCatalog, ModelCatalogEntry, ModelLookup, ModelMatchKind, ModelReasoning, ModelTopProvider,
-    ResolvedModel, normalize_model_name, normalize_model_slug,
+    ModelCatalog, ModelCatalogEntry, ModelLookup, ModelMatchKind, ModelReasoning, ModelRouteClass,
+    ModelTopProvider, ResolvedModel, ResolvedModelRoute, normalize_model_name,
+    normalize_model_slug,
 };
 pub use model::{
     EffectivePricing, Endpoint, EndpointCapabilities, EndpointStats, InferenceRequest,
