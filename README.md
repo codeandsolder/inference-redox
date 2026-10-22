@@ -97,6 +97,12 @@ The stdio bridge exposes `models` and `resolve_model` alongside the existing Ope
 
 Batch is a first-class asynchronous execution class, not a slow synchronous model variant. OpenRouter `:batch` catalog routes participate in cost/capability planning only when the request explicitly admits `batch`. `OpenRouter::submit_batch` strips the catalog suffix to the underlying model, submits independent custom-ID requests to `/batches`, and exposes status/result fetch plus deletion. The stdio bridge mirrors this as `submit_batch`, `batch_status`, and `delete_batch`. Inputs are compiled through the same normalized chat/system/schema/reasoning request model, but synchronous inference rejects batch admission rather than pretending an asynchronous job is a completion.
 
+## Quota/resource accounting
+
+Quota is modeled as shared resources, not as `API key × model = faucet`. A `QuotaRouteKey` can bind to any number of credential-, account-, provider-, model-family-, model-, or route-scoped buckets. Multiple credentials bind to the same resource ID when the upstream limit is actually shared, so adding keys cannot multiply account-scoped RPD/TPD by construction.
+
+Finite, unknown, and explicitly unlimited quota are separate states. Unknown limits or unknown credit cost produce an `Indeterminate` admission result rather than being treated as infinity. Provider reset timestamps are observation boundaries: once a reported reset time passes, the observation becomes unknown until refreshed instead of assuming every provider refills the same way. `QuotaLedger` reserves finite headroom for concurrent work, releases unaccepted requests, and commits actual token/credit usage when available.
+
 ## Provider architecture
 
 Implement `InferenceProvider` for another service. The adapter owns endpoint discovery and exact request/response grammar; core routing stays independent of OpenAI-compatible assumptions. OpenRouter and direct NVIDIA NIM both implement the trait. NVIDIA currently normalizes plain chat/system prompts, max tokens, temperature and JSON response formats; reasoning/tool dialects remain deliberately unavailable until normalized and conformance-tested.

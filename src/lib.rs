@@ -7,6 +7,7 @@ mod inventory;
 mod model;
 mod pool;
 mod provider;
+mod quota;
 mod router;
 
 pub mod providers;
@@ -31,4 +32,9 @@ pub use model::{
 };
 pub use pool::{InferencePool, PooledInferenceResponse};
 pub use provider::{InferenceProvider, ProviderError};
+pub use quota::{
+    QuotaAdmission, QuotaAdmissionReport, QuotaAmount, QuotaCheck, QuotaCheckStatus, QuotaDemand,
+    QuotaGraph, QuotaLedger, QuotaMetric, QuotaReservationId, QuotaResource, QuotaResourceId,
+    QuotaRouteKey, QuotaScope,
+};
 pub use router::{approximate_prompt_tokens, build_route_plan};
