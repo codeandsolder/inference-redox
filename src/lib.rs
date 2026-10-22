@@ -10,6 +10,7 @@ mod provider;
 mod quota;
 mod quota_headers;
 mod router;
+mod suitability;
 
 pub mod providers;
 
@@ -45,3 +46,7 @@ pub use quota::{
     QuotaUnknownPolicy,
 };
 pub use router::{approximate_prompt_tokens, build_route_plan, request_prompt_tokens};
+pub use suitability::{
+    BenchmarkKind, ModelSuitabilityReport, ModelSuitabilityRequirements, SuitabilityCheck,
+    SuitabilityStatus,
+};
