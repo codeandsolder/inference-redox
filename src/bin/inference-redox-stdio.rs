@@ -17,6 +17,8 @@ use tokio::task::JoinSet;
 enum Operation {
     Infer,
     Route,
+    Models,
+    ResolveModel,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,8 +47,12 @@ impl WireRetryPolicy {
 struct WireRequest {
     id: Value,
     op: Operation,
-    request: InferenceRequest,
-    fastest_response_cheap: f64,
+    #[serde(default)]
+    request: Option<InferenceRequest>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    fastest_response_cheap: Option<f64>,
     retry: Option<WireRetryPolicy>,
 }
 
@@ -74,74 +80,119 @@ async fn write_json<T: Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value:
     let _ = output.flush().await;
 }
 
+async fn write_error(stdout: &Arc<Mutex<tokio::io::Stdout>>, id: Value, error: impl Into<String>) {
+    write_json(
+        stdout,
+        &WireError {
+            id,
+            ok: false,
+            error: error.into(),
+        },
+    )
+    .await;
+}
+
 async fn handle(
     provider: Arc<OpenRouter>,
     stdout: Arc<Mutex<tokio::io::Stdout>>,
     request: WireRequest,
 ) {
-    let strategy = RoutingStrategy::FastestResponseCheap(request.fastest_response_cheap);
-    let id = request.id;
-    match request.op {
-        Operation::Route => {
-            let result = match provider.endpoints(&request.request.model).await {
-                Ok(endpoints) => {
-                    inference_redox::build_route_plan(strategy, &request.request, endpoints)
-                }
-                Err(error) => Err(error),
+    let WireRequest {
+        id,
+        op,
+        request,
+        query,
+        fastest_response_cheap,
+        retry,
+    } = request;
+
+    match op {
+        Operation::Models => match provider.models().await {
+            Ok(catalog) => {
+                write_json(
+                    &stdout,
+                    &WireSuccess {
+                        id,
+                        ok: true,
+                        result: catalog,
+                    },
+                )
+                .await;
+            }
+            Err(error) => write_error(&stdout, id, error.to_string()).await,
+        },
+        Operation::ResolveModel => {
+            let Some(query) = query else {
+                write_error(&stdout, id, "resolve_model requires query").await;
+                return;
             };
-            match result {
-                Ok(route) => {
+            match provider.resolve_model(&query).await {
+                Ok(model) => {
                     write_json(
                         &stdout,
                         &WireSuccess {
                             id,
                             ok: true,
-                            result: route,
+                            result: model,
                         },
                     )
                     .await;
                 }
-                Err(error) => {
-                    write_json(
-                        &stdout,
-                        &WireError {
-                            id,
-                            ok: false,
-                            error: error.to_string(),
-                        },
-                    )
-                    .await;
-                }
+                Err(error) => write_error(&stdout, id, error.to_string()).await,
             }
         }
-        Operation::Infer => {
-            let retry = request
-                .retry
-                .map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
-            let result = provider.infer(strategy, &request.request, retry).await;
-            match result {
-                Ok((route, response)) => {
-                    write_json(
-                        &stdout,
-                        &WireSuccess {
-                            id,
-                            ok: true,
-                            result: serde_json::json!({"route": route, "response": response}),
-                        },
-                    )
-                    .await;
+        Operation::Route | Operation::Infer => {
+            let Some(request) = request else {
+                write_error(&stdout, id, "route/infer requires request").await;
+                return;
+            };
+            let Some(multiplier) = fastest_response_cheap else {
+                write_error(&stdout, id, "route/infer requires fastest_response_cheap").await;
+                return;
+            };
+            let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
+            match op {
+                Operation::Route => {
+                    let result = match provider.endpoints(&request.model).await {
+                        Ok(endpoints) => {
+                            inference_redox::build_route_plan(strategy, &request, endpoints)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(route) => {
+                            write_json(
+                                &stdout,
+                                &WireSuccess {
+                                    id,
+                                    ok: true,
+                                    result: route,
+                                },
+                            )
+                            .await;
+                        }
+                        Err(error) => write_error(&stdout, id, error.to_string()).await,
+                    }
                 }
-                Err(error) => {
-                    write_json(
-                        &stdout,
-                        &WireError {
-                            id,
-                            ok: false,
-                            error: error.to_string(),
-                        },
-                    )
-                    .await;
+                Operation::Infer => {
+                    let retry =
+                        retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
+                    match provider.infer(strategy, &request, retry).await {
+                        Ok((route, response)) => {
+                            write_json(
+                                &stdout,
+                                &WireSuccess {
+                                    id,
+                                    ok: true,
+                                    result: serde_json::json!({"route": route, "response": response}),
+                                },
+                            )
+                            .await;
+                        }
+                        Err(error) => write_error(&stdout, id, error.to_string()).await,
+                    }
                 }
+                Operation::Models | Operation::ResolveModel => {}
             }
         }
     }

@@ -10,8 +10,10 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::{
-    Endpoint, EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest,
-    InferenceResponse, Percentiles, Pricing, PricingOverride, ProviderError, ReasoningEffort,
+    ArtificialAnalysisBenchmarks, DesignArenaBenchmark, Endpoint, EndpointCapabilities,
+    EndpointStats, InferenceProvider, InferenceRequest, InferenceResponse, ModelArchitecture,
+    ModelBenchmarks, ModelCatalog, ModelCatalogEntry, ModelLookup, ModelReasoning,
+    ModelTopProvider, Percentiles, Pricing, PricingOverride, ProviderError, ReasoningEffort,
     ReasoningSupport, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan,
 };
 
@@ -26,6 +28,7 @@ pub struct OpenRouter {
     app_title: Option<String>,
     http_referer: Option<String>,
     catalog_cache: Arc<Mutex<HashMap<String, CachedEndpoints>>>,
+    model_cache: Arc<Mutex<Option<CachedModels>>>,
     catalog_ttl: Duration,
 }
 
@@ -33,6 +36,12 @@ pub struct OpenRouter {
 struct CachedEndpoints {
     fetched_at: Instant,
     endpoints: Vec<Endpoint>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedModels {
+    fetched_at: Instant,
+    catalog: ModelCatalog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +71,7 @@ impl OpenRouter {
             app_title: None,
             http_referer: None,
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
+            model_cache: Arc::new(Mutex::new(None)),
             catalog_ttl: Duration::from_secs(60),
         }
     }
@@ -318,6 +328,68 @@ impl OpenRouter {
         current.saturating_mul(2).min(max)
     }
 
+    /// Fetch `OpenRouter` model metadata, canonical slugs, and benchmark summaries.
+    ///
+    /// # Errors
+    /// Returns a catalog error when metadata cannot be fetched or decoded and no stale catalog
+    /// is available.
+    pub async fn models(&self) -> Result<ModelCatalog, ProviderError> {
+        let mut cache = self.model_cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.fetched_at.elapsed() <= self.catalog_ttl
+        {
+            return Ok(cached.catalog.clone());
+        }
+        let stale = cache.as_ref().map(|cached| cached.catalog.clone());
+        drop(cache);
+
+        let url = format!("{}/models", self.base_url);
+        let fetched = async {
+            let response = self
+                .request(reqwest::Method::GET, url)
+                .send()
+                .await
+                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(ProviderError::Catalog(format!("HTTP {status}: {body}")));
+            }
+            let envelope: ModelEnvelope = response
+                .json()
+                .await
+                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+            Ok::<ModelCatalog, ProviderError>(ModelCatalog {
+                models: envelope
+                    .data
+                    .into_iter()
+                    .map(OpenRouterModel::normalize)
+                    .collect(),
+            })
+        }
+        .await;
+
+        match fetched {
+            Ok(catalog) => {
+                cache = self.model_cache.lock().await;
+                *cache = Some(CachedModels {
+                    fetched_at: Instant::now(),
+                    catalog: catalog.clone(),
+                });
+                Ok(catalog)
+            }
+            Err(error) => stale.ok_or(error),
+        }
+    }
+
+    /// Resolve a human or provider-native model name through the `OpenRouter` catalog.
+    ///
+    /// # Errors
+    /// Returns a catalog error when model metadata cannot be loaded.
+    pub async fn resolve_model(&self, query: &str) -> Result<ModelLookup, ProviderError> {
+        Ok(self.models().await?.resolve(query))
+    }
+
     fn retry_after(response: &reqwest::Response) -> Option<Duration> {
         response
             .headers()
@@ -326,6 +398,80 @@ impl OpenRouter {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEnvelope {
+    data: Vec<OpenRouterModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterModel {
+    id: String,
+    canonical_slug: Option<String>,
+    hugging_face_id: Option<String>,
+    name: String,
+    description: Option<String>,
+    created: Option<u64>,
+    context_length: Option<u64>,
+    architecture: Option<OpenRouterArchitecture>,
+    pricing: OpenRouterPricing,
+    top_provider: Option<OpenRouterTopProvider>,
+    supported_parameters: Option<Vec<String>>,
+    knowledge_cutoff: Option<String>,
+    expiration_date: Option<String>,
+    benchmarks: Option<OpenRouterBenchmarks>,
+    reasoning: Option<OpenRouterModelReasoning>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterArchitecture {
+    modality: Option<String>,
+    input_modalities: Option<Vec<String>>,
+    output_modalities: Option<Vec<String>>,
+    tokenizer: Option<String>,
+    instruct_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterTopProvider {
+    context_length: Option<u64>,
+    max_completion_tokens: Option<u64>,
+    is_moderated: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenRouterBenchmarks {
+    #[serde(default)]
+    design_arena: Vec<OpenRouterDesignArenaBenchmark>,
+    artificial_analysis: Option<OpenRouterArtificialAnalysisBenchmarks>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterArtificialAnalysisBenchmarks {
+    #[serde(rename = "intelligence_index")]
+    intelligence: Option<f64>,
+    #[serde(rename = "coding_index")]
+    coding: Option<f64>,
+    #[serde(rename = "agentic_index")]
+    agentic: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterDesignArenaBenchmark {
+    arena: Option<String>,
+    category: Option<String>,
+    elo: Option<f64>,
+    win_rate: Option<f64>,
+    rank: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterModelReasoning {
+    mandatory: Option<bool>,
+    default_enabled: Option<bool>,
+    supported_efforts: Option<Vec<String>>,
+    default_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -484,6 +630,100 @@ fn normalize_latency_seconds(mut latency: Percentiles) -> Percentiles {
         }
     }
     latency
+}
+
+impl OpenRouterModel {
+    fn normalize(self) -> ModelCatalogEntry {
+        let canonical_id = self
+            .canonical_slug
+            .clone()
+            .unwrap_or_else(|| self.id.clone());
+        let mut aliases =
+            BTreeSet::from([self.id.clone(), canonical_id.clone(), self.name.clone()]);
+        if let Some(hugging_face_id) = self.hugging_face_id.as_ref() {
+            aliases.insert(hugging_face_id.clone());
+        }
+        let architecture = self
+            .architecture
+            .map_or_else(ModelArchitecture::default, |raw| ModelArchitecture {
+                modality: raw.modality,
+                input_modalities: raw
+                    .input_modalities
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                output_modalities: raw
+                    .output_modalities
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                tokenizer: raw.tokenizer,
+                instruct_type: raw.instruct_type,
+            });
+        let top_provider = self
+            .top_provider
+            .map_or_else(ModelTopProvider::default, |raw| ModelTopProvider {
+                context_length: raw.context_length,
+                max_completion_tokens: raw.max_completion_tokens,
+                is_moderated: raw.is_moderated,
+            });
+        let reasoning = self
+            .reasoning
+            .map_or_else(ModelReasoning::default, |raw| ModelReasoning {
+                mandatory: raw.mandatory,
+                default_enabled: raw.default_enabled,
+                supported_efforts: raw
+                    .supported_efforts
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                default_effort: raw.default_effort,
+            });
+        let benchmarks = self
+            .benchmarks
+            .map_or_else(ModelBenchmarks::default, |raw| ModelBenchmarks {
+                artificial_analysis: raw.artificial_analysis.map(|benchmark| {
+                    ArtificialAnalysisBenchmarks {
+                        intelligence_index: benchmark.intelligence,
+                        coding_index: benchmark.coding,
+                        agentic_index: benchmark.agentic,
+                    }
+                }),
+                design_arena: raw
+                    .design_arena
+                    .into_iter()
+                    .map(|benchmark| DesignArenaBenchmark {
+                        arena: benchmark.arena,
+                        category: benchmark.category,
+                        elo: benchmark.elo,
+                        win_rate: benchmark.win_rate,
+                        rank: benchmark.rank,
+                    })
+                    .collect(),
+            });
+        ModelCatalogEntry {
+            id: self.id,
+            canonical_id,
+            name: self.name,
+            description: self.description,
+            aliases,
+            created_unix: self.created,
+            context_length: self.context_length,
+            architecture,
+            pricing: normalize_pricing(self.pricing),
+            top_provider,
+            supported_parameters: self
+                .supported_parameters
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            reasoning,
+            benchmarks,
+            knowledge_cutoff: self.knowledge_cutoff,
+            expiration_date: self.expiration_date,
+            source: "openrouter".to_owned(),
+        }
+    }
 }
 
 impl OpenRouterEndpoint {
@@ -777,6 +1017,64 @@ mod tests {
                 .and_then(Value::as_str),
             Some("json_schema")
         );
+    }
+
+    #[test]
+    fn normalizes_model_identity_reasoning_and_benchmarks() -> Result<(), serde_json::Error> {
+        let raw = json!({
+            "id": "openai/gpt-6-luna:batch",
+            "canonical_slug": "openai/gpt-6-luna-20260922",
+            "hugging_face_id": null,
+            "name": "OpenAI: GPT-6 Luna (batch)",
+            "description": "Fast model",
+            "created": 1_790_100_786,
+            "context_length": 1_050_000,
+            "architecture": {
+                "modality": "text+image->text",
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"],
+                "tokenizer": "GPT",
+                "instruct_type": null
+            },
+            "pricing": {"prompt": "0.00000005", "completion": "0.00000025"},
+            "top_provider": {
+                "context_length": 1_050_000,
+                "max_completion_tokens": 128_000,
+                "is_moderated": true
+            },
+            "supported_parameters": ["reasoning", "tools"],
+            "knowledge_cutoff": "2025-08",
+            "expiration_date": null,
+            "benchmarks": {
+                "design_arena": [],
+                "artificial_analysis": {
+                    "intelligence_index": 38.1,
+                    "coding_index": 41.2,
+                    "agentic_index": null
+                }
+            },
+            "reasoning": {
+                "mandatory": false,
+                "default_enabled": true,
+                "supported_efforts": ["high", "medium", "low", "none"],
+                "default_effort": "medium"
+            }
+        });
+        let model: OpenRouterModel = serde_json::from_value(raw)?;
+        let normalized = model.normalize();
+        assert_eq!(normalized.canonical_id, "openai/gpt-6-luna-20260922");
+        assert!(normalized.aliases.contains("openai/gpt-6-luna:batch"));
+        assert_eq!(normalized.top_provider.max_completion_tokens, Some(128_000));
+        assert!(normalized.reasoning.supported_efforts.contains("none"));
+        assert_eq!(
+            normalized
+                .benchmarks
+                .artificial_analysis
+                .as_ref()
+                .and_then(|benchmark| benchmark.intelligence_index),
+            Some(38.1)
+        );
+        Ok(())
     }
 
     #[test]

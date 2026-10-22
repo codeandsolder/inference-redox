@@ -78,6 +78,16 @@ println!("{} via {} candidates", response.content, route.candidates.len());
 
 The bridge is deliberately thin: provider-specific request grammar, capability filtering, request-shape cost calculation, service-tier handling, fallback and retry policy remain in the Rust adapter rather than being reimplemented by callers.
 
+## Model catalog and identity
+
+Model identity is deliberately separate from provider endpoints. OpenRouter's `/models` catalog is the first metadata authority: `canonical_slug` groups route variants such as `:batch` under one underlying model, while every routable ID remains available as an alias. Catalog entries also retain architecture/modalities, tokenizer, context and output limits, supported parameters, reasoning modes, pricing, and the benchmark summaries OpenRouter publishes (Artificial Analysis and Design Arena when present).
+
+Name resolution is conservative: exact aliases first, normalized full names second, then a basename match only when it identifies exactly one canonical model. That lets a provider-native name such as `stepfun-ai/step-5-preview` resolve to an OpenRouter spelling such as `stepfun/step-5-preview` without maintaining a vendor-renaming table; ambiguous basenames are returned as ambiguous rather than guessed.
+
+This is intentionally not an availability model. A provider can advertise a model that is currently unhealthy or not entitled for a particular account, and multiple providers can expose the same canonical model under different names. Provider-local availability, health, quota and price observations belong to routing state, not model identity.
+
+The stdio bridge exposes `models` and `resolve_model` operations alongside `route` and `infer`, so long-lived callers can keep the catalog cache warm and share one normalization layer.
+
 ## Provider architecture
 
 Implement `InferenceProvider` for another service. The adapter owns endpoint discovery and exact request/response grammar; core routing stays independent of OpenAI-compatible assumptions.

@@ -1,11 +1,17 @@
 #![doc = "Provider-agnostic inference routing with shape-aware endpoint selection."]
 
+mod catalog;
 mod model;
 mod provider;
 mod router;
 
 pub mod providers;
 
+pub use catalog::{
+    ArtificialAnalysisBenchmarks, DesignArenaBenchmark, ModelArchitecture, ModelBenchmarks,
+    ModelCatalog, ModelCatalogEntry, ModelLookup, ModelMatchKind, ModelReasoning, ModelTopProvider,
+    ResolvedModel, normalize_model_name, normalize_model_slug,
+};
 pub use model::{
     EffectivePricing, Endpoint, EndpointCapabilities, EndpointStats, InferenceRequest,
     InferenceResponse, Percentiles, Pricing, PricingOverride, ReasoningEffort, ReasoningSupport,
