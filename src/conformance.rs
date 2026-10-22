@@ -511,6 +511,7 @@ mod tests {
         let error = ProviderError::Execution {
             phase: crate::ExecutionFailurePhase::ResponseReceived,
             detail: "HTTP 429 Too Many Requests: {\"user_id\":\"secret-ish\"}".to_owned(),
+            quota_observations: Vec::new(),
         };
         assert_eq!(probe_error_detail(&error), "HTTP 429");
         assert_eq!(

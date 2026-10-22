@@ -8,6 +8,7 @@ mod model;
 mod pool;
 mod provider;
 mod quota;
+mod quota_headers;
 mod router;
 
 pub mod providers;
@@ -38,7 +39,9 @@ pub use pool::{
 pub use provider::{ExecutionFailurePhase, InferenceProvider, ProviderError};
 pub use quota::{
     QuotaAdmission, QuotaAdmissionReport, QuotaAmount, QuotaAwareRoutePlan, QuotaCheck,
-    QuotaCheckStatus, QuotaDemand, QuotaGraph, QuotaLedger, QuotaMetric, QuotaReservationId,
-    QuotaResource, QuotaResourceId, QuotaRouteKey, QuotaScope, QuotaUnknownPolicy,
+    QuotaCheckStatus, QuotaDemand, QuotaGraph, QuotaLedger, QuotaMetric, QuotaObservation,
+    QuotaObservationApplyResult, QuotaObservationApplyStatus, QuotaObservationMap,
+    QuotaReservationId, QuotaResource, QuotaResourceId, QuotaRouteKey, QuotaScope,
+    QuotaUnknownPolicy,
 };
 pub use router::{approximate_prompt_tokens, build_route_plan, request_prompt_tokens};

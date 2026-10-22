@@ -51,6 +51,7 @@ struct OpenRouterAttemptFailure {
     detail: String,
     retryable: bool,
     retry_after: Option<Duration>,
+    quota_observations: Vec<crate::QuotaObservation>,
 }
 
 impl OpenRouterAttemptFailure {
@@ -58,6 +59,7 @@ impl OpenRouterAttemptFailure {
         ProviderError::Execution {
             phase: self.phase,
             detail: self.detail,
+            quota_observations: self.quota_observations,
         }
     }
 }
@@ -543,9 +545,12 @@ impl OpenRouter {
                 detail: error.to_string(),
                 retryable: true,
                 retry_after: None,
+                quota_observations: Vec::new(),
             })?;
         let status = response.status();
         let retry_after = Self::retry_after(&response);
+        let quota_observations =
+            crate::quota_headers::standard_rate_limit_observations(response.headers());
         if !status.is_success() {
             let retryable = Self::retryable_status(status) || status == StatusCode::NOT_FOUND;
             let text = response.text().await.unwrap_or_default();
@@ -554,6 +559,7 @@ impl OpenRouter {
                 detail: format!("HTTP {status}: {text}"),
                 retryable,
                 retry_after,
+                quota_observations,
             });
         }
         let raw: Value = response
@@ -564,6 +570,7 @@ impl OpenRouter {
                 detail: error.to_string(),
                 retryable: false,
                 retry_after,
+                quota_observations: quota_observations.clone(),
             })?;
         if let Some(error) = raw.get("error") {
             return Err(OpenRouterAttemptFailure {
@@ -571,6 +578,7 @@ impl OpenRouter {
                 detail: format!("OpenRouter API error: {error}"),
                 retryable: Self::embedded_error_retryable(error),
                 retry_after,
+                quota_observations,
             });
         }
         let Some(content) = raw
@@ -582,6 +590,7 @@ impl OpenRouter {
                 detail: "OpenRouter success response omitted choices[0].message.content".to_owned(),
                 retryable: true,
                 retry_after,
+                quota_observations,
             });
         };
         if content.is_empty() {
@@ -590,6 +599,7 @@ impl OpenRouter {
                 detail: "OpenRouter success response returned empty message content".to_owned(),
                 retryable: true,
                 retry_after,
+                quota_observations,
             });
         }
         Ok(InferenceResponse {
@@ -601,6 +611,7 @@ impl OpenRouter {
                 .map(str::to_owned),
             usage_cost_usd: raw.pointer("/usage/cost").and_then(Value::as_f64),
             usage: TokenUsage::from_openai_compatible(&raw),
+            quota_observations,
             raw,
         })
     }
@@ -1185,6 +1196,7 @@ impl InferenceProvider for OpenRouter {
         let mut backoff = retry.initial_backoff;
         let mut last_error = None;
         let mut last_phase = None;
+        let mut last_quota_observations = Vec::new();
 
         for attempt in 1..=retry.max_attempts {
             let mut retry_after = None;
@@ -1201,6 +1213,9 @@ impl InferenceProvider for OpenRouter {
                         {
                             last_phase = Some(failure.phase);
                         }
+                        if !failure.quota_observations.is_empty() {
+                            last_quota_observations = failure.quota_observations;
+                        }
                         last_error = Some(failure.detail);
                     }
                 }
@@ -1216,6 +1231,7 @@ impl InferenceProvider for OpenRouter {
         Err(ProviderError::Execution {
             phase: last_phase.unwrap_or(ExecutionFailurePhase::TransportUnknown),
             detail: last_error.unwrap_or_else(|| "request failed without an error body".to_owned()),
+            quota_observations: last_quota_observations,
         })
     }
 }

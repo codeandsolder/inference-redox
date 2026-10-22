@@ -31,6 +31,20 @@ pub enum QuotaMetric {
     ConcurrentRequests,
 }
 
+/// One normalized quota/rate-limit measurement reported by an upstream surface.
+///
+/// `bucket` is a stable provider-local observation name such as `rate_limit.requests`; it does not
+/// imply credential/account/model ownership. Ownership is assigned separately by
+/// `QuotaObservationMap`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaObservation {
+    pub bucket: String,
+    pub metric: Option<QuotaMetric>,
+    pub limit: Option<u64>,
+    pub remaining: Option<u64>,
+    pub reset_after_millis: Option<u64>,
+}
+
 /// `Unknown` and `Unlimited` are deliberately different states.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
@@ -276,6 +290,103 @@ impl QuotaGraph {
     }
 }
 
+/// Explicit mapping from provider-local observation buckets to logical quota resources.
+///
+/// Bindings are route-specific, which lets two credential instances map the same observed header
+/// to either one shared account resource or two independent resources without changing adapters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaObservationMap {
+    bindings: BTreeMap<(QuotaRouteKey, String), QuotaResourceId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaObservationApplyStatus {
+    Applied,
+    Unbound,
+    MissingResource,
+    MetricMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaObservationApplyResult {
+    pub bucket: String,
+    pub status: QuotaObservationApplyStatus,
+    pub resource_id: Option<QuotaResourceId>,
+}
+
+impl QuotaObservationMap {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn bind(
+        &mut self,
+        route: QuotaRouteKey,
+        bucket: impl Into<String>,
+        resource_id: QuotaResourceId,
+    ) {
+        self.bindings.insert((route, bucket.into()), resource_id);
+    }
+
+    pub fn apply(
+        &self,
+        graph: &mut QuotaGraph,
+        route: &QuotaRouteKey,
+        observations: &[QuotaObservation],
+        observed_at_unix: u64,
+    ) -> Vec<QuotaObservationApplyResult> {
+        observations
+            .iter()
+            .map(|observation| {
+                let key = (route.clone(), observation.bucket.clone());
+                let Some(resource_id) = self.bindings.get(&key).cloned() else {
+                    return QuotaObservationApplyResult {
+                        bucket: observation.bucket.clone(),
+                        status: QuotaObservationApplyStatus::Unbound,
+                        resource_id: None,
+                    };
+                };
+                let Some(resource) = graph.resource_mut(&resource_id) else {
+                    return QuotaObservationApplyResult {
+                        bucket: observation.bucket.clone(),
+                        status: QuotaObservationApplyStatus::MissingResource,
+                        resource_id: Some(resource_id),
+                    };
+                };
+                if observation
+                    .metric
+                    .is_some_and(|metric| metric != resource.metric)
+                {
+                    return QuotaObservationApplyResult {
+                        bucket: observation.bucket.clone(),
+                        status: QuotaObservationApplyStatus::MetricMismatch,
+                        resource_id: Some(resource_id),
+                    };
+                }
+                if let Some(limit) = observation.limit {
+                    resource.capacity = QuotaAmount::Finite(limit);
+                }
+                if let Some(remaining) = observation.remaining {
+                    resource.remaining = QuotaAmount::Finite(remaining);
+                }
+                if let Some(reset_after_millis) = observation.reset_after_millis {
+                    let reset_after_seconds = reset_after_millis.saturating_add(999) / 1_000;
+                    resource.reset_at_unix =
+                        Some(observed_at_unix.saturating_add(reset_after_seconds));
+                }
+                resource.observed_at_unix = Some(observed_at_unix);
+                QuotaObservationApplyResult {
+                    bucket: observation.bucket.clone(),
+                    status: QuotaObservationApplyStatus::Applied,
+                    resource_id: Some(resource_id),
+                }
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct QuotaReservationId(pub u64);
@@ -516,6 +627,107 @@ mod tests {
     }
 
     #[test]
+    fn observation_binding_separates_measurement_from_ownership() {
+        let route_a = route("key-a");
+        let route_b = route("key-b");
+        let resource = QuotaResource::finite(
+            "shared-account/rpd",
+            QuotaScope::Account,
+            QuotaMetric::Requests,
+            100,
+            100,
+        );
+        let resource_id = resource.id.clone();
+        let mut graph = QuotaGraph::new();
+        graph.insert_resource(resource);
+        let mut map = QuotaObservationMap::new();
+        map.bind(route_a.clone(), "rate_limit.requests", resource_id.clone());
+        map.bind(route_b, "rate_limit.requests", resource_id.clone());
+        let result = map.apply(
+            &mut graph,
+            &route_a,
+            &[QuotaObservation {
+                bucket: "rate_limit.requests".to_owned(),
+                metric: Some(QuotaMetric::Requests),
+                limit: Some(1_000),
+                remaining: Some(731),
+                reset_after_millis: Some(2_500),
+            }],
+            100,
+        );
+        assert_eq!(result[0].status, QuotaObservationApplyStatus::Applied);
+        let updated = graph.resource(&resource_id);
+        assert_eq!(
+            updated.map(|resource| resource.capacity),
+            Some(QuotaAmount::Finite(1_000))
+        );
+        assert_eq!(
+            updated.map(|resource| resource.remaining),
+            Some(QuotaAmount::Finite(731))
+        );
+        assert_eq!(
+            updated.and_then(|resource| resource.reset_at_unix),
+            Some(103)
+        );
+        assert_eq!(
+            updated.and_then(|resource| resource.observed_at_unix),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn unbound_or_mismatched_observation_does_not_mutate_resource() {
+        let route = route("key");
+        let resource = QuotaResource::finite(
+            "account/rpd",
+            QuotaScope::Account,
+            QuotaMetric::Requests,
+            100,
+            100,
+        );
+        let resource_id = resource.id.clone();
+        let mut graph = QuotaGraph::new();
+        graph.insert_resource(resource);
+        let mut map = QuotaObservationMap::new();
+        map.bind(route.clone(), "rate_limit.tokens", resource_id.clone());
+        let mismatch = map.apply(
+            &mut graph,
+            &route,
+            &[QuotaObservation {
+                bucket: "rate_limit.tokens".to_owned(),
+                metric: Some(QuotaMetric::TotalTokens),
+                limit: Some(1),
+                remaining: Some(0),
+                reset_after_millis: None,
+            }],
+            100,
+        );
+        assert_eq!(
+            mismatch[0].status,
+            QuotaObservationApplyStatus::MetricMismatch
+        );
+        assert_eq!(
+            graph
+                .resource(&resource_id)
+                .map(|resource| resource.remaining),
+            Some(QuotaAmount::Finite(100))
+        );
+        let unbound = map.apply(
+            &mut graph,
+            &route,
+            &[QuotaObservation {
+                bucket: "other".to_owned(),
+                metric: None,
+                limit: None,
+                remaining: Some(0),
+                reset_after_millis: None,
+            }],
+            100,
+        );
+        assert_eq!(unbound[0].status, QuotaObservationApplyStatus::Unbound);
+    }
+
+    #[test]
     fn endpoint_credential_becomes_quota_route_identity() {
         let endpoint = Endpoint {
             source: "nvidia".to_owned(),
@@ -718,6 +930,7 @@ mod tests {
                 total_tokens: Some(81),
                 reasoning_tokens: Some(56),
             },
+            quota_observations: Vec::new(),
             raw: serde_json::Value::Null,
         };
         assert!(ledger.commit(reservation, Some(demand.with_actual_usage(&response)), 100));

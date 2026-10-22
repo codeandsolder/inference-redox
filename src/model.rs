@@ -415,6 +415,9 @@ pub struct InferenceResponse {
     pub usage_cost_usd: Option<f64>,
     #[serde(default)]
     pub usage: TokenUsage,
+    /// Recognized, normalized quota measurements from response headers. No raw headers are kept.
+    #[serde(default)]
+    pub quota_observations: Vec<crate::QuotaObservation>,
     pub raw: Value,
 }
 

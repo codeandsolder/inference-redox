@@ -34,6 +34,25 @@ struct CachedNvidiaModels {
     models: Vec<NativeModelRecord>,
 }
 
+#[derive(Debug)]
+struct NvidiaAttemptFailure {
+    phase: crate::ExecutionFailurePhase,
+    detail: String,
+    retryable: bool,
+    retry_after: Option<Duration>,
+    quota_observations: Vec<crate::QuotaObservation>,
+}
+
+impl NvidiaAttemptFailure {
+    fn into_provider_error(self) -> ProviderError {
+        ProviderError::Execution {
+            phase: self.phase,
+            detail: self.detail,
+            quota_observations: self.quota_observations,
+        }
+    }
+}
+
 impl NvidiaNim {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -190,6 +209,81 @@ impl NvidiaNim {
         )
     }
 
+    async fn execute_once(
+        &self,
+        url: &str,
+        body: &Value,
+    ) -> Result<InferenceResponse, NvidiaAttemptFailure> {
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| NvidiaAttemptFailure {
+                phase: crate::ExecutionFailurePhase::TransportUnknown,
+                detail: error.to_string(),
+                retryable: true,
+                retry_after: None,
+                quota_observations: Vec::new(),
+            })?;
+        let status = response.status();
+        let retry_after = Self::retry_after(&response);
+        let quota_observations =
+            crate::quota_headers::standard_rate_limit_observations(response.headers());
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(NvidiaAttemptFailure {
+                phase: crate::ExecutionFailurePhase::ResponseReceived,
+                detail: format!("HTTP {status}: {text}"),
+                retryable: Self::retryable_status(status),
+                retry_after,
+                quota_observations,
+            });
+        }
+        let raw: Value = response
+            .json()
+            .await
+            .map_err(|error| NvidiaAttemptFailure {
+                phase: crate::ExecutionFailurePhase::ResponseReceived,
+                detail: error.to_string(),
+                retryable: false,
+                retry_after,
+                quota_observations: quota_observations.clone(),
+            })?;
+        let Some(content) = raw
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+        else {
+            return Err(NvidiaAttemptFailure {
+                phase: crate::ExecutionFailurePhase::ResponseReceived,
+                detail: Self::response_shape_detail(&raw),
+                retryable: false,
+                retry_after,
+                quota_observations,
+            });
+        };
+        if content.is_empty() {
+            return Err(NvidiaAttemptFailure {
+                phase: crate::ExecutionFailurePhase::ResponseReceived,
+                detail: Self::response_shape_detail(&raw),
+                retryable: false,
+                retry_after,
+                quota_observations,
+            });
+        }
+        Ok(InferenceResponse {
+            content: content.to_owned(),
+            model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
+            provider: Some("nvidia".to_owned()),
+            usage_cost_usd: Some(0.0),
+            usage: TokenUsage::from_openai_compatible(&raw),
+            quota_observations,
+            raw,
+        })
+    }
+
     fn retryable_status(status: StatusCode) -> bool {
         status == StatusCode::REQUEST_TIMEOUT
             || status == StatusCode::TOO_MANY_REQUESTS
@@ -284,74 +378,28 @@ impl InferenceProvider for NvidiaNim {
         let mut backoff = retry.initial_backoff;
         let mut last_error = None;
         let mut last_phase = None;
+        let mut last_quota_observations = Vec::new();
 
         for attempt in 1..=retry.max_attempts {
-            match self
-                .client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => {
-                    let raw: Value =
-                        response
-                            .json()
-                            .await
-                            .map_err(|error| ProviderError::Execution {
-                                phase: crate::ExecutionFailurePhase::ResponseReceived,
-                                detail: error.to_string(),
-                            })?;
-                    let Some(content) = raw
-                        .pointer("/choices/0/message/content")
-                        .and_then(Value::as_str)
-                    else {
-                        return Err(ProviderError::Execution {
-                            phase: crate::ExecutionFailurePhase::ResponseReceived,
-                            detail: Self::response_shape_detail(&raw),
-                        });
-                    };
-                    if content.is_empty() {
-                        return Err(ProviderError::Execution {
-                            phase: crate::ExecutionFailurePhase::ResponseReceived,
-                            detail: Self::response_shape_detail(&raw),
-                        });
+            match self.execute_once(&url, &body).await {
+                Ok(response) => return Ok(response),
+                Err(failure) if !failure.retryable => return Err(failure.into_provider_error()),
+                Err(failure) => {
+                    if last_phase.is_none()
+                        || failure.phase == crate::ExecutionFailurePhase::ResponseReceived
+                    {
+                        last_phase = Some(failure.phase);
                     }
-                    return Ok(InferenceResponse {
-                        content: content.to_owned(),
-                        model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
-                        provider: Some("nvidia".to_owned()),
-                        usage_cost_usd: Some(0.0),
-                        usage: TokenUsage::from_openai_compatible(&raw),
-                        raw,
-                    });
-                }
-                Ok(response) => {
-                    let status = response.status();
-                    let retry_after = Self::retry_after(&response);
-                    let text = response.text().await.unwrap_or_default();
-                    last_error = Some(format!("HTTP {status}: {text}"));
-                    last_phase = Some(crate::ExecutionFailurePhase::ResponseReceived);
-                    if !Self::retryable_status(status) {
-                        return Err(ProviderError::Execution {
-                            phase: crate::ExecutionFailurePhase::ResponseReceived,
-                            detail: last_error.unwrap_or_else(|| "request failed".to_owned()),
-                        });
+                    if !failure.quota_observations.is_empty() {
+                        last_quota_observations = failure.quota_observations;
                     }
+                    last_error = Some(failure.detail);
                     if attempt < retry.max_attempts {
-                        let delay = retry_after.unwrap_or(backoff).min(retry.max_backoff);
+                        let delay = failure
+                            .retry_after
+                            .unwrap_or(backoff)
+                            .min(retry.max_backoff);
                         sleep(delay).await;
-                        backoff = backoff.saturating_mul(2).min(retry.max_backoff);
-                    }
-                }
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                    if last_phase.is_none() {
-                        last_phase = Some(crate::ExecutionFailurePhase::TransportUnknown);
-                    }
-                    if attempt < retry.max_attempts {
-                        sleep(backoff).await;
                         backoff = backoff.saturating_mul(2).min(retry.max_backoff);
                     }
                 }
@@ -360,6 +408,7 @@ impl InferenceProvider for NvidiaNim {
         Err(ProviderError::Execution {
             phase: last_phase.unwrap_or(crate::ExecutionFailurePhase::TransportUnknown),
             detail: last_error.unwrap_or_else(|| "request failed without an error body".to_owned()),
+            quota_observations: last_quota_observations,
         })
     }
 }
@@ -442,11 +491,18 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buffer = [0_u8; 4096];
                 let _ = stream.read(&mut buffer);
-                let response = b"HTTP/1.1 429 Too Many Requests
-Content-Length: 0
-Connection: close
-
-";
+                let response = concat!(
+                    "HTTP/1.1 429 Too Many Requests\r\n",
+                    "X-RateLimit-Limit-Requests: 1000\r\n",
+                    "X-RateLimit-Remaining-Requests: 0\r\n",
+                    "X-RateLimit-Reset-Requests: 8.5s\r\n",
+                    "X-RateLimit-Limit-Tokens: 8000\r\n",
+                    "X-RateLimit-Remaining-Tokens: 7777\r\n",
+                    "X-RateLimit-Reset-Tokens: 2.25s\r\n",
+                    "Content-Length: 0\r\n",
+                    "Connection: close\r\n\r\n",
+                )
+                .as_bytes();
                 let _ = stream.write_all(response);
                 let _ = stream.flush();
             }
@@ -468,6 +524,14 @@ Connection: close
             Some(crate::ExecutionFailurePhase::ResponseReceived)
         );
         assert!(error.to_string().contains("HTTP 429"));
+        let observations = error.quota_observations();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].bucket, "rate_limit.requests");
+        assert_eq!(observations[0].limit, Some(1_000));
+        assert_eq!(observations[0].remaining, Some(0));
+        assert_eq!(observations[0].reset_after_millis, Some(8_500));
+        assert_eq!(observations[1].bucket, "rate_limit.tokens");
+        assert_eq!(observations[1].remaining, Some(7_777));
         Ok(())
     }
 

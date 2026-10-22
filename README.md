@@ -120,3 +120,5 @@ Implement `InferenceProvider` for another service. The adapter owns endpoint dis
 ## Cache-aware routing
 
 The normalized model already records endpoint cache support and cache pricing. A future cache-affinity layer can add "where is this prefix warm?" observations without changing `RoutingStrategy` or provider request types.
+
+Provider responses may carry normalized quota observations (currently the standard request/token `x-ratelimit-*` family used by services such as Groq). Adapters preserve only typed limit/remaining/reset facts, never raw headers. Observation bucket names do not imply ownership: `QuotaObservationMap` explicitly maps a bucket on a specific execution-surface/credential/provider/model route to a logical quota resource, so organization-wide and key-local limits cannot be conflated by header parsing alone.

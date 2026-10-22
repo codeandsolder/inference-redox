@@ -490,6 +490,7 @@ mod tests {
                 return Err(ProviderError::Execution {
                     phase: crate::ExecutionFailurePhase::TransportUnknown,
                     detail: "mock failure".to_owned(),
+                    quota_observations: Vec::new(),
                 });
             }
             Ok(InferenceResponse {
@@ -503,6 +504,7 @@ mod tests {
                     total_tokens: Some(30),
                     reasoning_tokens: None,
                 },
+                quota_observations: Vec::new(),
                 raw: json!({"native_model": request.model, "mock_price": self.price}),
             })
         }

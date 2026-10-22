@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Endpoint, InferenceRequest, InferenceResponse, RetryPolicy, RoutePlan, RoutingStrategy,
+    Endpoint, InferenceRequest, InferenceResponse, QuotaObservation, RetryPolicy, RoutePlan,
+    RoutingStrategy,
 };
 
 /// How far an inference attempt definitely progressed before failing.
@@ -35,6 +36,7 @@ pub enum ProviderError {
     Execution {
         phase: ExecutionFailurePhase,
         detail: String,
+        quota_observations: Vec<QuotaObservation>,
     },
     #[error("provider response error: {0}")]
     Response(String),
@@ -46,6 +48,16 @@ impl ProviderError {
         match self {
             Self::Execution { phase, .. } => Some(*phase),
             _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn quota_observations(&self) -> &[QuotaObservation] {
+        match self {
+            Self::Execution {
+                quota_observations, ..
+            } => quota_observations,
+            _ => &[],
         }
     }
 }
