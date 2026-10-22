@@ -972,6 +972,7 @@ impl OpenRouterEndpoint {
         let provider_key = id.split('/').next().unwrap_or(&id).to_owned();
         Endpoint {
             source: "openrouter".to_owned(),
+            credential: None,
             provider_key,
             id,
             provider: self.provider_name.unwrap_or_else(|| "unknown".to_owned()),
@@ -1213,6 +1214,7 @@ mod tests {
         };
         let endpoint = Endpoint {
             source: "openrouter".to_owned(),
+            credential: None,
             provider_key: "fast-provider".to_owned(),
             id: "fast-provider/fp8".to_owned(),
             provider: "Fast Provider".to_owned(),
@@ -1496,6 +1498,7 @@ mod tests {
         let request = InferenceRequest::new("openai/gpt-6-luna", "hello", 64);
         let mut endpoint = Endpoint {
             source: "openrouter".to_owned(),
+            credential: None,
             provider_key: "openai".to_owned(),
             id: "openai/flex".to_owned(),
             provider: "OpenAI".to_owned(),
@@ -1543,6 +1546,7 @@ mod tests {
         let request = InferenceRequest::new("vendor/model", "hello", 64);
         let mut fast = Endpoint {
             source: "openrouter".to_owned(),
+            credential: None,
             provider_key: "fast".to_owned(),
             id: "fast/fp8".to_owned(),
             provider: "Fast".to_owned(),

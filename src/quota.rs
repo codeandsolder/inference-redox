@@ -108,10 +108,10 @@ pub struct QuotaRouteKey {
 
 impl QuotaRouteKey {
     #[must_use]
-    pub fn from_endpoint(endpoint: &Endpoint, credential: Option<String>) -> Self {
+    pub fn from_endpoint(endpoint: &Endpoint) -> Self {
         Self {
             source: endpoint.source.clone(),
-            credential,
+            credential: endpoint.credential.clone(),
             provider: endpoint.provider_key.clone(),
             model: endpoint.model.clone(),
         }
@@ -445,6 +445,33 @@ mod tests {
             provider: "provider".to_owned(),
             model: "model".to_owned(),
         }
+    }
+
+    #[test]
+    fn endpoint_credential_becomes_quota_route_identity() {
+        let endpoint = Endpoint {
+            source: "nvidia".to_owned(),
+            credential: Some("account-a".to_owned()),
+            provider_key: "nvidia".to_owned(),
+            id: "nvidia".to_owned(),
+            provider: "NVIDIA NIM".to_owned(),
+            model: "vendor/model".to_owned(),
+            route_class: crate::ModelRouteClass::Free,
+            display_name: "model".to_owned(),
+            quantization: None,
+            status: 0,
+            context_length: None,
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: crate::Pricing::default(),
+            stats: crate::EndpointStats::default(),
+            capabilities: crate::EndpointCapabilities::default(),
+        };
+        let key = QuotaRouteKey::from_endpoint(&endpoint);
+        assert_eq!(key.source, "nvidia");
+        assert_eq!(key.credential.as_deref(), Some("account-a"));
+        assert_eq!(key.provider, "nvidia");
+        assert_eq!(key.model, "vendor/model");
     }
 
     #[test]

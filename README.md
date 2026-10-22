@@ -101,6 +101,8 @@ Batch is a first-class asynchronous execution class, not a slow synchronous mode
 
 Quota is modeled as shared resources, not as `API key × model = faucet`. A `QuotaRouteKey` can bind to any number of credential-, account-, provider-, model-family-, model-, or route-scoped buckets. Multiple credentials bind to the same resource ID when the upstream limit is actually shared, so adding keys cannot multiply account-scoped RPD/TPD by construction.
 
+Execution instances are keyed separately by provider source and an opaque credential/account label. This lets the pool hold multiple accounts for the same provider without putting secrets into routing metadata; selected endpoints retain that label, so execution dispatch and quota binding refer to the same logical account. `register(source, ...)` remains the default-credential shorthand while `register_credential(source, label, ...)` adds explicit instances.
+
 Finite, unknown, and explicitly unlimited quota are separate states. Unknown limits or unknown credit cost produce an `Indeterminate` admission result rather than being treated as infinity. Provider reset timestamps are observation boundaries: once a reported reset time passes, the observation becomes unknown until refreshed instead of assuming every provider refills the same way. `QuotaLedger` reserves finite headroom for concurrent work, releases unaccepted requests, and commits actual token/credit usage when available.
 
 ## Provider architecture

@@ -247,6 +247,9 @@ pub struct EndpointStats {
 pub struct Endpoint {
     /// Execution surface, e.g. `openrouter` or direct `nvidia`.
     pub source: String,
+    /// Opaque logical credential/account label. Never contains the secret itself.
+    #[serde(default)]
+    pub credential: Option<String>,
     /// Stable provider selector within the execution surface.
     pub provider_key: String,
     pub id: String,

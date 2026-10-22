@@ -9,11 +9,26 @@ use crate::{
     build_route_plan,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProviderInstanceKey {
+    source: String,
+    credential: Option<String>,
+}
+
+impl ProviderInstanceKey {
+    fn new(source: impl Into<String>, credential: Option<String>) -> Self {
+        Self {
+            source: source.into(),
+            credential,
+        }
+    }
+}
+
 /// Cross-provider coordinator. Catalog identity and provider execution stay separate:
 /// callers name a canonical model/alias, while each adapter receives its native route ID.
 #[derive(Clone, Default)]
 pub struct InferencePool {
-    providers: BTreeMap<String, Arc<dyn InferenceProvider>>,
+    providers: BTreeMap<ProviderInstanceKey, Arc<dyn InferenceProvider>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,7 +48,20 @@ impl InferencePool {
     where
         P: InferenceProvider + 'static,
     {
-        self.providers.insert(source.into(), provider);
+        self.register_dyn(source, provider);
+    }
+
+    /// Register another logical credential/account for one execution surface.
+    /// The label is opaque routing metadata and must never contain the secret itself.
+    pub fn register_credential<P>(
+        &mut self,
+        source: impl Into<String>,
+        credential: impl Into<String>,
+        provider: Arc<P>,
+    ) where
+        P: InferenceProvider + 'static,
+    {
+        self.register_dyn_credential(source, credential, provider);
     }
 
     pub fn register_dyn(
@@ -41,7 +69,20 @@ impl InferencePool {
         source: impl Into<String>,
         provider: Arc<dyn InferenceProvider>,
     ) {
-        self.providers.insert(source.into(), provider);
+        self.providers
+            .insert(ProviderInstanceKey::new(source, None), provider);
+    }
+
+    pub fn register_dyn_credential(
+        &mut self,
+        source: impl Into<String>,
+        credential: impl Into<String>,
+        provider: Arc<dyn InferenceProvider>,
+    ) {
+        self.providers.insert(
+            ProviderInstanceKey::new(source, Some(credential.into())),
+            provider,
+        );
     }
 
     /// Discover provider-native endpoints for the request's canonical model/alias.
@@ -78,19 +119,23 @@ impl InferencePool {
             {
                 continue;
             }
-            let Some(provider) = self.providers.get(&route.source) else {
-                continue;
-            };
-            let Ok(mut discovered) = provider.endpoints(&route.id).await else {
-                continue;
-            };
-            for endpoint in &mut discovered {
-                // The catalog route is authoritative for execution class and model spelling.
-                endpoint.source.clone_from(&route.source);
-                endpoint.model.clone_from(&route.id);
-                endpoint.route_class = route.route_class;
+            for (instance, provider) in self
+                .providers
+                .iter()
+                .filter(|(instance, _)| instance.source == route.source)
+            {
+                let Ok(mut discovered) = provider.endpoints(&route.id).await else {
+                    continue;
+                };
+                for endpoint in &mut discovered {
+                    // Catalog identity and registry credential are authoritative over adapter hints.
+                    endpoint.source.clone_from(&route.source);
+                    endpoint.credential.clone_from(&instance.credential);
+                    endpoint.model.clone_from(&route.id);
+                    endpoint.route_class = route.route_class;
+                }
+                endpoints.extend(discovered);
             }
-            endpoints.extend(discovered);
         }
 
         if endpoints.is_empty() {
@@ -138,7 +183,11 @@ impl InferencePool {
         let plan = self.route(catalog, strategy, request).await?;
         let mut attempted = 0_usize;
         for candidate in plan.candidates.clone() {
-            let Some(provider) = self.providers.get(&candidate.endpoint.source) else {
+            let instance = ProviderInstanceKey::new(
+                candidate.endpoint.source.clone(),
+                candidate.endpoint.credential.clone(),
+            );
+            let Some(provider) = self.providers.get(&instance) else {
                 continue;
             };
             attempted += 1;
@@ -198,6 +247,7 @@ mod tests {
                 .push(model.to_owned());
             Ok(vec![Endpoint {
                 source: self.source.to_owned(),
+                credential: None,
                 provider_key: self.source.to_owned(),
                 id: self.source.to_owned(),
                 provider: self.source.to_owned(),
@@ -240,7 +290,7 @@ mod tests {
                 model: Some(request.model.clone()),
                 provider: Some(self.source.to_owned()),
                 usage_cost_usd: None,
-                raw: json!({"native_model": request.model}),
+                raw: json!({"native_model": request.model, "mock_price": self.price}),
             })
         }
     }
@@ -380,6 +430,81 @@ mod tests {
                 .get("native_model")
                 .and_then(|v| v.as_str()),
             Some("vendor/native-model")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_source_credentials_remain_distinct_through_discovery_and_execution()
+    -> Result<(), ProviderError> {
+        let expensive_calls = Arc::new(StdMutex::new(Vec::new()));
+        let cheap_calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut pool = InferencePool::new();
+        pool.register_credential(
+            "nvidia",
+            "account-expensive",
+            Arc::new(MockProvider {
+                source: "nvidia",
+                price: 2e-6,
+                fail_execute: false,
+                calls: Arc::clone(&expensive_calls),
+            }),
+        );
+        pool.register_credential(
+            "nvidia",
+            "account-cheap",
+            Arc::new(MockProvider {
+                source: "nvidia",
+                price: 0.0,
+                fail_execute: false,
+                calls: Arc::clone(&cheap_calls),
+            }),
+        );
+        let request = InferenceRequest::new("vendor/model", "hi", 8);
+        let endpoints = pool.endpoints(&catalog(), &request).await?;
+        let credentials: BTreeSet<_> = endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.credential.as_deref())
+            .collect();
+        assert_eq!(
+            credentials,
+            BTreeSet::from(["account-cheap", "account-expensive"])
+        );
+
+        let result = pool
+            .infer(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                RetryPolicy::default(),
+            )
+            .await?;
+        assert_eq!(
+            result.selected.endpoint.credential.as_deref(),
+            Some("account-cheap")
+        );
+        assert_eq!(
+            result
+                .response
+                .raw
+                .get("mock_price")
+                .and_then(serde_json::Value::as_f64),
+            Some(0.0)
+        );
+        let expensive = expensive_calls
+            .lock()
+            .map_err(|_| ProviderError::Catalog("poisoned test mutex".to_owned()))?;
+        // Discovery happened for both credentials, but the expensive credential never executed.
+        assert_eq!(
+            expensive.as_slice(),
+            ["vendor/native-model", "vendor/native-model"]
+        );
+        let cheap = cheap_calls
+            .lock()
+            .map_err(|_| ProviderError::Catalog("poisoned test mutex".to_owned()))?;
+        assert_eq!(
+            cheap.as_slice(),
+            ["vendor/native-model", "vendor/native-model"]
         );
         Ok(())
     }

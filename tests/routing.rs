@@ -10,6 +10,7 @@ use serde_json::json;
 fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f64) -> Endpoint {
     Endpoint {
         source: "test".to_owned(),
+        credential: None,
         provider_key: id.to_owned(),
         id: id.to_owned(),
         provider: id.to_owned(),

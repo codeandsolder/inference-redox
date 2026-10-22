@@ -216,6 +216,7 @@ impl InferenceProvider for NvidiaNim {
         }
         Ok(vec![Endpoint {
             source: "nvidia".to_owned(),
+            credential: None,
             provider_key: "nvidia".to_owned(),
             id: "nvidia".to_owned(),
             provider: "NVIDIA NIM".to_owned(),

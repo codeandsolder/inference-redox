@@ -339,6 +339,7 @@ mod tests {
     fn endpoint(id: &str, model: &str) -> Endpoint {
         Endpoint {
             source: "openrouter".to_owned(),
+            credential: None,
             provider_key: id.split('/').next().unwrap_or(id).to_owned(),
             id: id.to_owned(),
             provider: "provider".to_owned(),
