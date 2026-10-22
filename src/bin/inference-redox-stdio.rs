@@ -7,7 +7,7 @@ use std::time::Duration;
 use inference_redox::providers::{nvidia::NvidiaNim, openrouter::OpenRouter};
 use inference_redox::{
     BatchInferenceItem, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
-    ProviderError, RetryPolicy, RoutingStrategy,
+    ModelSuitabilityRequirements, ProviderError, RetryPolicy, RoutingStrategy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +24,7 @@ enum Operation {
     RoutePool,
     Models,
     ResolveModel,
+    Suitability,
     SubmitBatch,
     BatchStatus,
     DeleteBatch,
@@ -59,6 +60,8 @@ struct WireRequest {
     request: Option<InferenceRequest>,
     #[serde(default)]
     query: Option<String>,
+    #[serde(default)]
+    suitability: Option<ModelSuitabilityRequirements>,
     #[serde(default)]
     batch_model: Option<String>,
     #[serde(default)]
@@ -140,7 +143,13 @@ async fn handle_catalog_operation(
     stdout: &Arc<Mutex<tokio::io::Stdout>>,
     wire: WireRequest,
 ) {
-    let WireRequest { id, op, query, .. } = wire;
+    let WireRequest {
+        id,
+        op,
+        query,
+        suitability,
+        ..
+    } = wire;
     match op {
         Operation::Models => match providers.catalog().await {
             Ok(catalog) => {
@@ -156,6 +165,26 @@ async fn handle_catalog_operation(
             }
             Err(error) => write_error(stdout, id, error.to_string()).await,
         },
+        Operation::Suitability => {
+            let Some(requirements) = suitability else {
+                write_error(stdout, id, "suitability requires suitability").await;
+                return;
+            };
+            match providers.catalog().await {
+                Ok(catalog) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: catalog.suitability_reports(&requirements),
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
         Operation::ResolveModel => {
             let Some(query) = query else {
                 write_error(stdout, id, "resolve_model requires query").await;
@@ -411,7 +440,7 @@ async fn handle_openrouter_operation(
 
 async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, request: WireRequest) {
     match request.op {
-        Operation::Models | Operation::ResolveModel => {
+        Operation::Models | Operation::ResolveModel | Operation::Suitability => {
             handle_catalog_operation(&providers, &stdout, request).await;
         }
         Operation::SubmitBatch | Operation::BatchStatus | Operation::DeleteBatch => {
@@ -534,7 +563,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::key_from_contents;
+    use super::{Operation, WireRequest, key_from_contents};
+    use serde_json::json;
 
     #[test]
     fn env_file_parser_handles_export_quotes_and_crlf() {
@@ -551,5 +581,21 @@ mod tests {
             key_from_contents("NVIDIA_API_key=legacy", "NVIDIA_API_key").as_deref(),
             Some("legacy")
         );
+    }
+
+    #[test]
+    fn suitability_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 1,
+            "op": "suitability",
+            "suitability": {"minimum_coding_index": 50.0}
+        }))?;
+        assert!(matches!(wire.op, Operation::Suitability));
+        assert_eq!(
+            wire.suitability
+                .and_then(|value| value.minimum_coding_index),
+            Some(50.0)
+        );
+        Ok(())
     }
 }
