@@ -45,6 +45,17 @@ fn supports_request(endpoint: &Endpoint, request: &InferenceRequest, prompt_toke
     {
         return false;
     }
+    if request.temperature.is_some() && !endpoint.capabilities.supports_parameter("temperature") {
+        return false;
+    }
+    if request.max_output_tokens.is_some()
+        && !endpoint.capabilities.supports_parameter("max_tokens")
+        && !endpoint
+            .capabilities
+            .supports_parameter("max_completion_tokens")
+    {
+        return false;
+    }
     match request.requirements.response_schema.as_ref() {
         None => {}
         Some(ResponseSchema::JsonObject) => {
@@ -53,14 +64,12 @@ fn supports_request(endpoint: &Endpoint, request: &InferenceRequest, prompt_toke
             }
         }
         Some(ResponseSchema::JsonSchema { strict, .. }) => {
-            if !endpoint.capabilities.supports_parameter("response_format") {
-                return false;
-            }
-            if *strict
-                && !endpoint
-                    .capabilities
-                    .supports_parameter("structured_outputs")
-            {
+            let parameter = if *strict {
+                "structured_outputs"
+            } else {
+                "response_format"
+            };
+            if !endpoint.capabilities.supports_parameter(parameter) {
                 return false;
             }
         }

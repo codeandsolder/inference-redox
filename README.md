@@ -84,13 +84,17 @@ Model identity is deliberately separate from provider endpoints. OpenRouter's `/
 
 Name resolution is conservative: exact aliases first, normalized full names second, then a basename match only when it identifies exactly one canonical model. That lets a provider-native name such as `stepfun-ai/step-5-preview` resolve to an OpenRouter spelling such as `stepfun/step-5-preview` without maintaining a vendor-renaming table; ambiguous basenames are returned as ambiguous rather than guessed.
 
-This is intentionally not an availability model. A provider can advertise a model that is currently unhealthy or not entitled for a particular account, and multiple providers can expose the same canonical model under different names. Provider-local availability, health, quota and price observations belong to routing state, not model identity. Endpoint `supported_parameters` are likewise treated as nominal provider/catalog claims: conformance observations can separately mark parameters verified or rejected, and rejected observations override optimistic provider metadata during routing.
+Provider-native inventories are a separate input. A direct provider route is attached to an existing OpenRouter-backed canonical identity when resolution succeeds; otherwise its native `author/model` ID becomes a provisional canonical identity. Routes carry both `source` and `id`, so `nvidia/nemotron-...` through direct NIM is distinct from the same model string through OpenRouter. NVIDIA NIM is the first native inventory adapter. A provider's `/models` listing is only an advertisement, not proof that the route is callable.
+
+This is intentionally not an availability model. A provider can advertise a model that is currently unhealthy or not entitled for a particular account, and multiple providers can expose the same canonical model under different names. Provider-local availability, health, quota and price observations belong to routing state, not model identity.
+
+Capabilities have three independent evidence layers. `adapter_parameters` says what inference-redox can actually encode on the wire; `supported_parameters` is the provider/catalog's nominal claim; versioned conformance observations can verify or reject claims for one execution-surface/provider/model scope. Effective support requires adapter support and either a provider claim or successful probe, while a failed probe vetoes both. This prevents optimistic provider metadata from advertising features the adapter cannot even send yet. Transient HTTP errors remain inconclusive rather than becoming negative capability evidence.
 
 The stdio bridge exposes `models` and `resolve_model` operations alongside `route` and `infer`, so long-lived callers can keep the catalog cache warm and share one normalization layer.
 
 ## Provider architecture
 
-Implement `InferenceProvider` for another service. The adapter owns endpoint discovery and exact request/response grammar; core routing stays independent of OpenAI-compatible assumptions.
+Implement `InferenceProvider` for another service. The adapter owns endpoint discovery and exact request/response grammar; core routing stays independent of OpenAI-compatible assumptions. OpenRouter and direct NVIDIA NIM both implement the trait. NVIDIA currently normalizes plain chat/system prompts, max tokens, temperature and JSON response formats; reasoning/tool dialects remain deliberately unavailable until normalized and conformance-tested.
 
 ## Cache-aware routing
 

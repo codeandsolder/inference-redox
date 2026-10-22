@@ -179,6 +179,8 @@ pub enum ResponseSchema {
 /// Normalized endpoint capabilities used before routing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointCapabilities {
+    /// Parameters the adapter can actually encode on the wire.
+    pub adapter_parameters: BTreeSet<String>,
     /// Provider/catalog claims. These are nominal until conformance-tested.
     pub supported_parameters: BTreeSet<String>,
     /// Parameters observed to work on this provider/model route.
@@ -195,7 +197,9 @@ impl EndpointCapabilities {
     /// Effective parameter support, with observations overriding nominal claims.
     #[must_use]
     pub fn supports_parameter(&self, parameter: &str) -> bool {
-        if self.rejected_parameters.contains(parameter) {
+        if self.rejected_parameters.contains(parameter)
+            || !self.adapter_parameters.contains(parameter)
+        {
             return false;
         }
         self.verified_parameters.contains(parameter)
@@ -214,6 +218,7 @@ impl EndpointCapabilities {
 impl Default for EndpointCapabilities {
     fn default() -> Self {
         Self {
+            adapter_parameters: BTreeSet::new(),
             supported_parameters: BTreeSet::new(),
             verified_parameters: BTreeSet::new(),
             rejected_parameters: BTreeSet::new(),
@@ -238,6 +243,10 @@ pub struct EndpointStats {
 /// A normalized endpoint from any inference provider/gateway.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Endpoint {
+    /// Execution surface, e.g. `openrouter` or direct `nvidia`.
+    pub source: String,
+    /// Stable provider selector within the execution surface.
+    pub provider_key: String,
     pub id: String,
     pub provider: String,
     pub model: String,

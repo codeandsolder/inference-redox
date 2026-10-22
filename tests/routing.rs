@@ -9,6 +9,8 @@ use serde_json::json;
 
 fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f64) -> Endpoint {
     Endpoint {
+        source: "test".to_owned(),
+        provider_key: id.to_owned(),
         id: id.to_owned(),
         provider: id.to_owned(),
         model: "x/model".to_owned(),
@@ -40,10 +42,29 @@ fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f6
             ..EndpointStats::default()
         },
         capabilities: EndpointCapabilities {
-            supported_parameters: ["response_format", "structured_outputs", "reasoning"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            adapter_parameters: [
+                "max_tokens",
+                "max_completion_tokens",
+                "temperature",
+                "response_format",
+                "structured_outputs",
+                "reasoning",
+                "reasoning_effort",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            supported_parameters: [
+                "max_tokens",
+                "max_completion_tokens",
+                "temperature",
+                "response_format",
+                "structured_outputs",
+                "reasoning",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
             verified_parameters: BTreeSet::new(),
             rejected_parameters: BTreeSet::new(),
             reasoning: ReasoningSupport::GatewayNormalized,
@@ -133,6 +154,31 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
     assert_eq!(plan.candidates.len(), 1);
     assert_eq!(plan.candidates[0].endpoint.id, "capable");
     Ok(())
+}
+
+#[test]
+fn provider_claim_cannot_exceed_adapter_wire_support() {
+    let mut optimistic = endpoint("optimistic-provider", 1e-6, 1e-6, 0.1, 100.0);
+    optimistic
+        .capabilities
+        .supported_parameters
+        .insert("tools".to_owned());
+
+    let mut request = InferenceRequest::new("x/model", "x", 100);
+    request.prompt_tokens = Some(100);
+    request
+        .requirements
+        .required_parameters
+        .insert("tools".to_owned());
+
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![optimistic],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
 }
 
 #[test]

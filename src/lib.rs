@@ -1,6 +1,8 @@
 #![doc = "Provider-agnostic inference routing with shape-aware endpoint selection."]
 
 mod catalog;
+mod conformance;
+mod inventory;
 mod model;
 mod provider;
 mod router;
@@ -11,7 +13,13 @@ pub use catalog::{
     ArtificialAnalysisBenchmarks, DesignArenaBenchmark, ModelArchitecture, ModelBenchmarks,
     ModelCatalog, ModelCatalogEntry, ModelLookup, ModelMatchKind, ModelReasoning, ModelRouteClass,
     ModelTopProvider, ResolvedModel, ResolvedModelRoute, normalize_model_name,
-    normalize_model_slug,
+    normalize_model_slug, provisional_canonical_id,
+};
+pub use conformance::{
+    ConformanceObservation, ConformanceOutcome, ConformanceProbe, ConformanceProfile,
+};
+pub use inventory::{
+    InventoryResolution, NativeModelRecord, ProviderInventory, ProviderModelObservation,
 };
 pub use model::{
     EffectivePricing, Endpoint, EndpointCapabilities, EndpointStats, InferenceRequest,

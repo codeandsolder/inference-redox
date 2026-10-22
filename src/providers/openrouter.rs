@@ -132,10 +132,7 @@ impl OpenRouter {
     }
 
     fn provider_selector(candidate: &RouteCandidate) -> String {
-        candidate.endpoint.id.split_once('/').map_or_else(
-            || candidate.endpoint.id.clone(),
-            |(provider, _)| provider.to_owned(),
-        )
+        candidate.endpoint.provider_key.clone()
     }
 
     fn route_batches(plan: &RoutePlan) -> Vec<Vec<&RouteCandidate>> {
@@ -722,6 +719,7 @@ impl OpenRouterModel {
             context_length: self.context_length,
             architecture,
             pricing: normalize_pricing(self.pricing),
+            pricing_known: true,
             top_provider,
             supported_parameters: self
                 .supported_parameters
@@ -750,8 +748,12 @@ impl OpenRouterEndpoint {
             } else {
                 ReasoningSupport::None
             };
+        let id = self.tag;
+        let provider_key = id.split('/').next().unwrap_or(&id).to_owned();
         Endpoint {
-            id: self.tag,
+            source: "openrouter".to_owned(),
+            provider_key,
+            id,
             provider: self.provider_name.unwrap_or_else(|| "unknown".to_owned()),
             model: self.model_id.unwrap_or_else(|| requested_model.to_owned()),
             display_name: self.name.unwrap_or_else(|| requested_model.to_owned()),
@@ -771,6 +773,19 @@ impl OpenRouterEndpoint {
                 uptime_1d: self.uptime_last_1d,
             },
             capabilities: EndpointCapabilities {
+                adapter_parameters: [
+                    "max_tokens",
+                    "max_completion_tokens",
+                    "response_format",
+                    "structured_outputs",
+                    "temperature",
+                    "reasoning",
+                    "reasoning_effort",
+                    "system_role",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
                 supported_parameters: parameters,
                 verified_parameters: BTreeSet::new(),
                 rejected_parameters: BTreeSet::new(),
@@ -976,6 +991,8 @@ mod tests {
             },
         };
         let endpoint = Endpoint {
+            source: "openrouter".to_owned(),
+            provider_key: "fast-provider".to_owned(),
             id: "fast-provider/fp8".to_owned(),
             provider: "Fast Provider".to_owned(),
             model: request.model.clone(),
@@ -1167,6 +1184,8 @@ mod tests {
     fn flex_endpoint_sets_service_tier_and_base_provider_selector() {
         let request = InferenceRequest::new("openai/gpt-6-luna", "hello", 64);
         let mut endpoint = Endpoint {
+            source: "openrouter".to_owned(),
+            provider_key: "openai".to_owned(),
             id: "openai/flex".to_owned(),
             provider: "OpenAI".to_owned(),
             model: request.model.clone(),
@@ -1211,6 +1230,8 @@ mod tests {
     fn local_telemetry_uses_explicit_ranked_order() {
         let request = InferenceRequest::new("vendor/model", "hello", 64);
         let mut fast = Endpoint {
+            source: "openrouter".to_owned(),
+            provider_key: "fast".to_owned(),
             id: "fast/fp8".to_owned(),
             provider: "Fast".to_owned(),
             model: request.model.clone(),

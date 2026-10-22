@@ -1,11 +1,13 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use inference_redox::providers::openrouter::OpenRouter;
-use inference_redox::{InferenceProvider, InferenceRequest, RetryPolicy, RoutingStrategy};
+use inference_redox::providers::{nvidia::NvidiaNim, openrouter::OpenRouter};
+use inference_redox::{
+    InferenceProvider, InferenceRequest, ModelCatalog, ProviderError, RetryPolicy, RoutingStrategy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -70,6 +72,24 @@ struct WireError {
     error: String,
 }
 
+#[derive(Clone)]
+struct Providers {
+    openrouter: Arc<OpenRouter>,
+    nvidia: Option<Arc<NvidiaNim>>,
+}
+
+impl Providers {
+    async fn catalog(&self) -> Result<ModelCatalog, ProviderError> {
+        let mut catalog = self.openrouter.models().await?;
+        if let Some(nvidia) = self.nvidia.as_ref()
+            && let Ok(inventory) = nvidia.inventory(&catalog).await
+        {
+            catalog.ingest_provider_inventory(&inventory);
+        }
+        Ok(catalog)
+    }
+}
+
 async fn write_json<T: Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
     let Ok(mut bytes) = serde_json::to_vec(value) else {
         return;
@@ -92,11 +112,7 @@ async fn write_error(stdout: &Arc<Mutex<tokio::io::Stdout>>, id: Value, error: i
     .await;
 }
 
-async fn handle(
-    provider: Arc<OpenRouter>,
-    stdout: Arc<Mutex<tokio::io::Stdout>>,
-    request: WireRequest,
-) {
+async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, request: WireRequest) {
     let WireRequest {
         id,
         op,
@@ -107,7 +123,7 @@ async fn handle(
     } = request;
 
     match op {
-        Operation::Models => match provider.models().await {
+        Operation::Models => match providers.catalog().await {
             Ok(catalog) => {
                 write_json(
                     &stdout,
@@ -126,14 +142,14 @@ async fn handle(
                 write_error(&stdout, id, "resolve_model requires query").await;
                 return;
             };
-            match provider.resolve_model(&query).await {
-                Ok(model) => {
+            match providers.catalog().await {
+                Ok(catalog) => {
                     write_json(
                         &stdout,
                         &WireSuccess {
                             id,
                             ok: true,
-                            result: model,
+                            result: catalog.resolve(&query),
                         },
                     )
                     .await;
@@ -153,7 +169,7 @@ async fn handle(
             let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
             match op {
                 Operation::Route => {
-                    let result = match provider.endpoints(&request.model).await {
+                    let result = match providers.openrouter.endpoints(&request.model).await {
                         Ok(endpoints) => {
                             inference_redox::build_route_plan(strategy, &request, endpoints)
                         }
@@ -177,7 +193,7 @@ async fn handle(
                 Operation::Infer => {
                     let retry =
                         retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
-                    match provider.infer(strategy, &request, retry).await {
+                    match providers.openrouter.infer(strategy, &request, retry).await {
                         Ok((route, response)) => {
                             write_json(
                                 &stdout,
@@ -198,35 +214,42 @@ async fn handle(
     }
 }
 
-fn key_from_env_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let contents = fs::read_to_string(path)?;
+fn key_from_contents(contents: &str, name: &str) -> Option<String> {
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(value) = line.strip_prefix("OPENROUTER_API_KEY=") {
-            let value = value.trim().trim_matches(['\'', '"']);
-            if !value.is_empty() {
-                return Ok(value.to_owned());
-            }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != name {
+            continue;
+        }
+        let value = value.trim().trim_matches(['\'', '"']);
+        if !value.is_empty() {
+            return Some(value.to_owned());
         }
     }
-    Err(format!("OPENROUTER_API_KEY not found in {}", path.display()).into())
+    None
 }
 
-fn load_api_key() -> Result<String, Box<dyn std::error::Error>> {
-    if let Ok(key) = env::var("OPENROUTER_API_KEY")
-        && !key.trim().is_empty()
-    {
-        return Ok(key);
-    }
+fn key_from_env_file(
+    path: &Path,
+    name: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    Ok(key_from_contents(&fs::read_to_string(path)?, name))
+}
+
+fn environment_key(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn env_file_argument() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);
     let Some(arg) = args.next() else {
-        return Err(
-            "OPENROUTER_API_KEY is unset; pass --env-file <path> or set the environment variable"
-                .into(),
-        );
+        return Ok(None);
     };
     if arg != "--env-file" {
         return Err(format!("unknown argument: {}", arg.to_string_lossy()).into());
@@ -237,13 +260,32 @@ fn load_api_key() -> Result<String, Box<dyn std::error::Error>> {
     if let Some(extra) = args.next() {
         return Err(format!("unexpected argument: {}", extra.to_string_lossy()).into());
     }
-    key_from_env_file(Path::new(&path))
+    Ok(Some(path.into()))
+}
+
+fn load_api_keys() -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    let env_file = env_file_argument()?;
+    let from_file = |name: &str| -> Result<Option<String>, Box<dyn std::error::Error>> {
+        env_file
+            .as_deref()
+            .map_or(Ok(None), |path| key_from_env_file(path, name))
+    };
+    let openrouter = environment_key("OPENROUTER_API_KEY")
+        .or(from_file("OPENROUTER_API_KEY")?)
+        .ok_or(
+            "OPENROUTER_API_KEY is unset; pass --env-file <path> or set the environment variable",
+        )?;
+    let nvidia = environment_key("NVIDIA_API_KEY").or(from_file("NVIDIA_API_KEY")?);
+    Ok((openrouter, nvidia))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = load_api_key()?;
-    let provider = Arc::new(OpenRouter::new(api_key));
+    let (openrouter_key, nvidia_key) = load_api_keys()?;
+    let providers = Providers {
+        openrouter: Arc::new(OpenRouter::new(openrouter_key)),
+        nvidia: nvidia_key.map(|key| Arc::new(NvidiaNim::new(key))),
+    };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -255,7 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         match serde_json::from_str::<WireRequest>(&line) {
             Ok(request) => {
-                tasks.spawn(handle(Arc::clone(&provider), Arc::clone(&stdout), request));
+                tasks.spawn(handle(providers.clone(), Arc::clone(&stdout), request));
                 while tasks.try_join_next().is_some() {}
             }
             Err(error) => {
@@ -273,4 +315,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     while tasks.join_next().await.is_some() {}
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_from_contents;
+
+    #[test]
+    fn env_file_parser_handles_export_quotes_and_crlf() {
+        let contents = "export OPENROUTER_API_KEY='or-key'\r\nNVIDIA_API_KEY=\"nv-key\"\r\n";
+        assert_eq!(
+            key_from_contents(contents, "OPENROUTER_API_KEY").as_deref(),
+            Some("or-key")
+        );
+        assert_eq!(
+            key_from_contents(contents, "NVIDIA_API_KEY").as_deref(),
+            Some("nv-key")
+        );
+    }
 }

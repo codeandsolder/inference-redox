@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::Pricing;
+use crate::{InventoryResolution, Pricing, ProviderInventory};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelArchitecture {
@@ -74,6 +74,9 @@ pub struct ModelCatalogEntry {
     pub context_length: Option<u64>,
     pub architecture: ModelArchitecture,
     pub pricing: Pricing,
+    #[serde(default)]
+    /// Whether `pricing` is authoritative rather than a placeholder.
+    pub pricing_known: bool,
     pub top_provider: ModelTopProvider,
     /// Model-level nominal parameter claims from the metadata authority.
     pub supported_parameters: BTreeSet<String>,
@@ -100,6 +103,7 @@ pub enum ModelMatchKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedModelRoute {
+    pub source: String,
     pub id: String,
     pub route_class: ModelRouteClass,
 }
@@ -108,6 +112,7 @@ pub struct ResolvedModelRoute {
 pub struct ResolvedModel {
     pub canonical_id: String,
     pub preferred_id: String,
+    pub preferred_route: ResolvedModelRoute,
     /// Compatibility view of route IDs; prefer `routes` when execution class matters.
     pub variants: Vec<String>,
     pub routes: Vec<ResolvedModelRoute>,
@@ -148,6 +153,57 @@ impl ModelCatalog {
         let slug_matches = self.matching_canonical_ids(|alias| normalize_model_slug(alias) == slug);
         self.finish_lookup(query, slug_matches, ModelMatchKind::UniqueSlug)
             .unwrap_or(ModelLookup::NotFound)
+    }
+
+    /// Merge provider-native inventory into the catalog. Existing OpenRouter-backed canonical
+    /// identities win; unmatched native IDs become provisional canonical identities.
+    pub fn ingest_provider_inventory(&mut self, inventory: &ProviderInventory) {
+        for observation in &inventory.models {
+            let canonical_id = match &observation.resolution {
+                InventoryResolution::Resolved { canonical_id, .. } => canonical_id.clone(),
+                InventoryResolution::Ambiguous { .. } => continue,
+                InventoryResolution::Unmatched => provisional_canonical_id(&observation.native_id),
+            };
+            if self.models.iter().any(|model| {
+                model.source == inventory.provider
+                    && model.id == observation.native_id
+                    && model.canonical_id == canonical_id
+            }) {
+                continue;
+            }
+            let mut aliases = BTreeSet::from([observation.native_id.clone(), canonical_id.clone()]);
+            if let Some(display_name) = observation.display_name.as_ref() {
+                aliases.insert(display_name.clone());
+            }
+            let pricing_known = observation.pricing.is_some();
+            self.models.push(ModelCatalogEntry {
+                id: observation.native_id.clone(),
+                route_class: observation.route_class.unwrap_or(ModelRouteClass::Standard),
+                canonical_id,
+                name: observation
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| observation.native_id.clone()),
+                description: None,
+                aliases,
+                created_unix: observation.created_unix,
+                context_length: observation.context_length,
+                architecture: ModelArchitecture::default(),
+                pricing: observation.pricing.clone().unwrap_or_default(),
+                pricing_known,
+                top_provider: ModelTopProvider {
+                    context_length: observation.context_length,
+                    max_completion_tokens: observation.max_completion_tokens,
+                    is_moderated: None,
+                },
+                supported_parameters: observation.claimed_parameters.clone(),
+                reasoning: ModelReasoning::default(),
+                benchmarks: ModelBenchmarks::default(),
+                knowledge_cutoff: None,
+                expiration_date: None,
+                source: inventory.provider.clone(),
+            });
+        }
     }
 
     #[must_use]
@@ -213,13 +269,14 @@ impl ModelCatalog {
             .iter()
             .filter(|model| model.canonical_id == canonical_id)
             .map(|model| ResolvedModelRoute {
+                source: model.source.clone(),
                 id: model.id.clone(),
                 route_class: model.route_class,
             })
             .collect();
-        routes.sort_by(|left, right| left.id.cmp(&right.id));
-        routes.dedup_by(|left, right| left.id == right.id);
-        let preferred_id = routes
+        routes.sort_by(|left, right| (&left.source, &left.id).cmp(&(&right.source, &right.id)));
+        routes.dedup_by(|left, right| left.source == right.source && left.id == right.id);
+        let preferred_route = routes
             .iter()
             .min_by_key(|route| {
                 let rank = match route.route_class {
@@ -229,18 +286,25 @@ impl ModelCatalog {
                 };
                 (rank, route.id.len(), route.id.as_str())
             })?
-            .id
             .clone();
-        let variants = routes.iter().map(|route| route.id.clone()).collect();
+        let preferred_id = preferred_route.id.clone();
+        let variants: BTreeSet<_> = routes.iter().map(|route| route.id.clone()).collect();
+        let variants = variants.into_iter().collect();
         Some(ResolvedModel {
             canonical_id: canonical_id.to_owned(),
             preferred_id,
+            preferred_route,
             variants,
             routes,
             matched_alias: matched_alias.to_owned(),
             match_kind,
         })
     }
+}
+
+#[must_use]
+pub fn provisional_canonical_id(native_id: &str) -> String {
+    native_id.trim().to_ascii_lowercase()
 }
 
 #[must_use]
@@ -284,6 +348,7 @@ mod tests {
             context_length: None,
             architecture: ModelArchitecture::default(),
             pricing: Pricing::default(),
+            pricing_known: true,
             top_provider: ModelTopProvider::default(),
             supported_parameters: BTreeSet::new(),
             reasoning: ModelReasoning::default(),
@@ -348,6 +413,55 @@ mod tests {
         };
         assert_eq!(model.match_kind, ModelMatchKind::UniqueSlug);
         assert_eq!(model.preferred_id, "stepfun/step-5-preview");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_inventory_extends_existing_and_provisional_canonical_models()
+    -> Result<(), &'static str> {
+        let mut catalog = ModelCatalog {
+            models: vec![entry(
+                "stepfun/step-5-preview",
+                "stepfun/step-5-preview-20261008",
+                "Step 5 Preview",
+            )],
+        };
+        let inventory = ProviderInventory::reconcile(
+            "nvidia",
+            vec![
+                crate::NativeModelRecord {
+                    id: "stepfun-ai/step-5-preview".to_owned(),
+                    pricing: Some(Pricing::default()),
+                    route_class: Some(ModelRouteClass::Free),
+                    ..crate::NativeModelRecord::default()
+                },
+                crate::NativeModelRecord {
+                    id: "nvidia/native-only".to_owned(),
+                    pricing: Some(Pricing::default()),
+                    route_class: Some(ModelRouteClass::Free),
+                    ..crate::NativeModelRecord::default()
+                },
+            ],
+            &catalog,
+        );
+        catalog.ingest_provider_inventory(&inventory);
+
+        let ModelLookup::Resolved { model } = catalog.resolve("stepfun-ai/step-5-preview") else {
+            return Err("expected NVIDIA Step route to resolve");
+        };
+        assert_eq!(model.canonical_id, "stepfun/step-5-preview-20261008");
+        assert!(model.routes.iter().any(|route| {
+            route.source == "nvidia"
+                && route.id == "stepfun-ai/step-5-preview"
+                && route.route_class == ModelRouteClass::Free
+        }));
+
+        let ModelLookup::Resolved { model } = catalog.resolve("nvidia/native-only") else {
+            return Err("expected provisional native canonical model");
+        };
+        assert_eq!(model.canonical_id, "nvidia/native-only");
+        assert_eq!(model.routes.len(), 1);
+        assert_eq!(model.routes[0].source, "nvidia");
         Ok(())
     }
 
