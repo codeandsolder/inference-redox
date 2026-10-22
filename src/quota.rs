@@ -313,6 +313,8 @@ pub struct QuotaObservationApplyResult {
     pub bucket: String,
     pub status: QuotaObservationApplyStatus,
     pub resource_id: Option<QuotaResourceId>,
+    /// True only when this observation replaced the post-request remaining value.
+    pub remaining_refreshed: bool,
 }
 
 impl QuotaObservationMap {
@@ -346,6 +348,7 @@ impl QuotaObservationMap {
                         bucket: observation.bucket.clone(),
                         status: QuotaObservationApplyStatus::Unbound,
                         resource_id: None,
+                        remaining_refreshed: false,
                     };
                 };
                 let Some(resource) = graph.resource_mut(&resource_id) else {
@@ -353,6 +356,7 @@ impl QuotaObservationMap {
                         bucket: observation.bucket.clone(),
                         status: QuotaObservationApplyStatus::MissingResource,
                         resource_id: Some(resource_id),
+                        remaining_refreshed: false,
                     };
                 };
                 if observation
@@ -363,6 +367,7 @@ impl QuotaObservationMap {
                         bucket: observation.bucket.clone(),
                         status: QuotaObservationApplyStatus::MetricMismatch,
                         resource_id: Some(resource_id),
+                        remaining_refreshed: false,
                     };
                 }
                 if let Some(limit) = observation.limit {
@@ -381,6 +386,7 @@ impl QuotaObservationMap {
                     bucket: observation.bucket.clone(),
                     status: QuotaObservationApplyStatus::Applied,
                     resource_id: Some(resource_id),
+                    remaining_refreshed: observation.remaining.is_some(),
                 }
             })
             .collect()
@@ -401,6 +407,7 @@ struct ActiveReservation {
 #[derive(Debug, Clone, Default)]
 pub struct QuotaLedger {
     graph: QuotaGraph,
+    observation_map: QuotaObservationMap,
     reserved: BTreeMap<QuotaResourceId, u64>,
     active: BTreeMap<QuotaReservationId, ActiveReservation>,
     next_reservation: u64,
@@ -411,6 +418,18 @@ impl QuotaLedger {
     pub fn new(graph: QuotaGraph) -> Self {
         Self {
             graph,
+            observation_map: QuotaObservationMap::new(),
+            reserved: BTreeMap::new(),
+            active: BTreeMap::new(),
+            next_reservation: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn with_observation_map(graph: QuotaGraph, observation_map: QuotaObservationMap) -> Self {
+        Self {
+            graph,
+            observation_map,
             reserved: BTreeMap::new(),
             active: BTreeMap::new(),
             next_reservation: 1,
@@ -424,6 +443,15 @@ impl QuotaLedger {
 
     pub fn graph_mut(&mut self) -> &mut QuotaGraph {
         &mut self.graph
+    }
+
+    #[must_use]
+    pub fn observation_map(&self) -> &QuotaObservationMap {
+        &self.observation_map
+    }
+
+    pub fn observation_map_mut(&mut self) -> &mut QuotaObservationMap {
+        &mut self.observation_map
     }
 
     #[must_use]
@@ -572,7 +600,48 @@ impl QuotaLedger {
             return false;
         };
         self.unreserve(&active.charges);
+        self.consume_unobserved(active, actual, now_unix, &BTreeSet::new());
+        true
+    }
+
+    /// Commit an accepted request while applying provider-reported post-request quota state.
+    /// Mapped `remaining` snapshots are authoritative for that resource and therefore suppress
+    /// local consumption for the same request; capacity/reset-only observations do not.
+    pub fn commit_with_observations(
+        &mut self,
+        reservation: QuotaReservationId,
+        route: &QuotaRouteKey,
+        actual: Option<QuotaDemand>,
+        observations: &[QuotaObservation],
+        now_unix: u64,
+    ) -> Option<Vec<QuotaObservationApplyResult>> {
+        let active = self.active.remove(&reservation)?;
+        self.unreserve(&active.charges);
+        let results = self
+            .observation_map
+            .apply(&mut self.graph, route, observations, now_unix);
+        let refreshed_remaining = results
+            .iter()
+            .filter(|result| {
+                result.status == QuotaObservationApplyStatus::Applied && result.remaining_refreshed
+            })
+            .filter_map(|result| result.resource_id.clone())
+            .collect();
+        self.consume_unobserved(active, actual, now_unix, &refreshed_remaining);
+        Some(results)
+    }
+
+    fn consume_unobserved(
+        &mut self,
+        active: ActiveReservation,
+        actual: Option<QuotaDemand>,
+        now_unix: u64,
+        refreshed_remaining: &BTreeSet<QuotaResourceId>,
+    ) {
         for resource_id in active.resources {
+            if refreshed_remaining.contains(&resource_id) {
+                continue;
+            }
             let reserved_amount = active.charges.get(&resource_id).copied();
             let Some(resource) = self.graph.resource_mut(&resource_id) else {
                 continue;
@@ -597,7 +666,6 @@ impl QuotaLedger {
                 (QuotaAmount::Unknown | QuotaAmount::Unlimited, _) => {}
             }
         }
-        true
     }
 
     fn unreserve(&mut self, charges: &BTreeMap<QuotaResourceId, u64>) {
@@ -725,6 +793,82 @@ mod tests {
             100,
         );
         assert_eq!(unbound[0].status, QuotaObservationApplyStatus::Unbound);
+    }
+
+    #[test]
+    fn observed_remaining_is_not_locally_subtracted_twice() {
+        let route = route("key");
+        let requests = QuotaResource::finite(
+            "provider/rpd",
+            QuotaScope::Account,
+            QuotaMetric::Requests,
+            100,
+            100,
+        );
+        let request_id = requests.id.clone();
+        let tokens = QuotaResource::finite(
+            "provider/tpm",
+            QuotaScope::Account,
+            QuotaMetric::TotalTokens,
+            1_000,
+            1_000,
+        );
+        let token_id = tokens.id.clone();
+        let mut graph = QuotaGraph::new();
+        graph.insert_resource(requests);
+        graph.insert_resource(tokens);
+        assert!(graph.bind(route.clone(), &request_id));
+        assert!(graph.bind(route.clone(), &token_id));
+        let mut observation_map = QuotaObservationMap::new();
+        observation_map.bind(route.clone(), "rate_limit.requests", request_id.clone());
+        observation_map.bind(route.clone(), "rate_limit.tokens", token_id.clone());
+        let mut ledger = QuotaLedger::with_observation_map(graph, observation_map);
+        let demand = QuotaDemand {
+            requests: 1,
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            concurrent_requests: 1,
+            ..QuotaDemand::default()
+        };
+        let reservation = match ledger.reserve(&route, demand, 100) {
+            Ok(id) => id,
+            Err(report) => return assert_eq!(report.admission, QuotaAdmission::Admitted),
+        };
+        let observations = [
+            QuotaObservation {
+                bucket: "rate_limit.requests".to_owned(),
+                metric: Some(QuotaMetric::Requests),
+                limit: Some(100),
+                remaining: Some(90),
+                reset_after_millis: None,
+            },
+            QuotaObservation {
+                bucket: "rate_limit.tokens".to_owned(),
+                metric: Some(QuotaMetric::TotalTokens),
+                limit: Some(2_000),
+                remaining: None,
+                reset_after_millis: Some(1_000),
+            },
+        ];
+        let results =
+            ledger.commit_with_observations(reservation, &route, Some(demand), &observations, 100);
+        assert!(results.is_some(), "reservation unexpectedly disappeared");
+        if let Some(results) = results {
+            assert!(results[0].remaining_refreshed);
+            assert!(!results[1].remaining_refreshed);
+        }
+        assert_eq!(
+            ledger.graph().resource(&request_id).map(|r| r.remaining),
+            Some(QuotaAmount::Finite(90))
+        );
+        assert_eq!(
+            ledger.graph().resource(&token_id).map(|r| r.capacity),
+            Some(QuotaAmount::Finite(2_000))
+        );
+        assert_eq!(
+            ledger.graph().resource(&token_id).map(|r| r.remaining),
+            Some(QuotaAmount::Finite(970))
+        );
     }
 
     #[test]
@@ -968,6 +1112,53 @@ mod tests {
         assert_eq!(
             ledger.evaluate(&route, demand, 200).admission,
             QuotaAdmission::Indeterminate
+        );
+    }
+
+    #[test]
+    fn releasing_one_reservation_preserves_other_held_capacity() {
+        let route = route("key");
+        let resource = QuotaResource::finite(
+            "provider/concurrency",
+            QuotaScope::Account,
+            QuotaMetric::ConcurrentRequests,
+            2,
+            2,
+        );
+        let id = resource.id.clone();
+        let mut graph = QuotaGraph::new();
+        graph.insert_resource(resource);
+        assert!(graph.bind(route.clone(), &id));
+        let demand = QuotaDemand {
+            concurrent_requests: 1,
+            ..QuotaDemand::default()
+        };
+        let mut ledger = QuotaLedger::new(graph);
+        let first = match ledger.reserve(&route, demand, 100) {
+            Ok(id) => id,
+            Err(report) => return assert_eq!(report.admission, QuotaAdmission::Admitted),
+        };
+        let _second = match ledger.reserve(&route, demand, 100) {
+            Ok(id) => id,
+            Err(report) => return assert_eq!(report.admission, QuotaAdmission::Admitted),
+        };
+        assert!(ledger.release(first));
+        assert_eq!(
+            ledger
+                .evaluate(
+                    &route,
+                    QuotaDemand {
+                        concurrent_requests: 2,
+                        ..QuotaDemand::default()
+                    },
+                    100,
+                )
+                .admission,
+            QuotaAdmission::Rejected
+        );
+        assert_eq!(
+            ledger.evaluate(&route, demand, 100).admission,
+            QuotaAdmission::Admitted
         );
     }
 

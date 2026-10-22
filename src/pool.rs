@@ -78,6 +78,62 @@ pub enum QuotaInferenceError {
     LedgerInvariant(String),
 }
 
+fn commit_successful_quota(
+    ledger: &mut QuotaLedger,
+    reservation: crate::QuotaReservationId,
+    route: &QuotaRouteKey,
+    demand: QuotaDemand,
+    response: &InferenceResponse,
+    now_unix: u64,
+) -> Result<(), QuotaInferenceError> {
+    let actual = demand.with_actual_usage(response);
+    if ledger
+        .commit_with_observations(
+            reservation,
+            route,
+            Some(actual),
+            &response.quota_observations,
+            now_unix,
+        )
+        .is_some()
+    {
+        Ok(())
+    } else {
+        Err(QuotaInferenceError::LedgerInvariant(
+            "failed to commit successful inference reservation".to_owned(),
+        ))
+    }
+}
+
+fn settle_failed_quota(
+    ledger: &mut QuotaLedger,
+    reservation: crate::QuotaReservationId,
+    route: &QuotaRouteKey,
+    error: &ProviderError,
+    now_unix: u64,
+) -> Result<(), QuotaInferenceError> {
+    let accounted = if error.execution_phase().is_some() {
+        ledger
+            .commit_with_observations(
+                reservation,
+                route,
+                None,
+                error.quota_observations(),
+                now_unix,
+            )
+            .is_some()
+    } else {
+        ledger.release(reservation)
+    };
+    if accounted {
+        Ok(())
+    } else {
+        Err(QuotaInferenceError::LedgerInvariant(
+            "failed to settle failed inference reservation".to_owned(),
+        ))
+    }
+}
+
 impl InferencePool {
     #[must_use]
     pub fn new() -> Self {
@@ -325,12 +381,14 @@ impl InferencePool {
                 .await
             {
                 Ok(response) => {
-                    let actual = demand.with_actual_usage(&response);
-                    if !ledger.commit(reservation, Some(actual), quota.now_unix) {
-                        return Err(QuotaInferenceError::LedgerInvariant(
-                            "failed to commit successful inference reservation".to_owned(),
-                        ));
-                    }
+                    commit_successful_quota(
+                        ledger,
+                        reservation,
+                        &route_key,
+                        demand,
+                        &response,
+                        quota.now_unix,
+                    )?;
                     return Ok(QuotaPooledInferenceResponse {
                         quota_plan,
                         selected: candidate,
@@ -338,16 +396,7 @@ impl InferencePool {
                     });
                 }
                 Err(error) => {
-                    let accounted = if error.execution_phase().is_some() {
-                        ledger.commit(reservation, None, quota.now_unix)
-                    } else {
-                        ledger.release(reservation)
-                    };
-                    if !accounted {
-                        return Err(QuotaInferenceError::LedgerInvariant(
-                            "failed to settle failed inference reservation".to_owned(),
-                        ));
-                    }
+                    settle_failed_quota(ledger, reservation, &route_key, &error, quota.now_unix)?;
                     last_error = Some(Box::new(error));
                 }
             }
@@ -506,6 +555,73 @@ mod tests {
                 },
                 quota_observations: Vec::new(),
                 raw: json!({"native_model": request.model, "mock_price": self.price}),
+            })
+        }
+    }
+
+    struct ObservedQuotaFailureProvider {
+        price: f64,
+        calls: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl InferenceProvider for ObservedQuotaFailureProvider {
+        async fn endpoints(&self, model: &str) -> Result<Vec<Endpoint>, ProviderError> {
+            self.calls
+                .lock()
+                .map_err(|_| ProviderError::Catalog("poisoned test mutex".to_owned()))?
+                .push(model.to_owned());
+            Ok(vec![Endpoint {
+                source: "nvidia".to_owned(),
+                credential: None,
+                provider_key: "nvidia".to_owned(),
+                id: "nvidia".to_owned(),
+                provider: "NVIDIA".to_owned(),
+                model: model.to_owned(),
+                route_class: ModelRouteClass::Free,
+                display_name: "NVIDIA".to_owned(),
+                quantization: None,
+                status: 0,
+                context_length: None,
+                max_prompt_tokens: None,
+                max_completion_tokens: None,
+                pricing: Pricing {
+                    prompt_per_token: self.price,
+                    completion_per_token: self.price,
+                    ..Pricing::default()
+                },
+                stats: EndpointStats::default(),
+                capabilities: EndpointCapabilities {
+                    adapter_parameters: BTreeSet::from(["max_tokens".to_owned()]),
+                    supported_parameters: BTreeSet::from(["max_tokens".to_owned()]),
+                    verified_parameters: BTreeSet::new(),
+                    rejected_parameters: BTreeSet::new(),
+                    reasoning: ReasoningSupport::None,
+                    supports_implicit_caching: false,
+                },
+            }])
+        }
+
+        async fn execute_plan(
+            &self,
+            request: &InferenceRequest,
+            _plan: &RoutePlan,
+            _retry: RetryPolicy,
+        ) -> Result<InferenceResponse, ProviderError> {
+            self.calls
+                .lock()
+                .map_err(|_| ProviderError::Catalog("poisoned test mutex".to_owned()))?
+                .push(format!("execute:{}", request.model));
+            Err(ProviderError::Execution {
+                phase: crate::ExecutionFailurePhase::ResponseReceived,
+                detail: "rate limited".to_owned(),
+                quota_observations: vec![crate::QuotaObservation {
+                    bucket: "rate_limit.requests".to_owned(),
+                    metric: Some(crate::QuotaMetric::Requests),
+                    limit: Some(100),
+                    remaining: Some(0),
+                    reset_after_millis: Some(1_000),
+                }],
             })
         }
     }
@@ -955,6 +1071,83 @@ mod tests {
             Some(crate::QuotaAmount::Finite(970))
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn response_quota_snapshot_blocks_shared_sibling_before_failover() {
+        let failing_calls = Arc::new(StdMutex::new(Vec::new()));
+        let healthy_calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut pool = InferencePool::new();
+        pool.register_credential(
+            "nvidia",
+            "a-failing",
+            Arc::new(ObservedQuotaFailureProvider {
+                price: 1e-6,
+                calls: Arc::clone(&failing_calls),
+            }),
+        );
+        pool.register_credential(
+            "nvidia",
+            "b-healthy",
+            Arc::new(MockProvider {
+                source: "nvidia",
+                price: 1.1e-6,
+                fail_execute: false,
+                calls: Arc::clone(&healthy_calls),
+            }),
+        );
+        let shared = crate::QuotaResource::finite(
+            "nvidia/account/rpd",
+            crate::QuotaScope::Account,
+            crate::QuotaMetric::Requests,
+            100,
+            10,
+        );
+        let shared_id = shared.id.clone();
+        let mut graph = crate::QuotaGraph::new();
+        graph.insert_resource(shared);
+        let mut observation_map = crate::QuotaObservationMap::new();
+        for credential in ["a-failing", "b-healthy"] {
+            let route = QuotaRouteKey {
+                source: "nvidia".to_owned(),
+                credential: Some(credential.to_owned()),
+                provider: "nvidia".to_owned(),
+                model: "vendor/native-model".to_owned(),
+            };
+            assert!(graph.bind(route.clone(), &shared_id));
+            observation_map.bind(route, "rate_limit.requests", shared_id.clone());
+        }
+        let mut ledger = QuotaLedger::with_observation_map(graph, observation_map);
+        let request = InferenceRequest::new("vendor/model", "hi", 8);
+        let result = pool
+            .infer_with_quota(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                RetryPolicy::default(),
+                &mut ledger,
+                QuotaExecutionContext {
+                    unknown_policy: QuotaUnknownPolicy::Reject,
+                    now_unix: 100,
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(QuotaInferenceError::AllCandidatesFailed { attempted: 1, .. })
+        ));
+        assert_eq!(
+            ledger
+                .graph()
+                .resource(&shared_id)
+                .map(|resource| resource.remaining),
+            Some(crate::QuotaAmount::Finite(0))
+        );
+        let healthy = healthy_calls.lock();
+        assert!(healthy.is_ok());
+        if let Ok(calls) = healthy {
+            assert!(!calls.iter().any(|call| call.starts_with("execute:")));
+        }
     }
 
     #[tokio::test]
