@@ -400,14 +400,14 @@ impl QuotaObservationMap {
 #[serde(transparent)]
 pub struct QuotaReservationId(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ActiveReservation {
     charges: BTreeMap<QuotaResourceId, u64>,
     resources: BTreeSet<QuotaResourceId>,
 }
 
 /// Local reservation/consumption ledger over provider observations.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct QuotaLedger {
     graph: QuotaGraph,
     observation_map: QuotaObservationMap,

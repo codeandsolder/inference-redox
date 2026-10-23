@@ -28,6 +28,7 @@ enum Operation {
     ProviderInventory,
     ResolveModel,
     Suitability,
+    QuotaState,
     SubmitBatch,
     BatchStatus,
     DeleteBatch,
@@ -252,6 +253,17 @@ async fn handle_catalog_operation(
                 }
                 Err(error) => write_error(stdout, id, error.to_string()).await,
             }
+        }
+        Operation::QuotaState => {
+            write_json(
+                stdout,
+                &WireSuccess {
+                    id,
+                    ok: true,
+                    result: providers.quota.snapshot().await,
+                },
+            )
+            .await;
         }
         Operation::Suitability => {
             let Some(requirements) = suitability else {
@@ -566,7 +578,8 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
         Operation::Models
         | Operation::ProviderInventory
         | Operation::ResolveModel
-        | Operation::Suitability => {
+        | Operation::Suitability
+        | Operation::QuotaState => {
             handle_catalog_operation(&providers, &stdout, request).await;
         }
         Operation::SubmitBatch | Operation::BatchStatus | Operation::DeleteBatch => {
@@ -756,6 +769,16 @@ mod tests {
         }))?;
         assert!(matches!(wire.op, Operation::ProviderInventory));
         assert_eq!(wire.provider.as_deref(), Some("groq"));
+        Ok(())
+    }
+
+    #[test]
+    fn quota_state_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 1,
+            "op": "quota_state"
+        }))?;
+        assert!(matches!(wire.op, Operation::QuotaState));
         Ok(())
     }
 
