@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -132,6 +133,24 @@ fn settle_failed_quota(
             "failed to settle failed inference reservation".to_owned(),
         ))
     }
+}
+
+fn reject_batch_for_sync_quota(request: &InferenceRequest) -> Result<(), QuotaInferenceError> {
+    if request
+        .requirements
+        .allowed_route_classes
+        .contains(&ModelRouteClass::Batch)
+    {
+        return Err(QuotaRoutingError::Provider(ProviderError::InvalidRequest(
+            "synchronous infer cannot admit batch routes; use the batch API".to_owned(),
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn quota_now_unix(base_unix: u64, started: &Instant) -> u64 {
+    base_unix.saturating_add(started.elapsed().as_secs())
 }
 
 fn build_quota_aware_plan(
@@ -366,16 +385,8 @@ impl InferencePool {
         ledger: &mut QuotaLedger,
         quota: QuotaExecutionContext,
     ) -> Result<QuotaPooledInferenceResponse, QuotaInferenceError> {
-        if request
-            .requirements
-            .allowed_route_classes
-            .contains(&ModelRouteClass::Batch)
-        {
-            return Err(QuotaRoutingError::Provider(ProviderError::InvalidRequest(
-                "synchronous infer cannot admit batch routes; use the batch API".to_owned(),
-            ))
-            .into());
-        }
+        reject_batch_for_sync_quota(request)?;
+        let operation_started = Instant::now();
         let quota_plan = self
             .route_with_quota(
                 catalog,
@@ -391,10 +402,11 @@ impl InferencePool {
         let mut last_error = None;
         for candidate in quota_plan.plan.candidates.clone() {
             let route_key = QuotaRouteKey::from_endpoint(&candidate.endpoint);
+            let reserve_now_unix = quota_now_unix(quota.now_unix, &operation_started);
             let Ok(reservation) = ledger.reserve_with_policy(
                 &route_key,
                 demand,
-                quota.now_unix,
+                reserve_now_unix,
                 quota.unknown_policy,
             ) else {
                 continue;
@@ -426,13 +438,14 @@ impl InferencePool {
                 .await
             {
                 Ok(response) => {
+                    let observed_at_unix = quota_now_unix(quota.now_unix, &operation_started);
                     commit_successful_quota(
                         ledger,
                         reservation,
                         &route_key,
                         demand,
                         &response,
-                        quota.now_unix,
+                        observed_at_unix,
                     )?;
                     return Ok(QuotaPooledInferenceResponse {
                         quota_plan,
@@ -441,7 +454,8 @@ impl InferencePool {
                     });
                 }
                 Err(error) => {
-                    settle_failed_quota(ledger, reservation, &route_key, &error, quota.now_unix)?;
+                    let observed_at_unix = quota_now_unix(quota.now_unix, &operation_started);
+                    settle_failed_quota(ledger, reservation, &route_key, &error, observed_at_unix)?;
                     last_error = Some(Box::new(error));
                 }
             }
@@ -470,16 +484,8 @@ impl InferencePool {
         ledger: &SharedQuotaLedger,
         quota: QuotaExecutionContext,
     ) -> Result<QuotaPooledInferenceResponse, QuotaInferenceError> {
-        if request
-            .requirements
-            .allowed_route_classes
-            .contains(&ModelRouteClass::Batch)
-        {
-            return Err(QuotaRoutingError::Provider(ProviderError::InvalidRequest(
-                "synchronous infer cannot admit batch routes; use the batch API".to_owned(),
-            ))
-            .into());
-        }
+        reject_batch_for_sync_quota(request)?;
+        let operation_started = Instant::now();
         let quota_plan = self
             .route_with_shared_quota(
                 catalog,
@@ -497,10 +503,11 @@ impl InferencePool {
             let route_key = QuotaRouteKey::from_endpoint(&candidate.endpoint);
             let reservation = {
                 let mut guard = ledger.lock().await;
+                let reserve_now_unix = quota_now_unix(quota.now_unix, &operation_started);
                 let Ok(reservation) = guard.reserve_with_policy(
                     &route_key,
                     demand,
-                    quota.now_unix,
+                    reserve_now_unix,
                     quota.unknown_policy,
                 ) else {
                     continue;
@@ -536,13 +543,14 @@ impl InferencePool {
             {
                 Ok(response) => {
                     let mut guard = ledger.lock().await;
+                    let observed_at_unix = quota_now_unix(quota.now_unix, &operation_started);
                     commit_successful_quota(
                         &mut guard,
                         reservation,
                         &route_key,
                         demand,
                         &response,
-                        quota.now_unix,
+                        observed_at_unix,
                     )?;
                     return Ok(QuotaPooledInferenceResponse {
                         quota_plan,
@@ -552,12 +560,13 @@ impl InferencePool {
                 }
                 Err(error) => {
                     let mut guard = ledger.lock().await;
+                    let observed_at_unix = quota_now_unix(quota.now_unix, &operation_started);
                     settle_failed_quota(
                         &mut guard,
                         reservation,
                         &route_key,
                         &error,
-                        quota.now_unix,
+                        observed_at_unix,
                     )?;
                     last_error = Some(Box::new(error));
                 }
