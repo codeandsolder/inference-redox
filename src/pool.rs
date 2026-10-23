@@ -6,10 +6,10 @@ use thiserror::Error;
 
 use crate::router::supports_request;
 use crate::{
-    InferenceProvider, InferenceRequest, InferenceResponse, ModelCatalog, ModelLookup,
+    Endpoint, InferenceProvider, InferenceRequest, InferenceResponse, ModelCatalog, ModelLookup,
     ModelRouteClass, ProviderError, QuotaAdmission, QuotaAdmissionReport, QuotaAwareRoutePlan,
     QuotaDemand, QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy, RouteCandidate,
-    RoutePlan, RoutingStrategy, build_route_plan, request_prompt_tokens,
+    RoutePlan, RoutingStrategy, SharedQuotaLedger, build_route_plan, request_prompt_tokens,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -132,6 +132,46 @@ fn settle_failed_quota(
             "failed to settle failed inference reservation".to_owned(),
         ))
     }
+}
+
+fn build_quota_aware_plan(
+    endpoints: Vec<Endpoint>,
+    strategy: RoutingStrategy,
+    request: &InferenceRequest,
+    ledger: &QuotaLedger,
+    unknown_policy: QuotaUnknownPolicy,
+    now_unix: u64,
+) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
+    let prompt_tokens = request_prompt_tokens(request);
+    let demand = QuotaDemand::for_request(request);
+    let mut quota_reports = Vec::new();
+    let mut admitted = Vec::new();
+    for endpoint in endpoints
+        .into_iter()
+        .filter(|endpoint| supports_request(endpoint, request, prompt_tokens))
+    {
+        let report = ledger.evaluate(&QuotaRouteKey::from_endpoint(&endpoint), demand, now_unix);
+        let keep = match report.admission {
+            QuotaAdmission::Admitted => true,
+            QuotaAdmission::Indeterminate => unknown_policy == QuotaUnknownPolicy::Allow,
+            QuotaAdmission::Rejected => false,
+        };
+        if keep {
+            admitted.push(endpoint);
+        }
+        quota_reports.push(report);
+    }
+    if admitted.is_empty() {
+        return Err(QuotaRoutingError::NoQuotaAdmissible {
+            model: request.model.clone(),
+            reports: Box::new(quota_reports),
+        });
+    }
+    let plan = build_route_plan(strategy, request, admitted)?;
+    Ok(QuotaAwareRoutePlan {
+        plan,
+        quota_reports,
+    })
 }
 
 impl InferencePool {
@@ -269,37 +309,42 @@ impl InferencePool {
         now_unix: u64,
     ) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
         let endpoints = self.endpoints(catalog, request).await?;
-        let prompt_tokens = request_prompt_tokens(request);
-        let demand = QuotaDemand::for_request(request);
-        let mut quota_reports = Vec::new();
-        let mut admitted = Vec::new();
-        for endpoint in endpoints
-            .into_iter()
-            .filter(|endpoint| supports_request(endpoint, request, prompt_tokens))
-        {
-            let report =
-                ledger.evaluate(&QuotaRouteKey::from_endpoint(&endpoint), demand, now_unix);
-            let keep = match report.admission {
-                QuotaAdmission::Admitted => true,
-                QuotaAdmission::Indeterminate => unknown_policy == QuotaUnknownPolicy::Allow,
-                QuotaAdmission::Rejected => false,
-            };
-            if keep {
-                admitted.push(endpoint);
-            }
-            quota_reports.push(report);
-        }
-        if admitted.is_empty() {
-            return Err(QuotaRoutingError::NoQuotaAdmissible {
-                model: request.model.clone(),
-                reports: Box::new(quota_reports),
-            });
-        }
-        let plan = build_route_plan(strategy, request, admitted)?;
-        Ok(QuotaAwareRoutePlan {
-            plan,
-            quota_reports,
-        })
+        build_quota_aware_plan(
+            endpoints,
+            strategy,
+            request,
+            ledger,
+            unknown_policy,
+            now_unix,
+        )
+    }
+
+    /// Build a quota-aware route plan from concurrency-safe shared state.
+    ///
+    /// Provider discovery runs before the ledger lock is acquired; only synchronous admission and
+    /// ranking observe the locked snapshot.
+    ///
+    /// # Errors
+    /// Returns the same provider/routing/quota failures as `route_with_quota`.
+    pub async fn route_with_shared_quota(
+        &self,
+        catalog: &ModelCatalog,
+        strategy: RoutingStrategy,
+        request: &InferenceRequest,
+        ledger: &SharedQuotaLedger,
+        unknown_policy: QuotaUnknownPolicy,
+        now_unix: u64,
+    ) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
+        let endpoints = self.endpoints(catalog, request).await?;
+        let guard = ledger.lock().await;
+        build_quota_aware_plan(
+            endpoints,
+            strategy,
+            request,
+            &guard,
+            unknown_policy,
+            now_unix,
+        )
     }
 
     /// Execute a synchronous route with quota reservation and conservative post-call accounting.
@@ -407,6 +452,123 @@ impl InferencePool {
         })
     }
 
+    /// Execute against concurrency-safe shared quota state without holding its lock over I/O.
+    ///
+    /// Reservations are made under the shared ledger lock immediately before dispatch. The lock is
+    /// then released while the provider request is in flight and reacquired only to commit/release
+    /// the reservation, allowing independent requests to overlap while still seeing each other's
+    /// held capacity.
+    ///
+    /// # Errors
+    /// Returns the same routing, provider and ledger-invariant failures as `infer_with_quota`.
+    pub async fn infer_with_shared_quota(
+        &self,
+        catalog: &ModelCatalog,
+        strategy: RoutingStrategy,
+        request: &InferenceRequest,
+        retry: RetryPolicy,
+        ledger: &SharedQuotaLedger,
+        quota: QuotaExecutionContext,
+    ) -> Result<QuotaPooledInferenceResponse, QuotaInferenceError> {
+        if request
+            .requirements
+            .allowed_route_classes
+            .contains(&ModelRouteClass::Batch)
+        {
+            return Err(QuotaRoutingError::Provider(ProviderError::InvalidRequest(
+                "synchronous infer cannot admit batch routes; use the batch API".to_owned(),
+            ))
+            .into());
+        }
+        let quota_plan = self
+            .route_with_shared_quota(
+                catalog,
+                strategy,
+                request,
+                ledger,
+                quota.unknown_policy,
+                quota.now_unix,
+            )
+            .await?;
+        let demand = QuotaDemand::for_request(request);
+        let mut attempted = 0_usize;
+        let mut last_error = None;
+        for candidate in quota_plan.plan.candidates.clone() {
+            let route_key = QuotaRouteKey::from_endpoint(&candidate.endpoint);
+            let reservation = {
+                let mut guard = ledger.lock().await;
+                let Ok(reservation) = guard.reserve_with_policy(
+                    &route_key,
+                    demand,
+                    quota.now_unix,
+                    quota.unknown_policy,
+                ) else {
+                    continue;
+                };
+                reservation
+            };
+            let instance = ProviderInstanceKey::new(
+                candidate.endpoint.source.clone(),
+                candidate.endpoint.credential.clone(),
+            );
+            let Some(provider) = self.providers.get(&instance) else {
+                let mut guard = ledger.lock().await;
+                if !guard.release(reservation) {
+                    return Err(QuotaInferenceError::LedgerInvariant(
+                        "failed to release reservation for missing provider instance".to_owned(),
+                    ));
+                }
+                continue;
+            };
+            attempted += 1;
+            let mut native_request = request.clone();
+            native_request.model.clone_from(&candidate.endpoint.model);
+            let candidate_plan = RoutePlan {
+                prompt_tokens: quota_plan.plan.prompt_tokens,
+                expected_output_tokens: quota_plan.plan.expected_output_tokens,
+                cheapest_cost_usd: candidate.expected_cost_usd,
+                cost_ceiling_usd: candidate.expected_cost_usd,
+                candidates: vec![candidate.clone()],
+            };
+            match provider
+                .execute_plan(&native_request, &candidate_plan, retry)
+                .await
+            {
+                Ok(response) => {
+                    let mut guard = ledger.lock().await;
+                    commit_successful_quota(
+                        &mut guard,
+                        reservation,
+                        &route_key,
+                        demand,
+                        &response,
+                        quota.now_unix,
+                    )?;
+                    return Ok(QuotaPooledInferenceResponse {
+                        quota_plan,
+                        selected: candidate,
+                        response,
+                    });
+                }
+                Err(error) => {
+                    let mut guard = ledger.lock().await;
+                    settle_failed_quota(
+                        &mut guard,
+                        reservation,
+                        &route_key,
+                        &error,
+                        quota.now_unix,
+                    )?;
+                    last_error = Some(Box::new(error));
+                }
+            }
+        }
+        Err(QuotaInferenceError::AllCandidatesFailed {
+            attempted,
+            last_error,
+        })
+    }
+
     /// Execute a synchronous request across ranked standard/free routes, failing over across
     /// provider surfaces when a candidate fails. Batch is intentionally a separate async API.
     ///
@@ -470,9 +632,11 @@ impl InferencePool {
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use serde_json::json;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::{
@@ -555,6 +719,54 @@ mod tests {
                 },
                 quota_observations: Vec::new(),
                 raw: json!({"native_model": request.model, "mock_price": self.price}),
+            })
+        }
+    }
+
+    struct BlockingProvider {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InferenceProvider for BlockingProvider {
+        async fn endpoints(&self, model: &str) -> Result<Vec<Endpoint>, ProviderError> {
+            Ok(vec![Endpoint {
+                source: "nvidia".to_owned(),
+                credential: None,
+                provider_key: "nvidia".to_owned(),
+                id: "nvidia".to_owned(),
+                provider: "blocking".to_owned(),
+                model: model.to_owned(),
+                route_class: ModelRouteClass::Free,
+                display_name: "blocking".to_owned(),
+                quantization: None,
+                status: 0,
+                context_length: None,
+                max_prompt_tokens: None,
+                max_completion_tokens: None,
+                pricing: Pricing::default(),
+                stats: EndpointStats::default(),
+                capabilities: EndpointCapabilities::default(),
+            }])
+        }
+
+        async fn execute_plan(
+            &self,
+            request: &InferenceRequest,
+            _plan: &RoutePlan,
+            _retry: RetryPolicy,
+        ) -> Result<InferenceResponse, ProviderError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(InferenceResponse {
+                content: "ok".to_owned(),
+                model: Some(request.model.clone()),
+                provider: Some("nvidia".to_owned()),
+                usage_cost_usd: Some(0.0),
+                usage: crate::TokenUsage::default(),
+                quota_observations: Vec::new(),
+                raw: json!({}),
             })
         }
     }
@@ -877,6 +1089,85 @@ mod tests {
             .await?;
         assert_eq!(result.selected.endpoint.source, "openrouter");
         assert_eq!(result.response.provider.as_deref(), Some("openrouter"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_quota_does_not_hold_ledger_lock_across_provider_io()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut pool = InferencePool::new();
+        pool.register(
+            "nvidia",
+            Arc::new(BlockingProvider {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+        );
+        let route = QuotaRouteKey {
+            source: "nvidia".to_owned(),
+            credential: None,
+            provider: "nvidia".to_owned(),
+            model: "vendor/native-model".to_owned(),
+        };
+        let concurrency = crate::QuotaResource::finite(
+            "nvidia/concurrency",
+            crate::QuotaScope::Account,
+            crate::QuotaMetric::ConcurrentRequests,
+            1,
+            1,
+        );
+        let concurrency_id = concurrency.id.clone();
+        let mut graph = crate::QuotaGraph::new();
+        graph.insert_resource(concurrency);
+        assert!(graph.bind(route, &concurrency_id));
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(graph));
+        let request = InferenceRequest::new("vendor/model", "hi", 8);
+        let first_pool = pool.clone();
+        let first_ledger = ledger.clone();
+        let first_request = request.clone();
+        let first_catalog = catalog();
+        let first = tokio::spawn(async move {
+            first_pool
+                .infer_with_shared_quota(
+                    &first_catalog,
+                    RoutingStrategy::FastestResponseCheap(1.5),
+                    &first_request,
+                    RetryPolicy::default(),
+                    &first_ledger,
+                    QuotaExecutionContext {
+                        unknown_policy: QuotaUnknownPolicy::Reject,
+                        now_unix: 100,
+                    },
+                )
+                .await
+        });
+        started.notified().await;
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.infer_with_shared_quota(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                RetryPolicy::default(),
+                &ledger,
+                QuotaExecutionContext {
+                    unknown_policy: QuotaUnknownPolicy::Reject,
+                    now_unix: 100,
+                },
+            ),
+        )
+        .await?;
+        assert!(matches!(
+            second,
+            Err(QuotaInferenceError::Routing(
+                QuotaRoutingError::NoQuotaAdmissible { .. }
+            ))
+        ));
+        release.notify_one();
+        let first_result = first.await?;
+        assert!(first_result.is_ok());
         Ok(())
     }
 

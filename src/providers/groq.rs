@@ -21,6 +21,12 @@ pub struct Groq {
 }
 
 impl Groq {
+    pub const FREE_PLAN_CHAT_MODELS: [&'static str; 4] = [
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-safeguard-20b",
+        "qwen/qwen3.8-27b",
+    ];
     #[must_use]
     pub fn new_free(api_key: impl Into<String>) -> Self {
         let adapter_parameters = [
@@ -118,20 +124,21 @@ impl Groq {
         }
     }
 
-    fn quota_resource_id(organization_label: &str, model: &str, bucket: &str) -> QuotaResourceId {
+    fn quota_resource_id(quota_pool_label: &str, model: &str, bucket: &str) -> QuotaResourceId {
         QuotaResourceId(format!(
-            "groq/org:{organization_label}/model:{model}/{bucket}"
+            "groq/pool:{quota_pool_label}/model:{model}/{bucket}"
         ))
     }
 
     /// Bind Groq's response-observable free-plan limits to one logical credential route.
     ///
-    /// The published free-plan RPD and TPM capacities are organization-level per model. Remaining
-    /// capacity starts unknown because another process or project may already have consumed quota;
-    /// live `x-ratelimit-*` response headers replace that state after the first dispatched request.
-    /// Reuse the same `organization_label` for every credential belonging to the same Groq
-    /// organization so keys cannot multiply the shared capacity. The label is routing metadata and
-    /// must not contain a secret.
+    /// The published free-plan RPD and TPM capacities are shared upstream limits. Remaining capacity
+    /// starts unknown because another process may already have consumed quota; live
+    /// `x-ratelimit-*` response headers replace that state after the first dispatched request.
+    /// `quota_pool_label` names the effective pool described by those headers and must not contain
+    /// a secret. Reuse a label only for credentials known to observe the same pool. Groq can layer
+    /// stricter project limits below organization limits, and one response header cannot represent
+    /// both ownership layers independently.
     ///
     /// RPM and TPD are intentionally not bootstrapped here: Groq's standard response headers expose
     /// RPD and TPM snapshots, so the router cannot safely infer current RPM/TPD headroom at startup.
@@ -142,20 +149,20 @@ impl Groq {
     pub fn bind_free_plan_rate_limits(
         graph: &mut QuotaGraph,
         observation_map: &mut QuotaObservationMap,
-        organization_label: &str,
+        quota_pool_label: &str,
         credential_label: Option<String>,
         model: &str,
     ) -> Result<QuotaRouteKey, ProviderError> {
-        if organization_label.trim().is_empty() {
+        if quota_pool_label.trim().is_empty() {
             return Err(ProviderError::InvalidRequest(
-                "Groq organization label must not be empty".to_owned(),
+                "Groq quota-pool label must not be empty".to_owned(),
             ));
         }
         let Some((rpd, tpm)) = Self::free_plan_header_limits(model) else {
             return Err(ProviderError::NoEligibleEndpoint(model.to_owned()));
         };
-        let request_id = Self::quota_resource_id(organization_label, model, "rpd");
-        let token_id = Self::quota_resource_id(organization_label, model, "tpm");
+        let request_id = Self::quota_resource_id(quota_pool_label, model, "rpd");
+        let token_id = Self::quota_resource_id(quota_pool_label, model, "tpm");
         if graph.resource(&request_id).is_none() {
             graph.insert_resource(QuotaResource {
                 id: request_id.clone(),
@@ -195,13 +202,7 @@ impl Groq {
     }
 
     fn is_free_chat_model(model: &str) -> bool {
-        matches!(
-            model,
-            "openai/gpt-oss-20b"
-                | "openai/gpt-oss-120b"
-                | "openai/gpt-oss-safeguard-20b"
-                | "qwen/qwen3.8-27b"
-        )
+        Self::FREE_PLAN_CHAT_MODELS.contains(&model)
     }
 
     fn apply_parameter_claims(model: &str, parameters: &mut BTreeSet<String>) {
@@ -377,26 +378,26 @@ mod tests {
     }
 
     #[test]
-    fn free_plan_quota_binding_shares_organization_state_across_credentials()
+    fn free_plan_quota_binding_shares_effective_pool_across_credentials()
     -> Result<(), ProviderError> {
         let mut graph = QuotaGraph::new();
         let mut observations = QuotaObservationMap::new();
         let first = Groq::bind_free_plan_rate_limits(
             &mut graph,
             &mut observations,
-            "org-a",
+            "pool-a",
             Some("key-a".to_owned()),
             "openai/gpt-oss-120b",
         )?;
         let second = Groq::bind_free_plan_rate_limits(
             &mut graph,
             &mut observations,
-            "org-a",
+            "pool-a",
             Some("key-b".to_owned()),
             "openai/gpt-oss-120b",
         )?;
-        let request_id = Groq::quota_resource_id("org-a", "openai/gpt-oss-120b", "rpd");
-        let token_id = Groq::quota_resource_id("org-a", "openai/gpt-oss-120b", "tpm");
+        let request_id = Groq::quota_resource_id("pool-a", "openai/gpt-oss-120b", "rpd");
+        let token_id = Groq::quota_resource_id("pool-a", "openai/gpt-oss-120b", "tpm");
         assert_eq!(
             graph
                 .resource(&request_id)
@@ -451,11 +452,11 @@ mod tests {
         Groq::bind_free_plan_rate_limits(
             &mut graph,
             &mut observations,
-            "org-a",
+            "pool-a",
             None,
             "openai/gpt-oss-safeguard-20b",
         )?;
-        let token_id = Groq::quota_resource_id("org-a", "openai/gpt-oss-safeguard-20b", "tpm");
+        let token_id = Groq::quota_resource_id("pool-a", "openai/gpt-oss-safeguard-20b", "tpm");
         assert_eq!(
             graph.resource(&token_id).map(|resource| resource.capacity),
             Some(QuotaAmount::Finite(2_000))

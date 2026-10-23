@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use tokio::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -411,6 +414,39 @@ pub struct QuotaLedger {
     reserved: BTreeMap<QuotaResourceId, u64>,
     active: BTreeMap<QuotaReservationId, ActiveReservation>,
     next_reservation: u64,
+}
+
+/// Concurrency-safe quota state shared by asynchronous routing/execution tasks.
+///
+/// The mutex protects only short ledger mutations. Provider I/O must never run while this lock is
+/// held; `InferencePool::infer_with_shared_quota` reserves before dispatch and settles afterwards.
+#[derive(Debug, Clone)]
+pub struct SharedQuotaLedger {
+    inner: Arc<Mutex<QuotaLedger>>,
+}
+
+impl SharedQuotaLedger {
+    #[must_use]
+    pub fn new(ledger: QuotaLedger) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ledger)),
+        }
+    }
+
+    /// Clone the current ledger state for diagnostics or persistence.
+    pub async fn snapshot(&self) -> QuotaLedger {
+        self.inner.lock().await.clone()
+    }
+
+    pub(crate) async fn lock(&self) -> MutexGuard<'_, QuotaLedger> {
+        self.inner.lock().await
+    }
+}
+
+impl Default for SharedQuotaLedger {
+    fn default() -> Self {
+        Self::new(QuotaLedger::default())
+    }
 }
 
 impl QuotaLedger {

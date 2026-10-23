@@ -2,12 +2,14 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use inference_redox::providers::{groq::Groq, nvidia::NvidiaNim, openrouter::OpenRouter};
 use inference_redox::{
     BatchInferenceItem, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
-    ModelSuitabilityRequirements, ProviderError, ProviderInventory, RetryPolicy, RoutingStrategy,
+    ModelSuitabilityRequirements, PooledInferenceResponse, ProviderError, ProviderInventory,
+    QuotaExecutionContext, QuotaGraph, QuotaLedger, QuotaObservationMap, QuotaUnknownPolicy,
+    RetryPolicy, RoutingStrategy, SharedQuotaLedger,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,6 +99,7 @@ struct Providers {
     openrouter: Arc<OpenRouter>,
     nvidia: Option<Arc<NvidiaNim>>,
     groq: Option<Arc<Groq>>,
+    quota: SharedQuotaLedger,
 }
 
 impl Providers {
@@ -142,6 +145,29 @@ impl Providers {
                 "provider_inventory does not support {other}"
             ))),
         }
+    }
+
+    fn quota_ledger(
+        groq_configured: bool,
+        groq_quota_pool_label: &str,
+    ) -> Result<SharedQuotaLedger, ProviderError> {
+        let mut graph = QuotaGraph::new();
+        let mut observations = QuotaObservationMap::new();
+        if groq_configured {
+            for model in Groq::FREE_PLAN_CHAT_MODELS {
+                Groq::bind_free_plan_rate_limits(
+                    &mut graph,
+                    &mut observations,
+                    groq_quota_pool_label,
+                    None,
+                    model,
+                )?;
+            }
+        }
+        Ok(SharedQuotaLedger::new(QuotaLedger::with_observation_map(
+            graph,
+            observations,
+        )))
     }
 
     fn pool(&self) -> InferencePool {
@@ -365,6 +391,12 @@ async fn handle_batch_operation(
     }
 }
 
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 async fn handle_pool_operation(
     providers: &Providers,
     stdout: &Arc<Mutex<tokio::io::Stdout>>,
@@ -400,15 +432,29 @@ async fn handle_pool_operation(
     };
     let pool = providers.pool();
     let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
+    let quota = QuotaExecutionContext {
+        unknown_policy: QuotaUnknownPolicy::Allow,
+        now_unix: unix_time_seconds(),
+    };
     match op {
-        Operation::RoutePool => match pool.route(&catalog, strategy, &request).await {
+        Operation::RoutePool => match pool
+            .route_with_shared_quota(
+                &catalog,
+                strategy,
+                &request,
+                &providers.quota,
+                quota.unknown_policy,
+                quota.now_unix,
+            )
+            .await
+        {
             Ok(route) => {
                 write_json(
                     stdout,
                     &WireSuccess {
                         id,
                         ok: true,
-                        result: route,
+                        result: route.plan,
                     },
                 )
                 .await;
@@ -417,8 +463,23 @@ async fn handle_pool_operation(
         },
         Operation::InferPool => {
             let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
-            match pool.infer(&catalog, strategy, &request, retry).await {
+            match pool
+                .infer_with_shared_quota(
+                    &catalog,
+                    strategy,
+                    &request,
+                    retry,
+                    &providers.quota,
+                    quota,
+                )
+                .await
+            {
                 Ok(result) => {
+                    let result = PooledInferenceResponse {
+                        plan: result.quota_plan.plan,
+                        selected: result.selected,
+                        response: result.response,
+                    };
                     write_json(
                         stdout,
                         &WireSuccess {
@@ -573,6 +634,7 @@ struct ApiKeys {
     openrouter: String,
     nvidia: Option<String>,
     groq: Option<String>,
+    groq_quota_pool_label: String,
 }
 
 fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
@@ -592,20 +654,32 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         .or(from_file("NVIDIA_API_KEY")?)
         .or(from_file("NVIDIA_API_key")?);
     let groq = environment_key("GROQ_API_KEY").or(from_file("GROQ_API_KEY")?);
+    let groq_quota_pool_label = environment_key("GROQ_QUOTA_POOL_LABEL")
+        .or(from_file("GROQ_QUOTA_POOL_LABEL")?)
+        .unwrap_or_else(|| "default".to_owned());
     Ok(ApiKeys {
         openrouter,
         nvidia,
         groq,
+        groq_quota_pool_label,
     })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let keys = load_api_keys()?;
+    let ApiKeys {
+        openrouter,
+        nvidia,
+        groq,
+        groq_quota_pool_label,
+    } = load_api_keys()?;
+    let groq = groq.map(|key| Arc::new(Groq::new_free(key)));
+    let quota = Providers::quota_ledger(groq.is_some(), &groq_quota_pool_label)?;
     let providers = Providers {
-        openrouter: Arc::new(OpenRouter::new(keys.openrouter)),
-        nvidia: keys.nvidia.map(|key| Arc::new(NvidiaNim::new(key))),
-        groq: keys.groq.map(|key| Arc::new(Groq::new_free(key))),
+        openrouter: Arc::new(OpenRouter::new(openrouter)),
+        nvidia: nvidia.map(|key| Arc::new(NvidiaNim::new(key))),
+        groq,
+        quota,
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
@@ -649,6 +723,7 @@ mod tests {
             "export OPENROUTER_API_KEY='or-key'\r\n",
             "NVIDIA_API_KEY=\"nv-key\"\r\n",
             "GROQ_API_KEY='groq-key'\r\n",
+            "GROQ_QUOTA_POOL_LABEL='pool-a'\r\n",
         );
         assert_eq!(
             key_from_contents(contents, "OPENROUTER_API_KEY").as_deref(),
@@ -661,6 +736,10 @@ mod tests {
         assert_eq!(
             key_from_contents(contents, "GROQ_API_KEY").as_deref(),
             Some("groq-key")
+        );
+        assert_eq!(
+            key_from_contents(contents, "GROQ_QUOTA_POOL_LABEL").as_deref(),
+            Some("pool-a")
         );
         assert_eq!(
             key_from_contents("NVIDIA_API_key=legacy", "NVIDIA_API_key").as_deref(),

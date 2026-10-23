@@ -43,7 +43,7 @@ pub use quota::{
     QuotaCheckStatus, QuotaDemand, QuotaGraph, QuotaLedger, QuotaMetric, QuotaObservation,
     QuotaObservationApplyResult, QuotaObservationApplyStatus, QuotaObservationMap,
     QuotaReservationId, QuotaResource, QuotaResourceId, QuotaRouteKey, QuotaScope,
-    QuotaUnknownPolicy,
+    QuotaUnknownPolicy, SharedQuotaLedger,
 };
 pub use router::{approximate_prompt_tokens, build_route_plan, request_prompt_tokens};
 pub use suitability::{
