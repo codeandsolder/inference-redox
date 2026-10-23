@@ -54,7 +54,7 @@ pub(crate) struct OpenAiCompatibleProfile {
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiCompatibleProvider {
     client: Client,
-    api_key: String,
+    api_key: Option<String>,
     profile: OpenAiCompatibleProfile,
     model_cache: Arc<Mutex<Option<CachedModels>>>,
     catalog_ttl: Duration,
@@ -88,9 +88,14 @@ impl AttemptFailure {
 impl OpenAiCompatibleProvider {
     #[must_use]
     pub fn new(api_key: impl Into<String>, profile: OpenAiCompatibleProfile) -> Self {
+        Self::new_optional(Some(api_key.into()), profile)
+    }
+
+    #[must_use]
+    pub fn new_optional(api_key: Option<String>, profile: OpenAiCompatibleProfile) -> Self {
         Self {
             client: Client::new(),
-            api_key: api_key.into(),
+            api_key,
             profile,
             model_cache: Arc::new(Mutex::new(None)),
             catalog_ttl: Duration::from_secs(60),
@@ -110,6 +115,15 @@ impl OpenAiCompatibleProvider {
     pub fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self
+    }
+
+    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        let request = self.client.request(method, url);
+        if let Some(api_key) = self.api_key.as_ref() {
+            request.bearer_auth(api_key)
+        } else {
+            request
+        }
     }
 
     pub async fn inventory(
@@ -136,9 +150,10 @@ impl OpenAiCompatibleProvider {
 
         let fetched = async {
             let response = self
-                .client
-                .get(format!("{}/models", self.profile.base_url))
-                .bearer_auth(&self.api_key)
+                .request(
+                    reqwest::Method::GET,
+                    format!("{}/models", self.profile.base_url),
+                )
                 .send()
                 .await
                 .map_err(|error| ProviderError::Catalog(error.to_string()))?;
@@ -312,9 +327,7 @@ impl OpenAiCompatibleProvider {
         body: &Value,
     ) -> Result<InferenceResponse, AttemptFailure> {
         let response = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
+            .request(reqwest::Method::POST, url.to_owned())
             .json(body)
             .send()
             .await
@@ -524,6 +537,19 @@ mod tests {
             pricing: Pricing::default(),
             usage_cost_usd: Some(0.0),
         }
+    }
+
+    #[test]
+    fn optional_auth_provider_compiles_requests_without_fake_credentials()
+    -> Result<(), ProviderError> {
+        let provider = OpenAiCompatibleProvider::new_optional(None, profile());
+        let request = InferenceRequest::new("vendor/model", "hi", 8);
+        let body = provider.compile_body(&request)?;
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("vendor/model")
+        );
+        Ok(())
     }
 
     #[test]
