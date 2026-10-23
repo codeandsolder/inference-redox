@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use inference_redox::providers::{groq::Groq, nvidia::NvidiaNim, openrouter::OpenRouter};
 use inference_redox::{
-    BatchInferenceItem, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
+    BatchInferenceItem, ConformanceObservation, ConformanceProbe, ConformanceProfile,
+    InferencePool, InferenceProvider, InferenceRequest, ModelCatalog, ModelLookup,
     ModelSuitabilityRequirements, PooledInferenceResponse, ProviderError, ProviderInventory,
     QuotaExecutionContext, QuotaGraph, QuotaLedger, QuotaObservationMap, QuotaUnknownPolicy,
     RetryPolicy, RoutingStrategy, SharedQuotaLedger,
@@ -26,6 +27,8 @@ enum Operation {
     RoutePool,
     Models,
     ProviderInventory,
+    ConformanceProbe,
+    ConformanceState,
     ResolveModel,
     Suitability,
     QuotaState,
@@ -67,6 +70,8 @@ struct WireRequest {
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
+    probe: Option<ConformanceProbe>,
+    #[serde(default)]
     suitability: Option<ModelSuitabilityRequirements>,
     #[serde(default)]
     batch_model: Option<String>,
@@ -101,6 +106,7 @@ struct Providers {
     nvidia: Option<Arc<NvidiaNim>>,
     groq: Option<Arc<Groq>>,
     quota: SharedQuotaLedger,
+    conformance: Arc<Mutex<ConformanceProfile>>,
 }
 
 impl Providers {
@@ -171,7 +177,59 @@ impl Providers {
         )))
     }
 
-    fn pool(&self) -> InferencePool {
+    async fn conformance_probe(
+        &self,
+        provider: &str,
+        model: &str,
+        probe: ConformanceProbe,
+    ) -> Result<ConformanceObservation, ProviderError> {
+        let catalog = self.catalog().await?;
+        let canonical_id = match catalog.resolve(model) {
+            ModelLookup::Resolved { model } => Some(model.canonical_id),
+            ModelLookup::Ambiguous { .. } | ModelLookup::NotFound => None,
+        };
+        let provider: Arc<dyn InferenceProvider> = match provider {
+            "nvidia" => self
+                .nvidia
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>)
+                .ok_or_else(|| {
+                    ProviderError::InvalidRequest("NVIDIA provider is not configured".to_owned())
+                })?,
+            "groq" => self
+                .groq
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>)
+                .ok_or_else(|| {
+                    ProviderError::InvalidRequest("Groq provider is not configured".to_owned())
+                })?,
+            other => {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "conformance_probe supports direct providers only, got {other}"
+                )));
+            }
+        };
+        let mut endpoints = provider.endpoints(model).await?;
+        let endpoint = endpoints
+            .drain(..)
+            .next()
+            .ok_or_else(|| ProviderError::NoEligibleEndpoint(model.to_owned()))?;
+        let observation = probe
+            .run_provider_model(provider.as_ref(), endpoint, canonical_id)
+            .await;
+        self.conformance
+            .lock()
+            .await
+            .observations
+            .push(observation.clone());
+        Ok(observation)
+    }
+
+    async fn conformance_snapshot(&self) -> ConformanceProfile {
+        self.conformance.lock().await.clone()
+    }
+
+    async fn pool(&self) -> InferencePool {
         let mut pool = InferencePool::new();
         pool.register("openrouter", Arc::clone(&self.openrouter));
         if let Some(nvidia) = self.nvidia.as_ref() {
@@ -180,6 +238,7 @@ impl Providers {
         if let Some(groq) = self.groq.as_ref() {
             pool.register("groq", Arc::clone(groq));
         }
+        pool.set_conformance_profile(self.conformance.lock().await.clone());
         pool
     }
 }
@@ -215,7 +274,6 @@ async fn handle_catalog_operation(
         id,
         op,
         query,
-        provider,
         suitability,
         ..
     } = wire;
@@ -234,37 +292,6 @@ async fn handle_catalog_operation(
             }
             Err(error) => write_error(stdout, id, error.to_string()).await,
         },
-        Operation::ProviderInventory => {
-            let Some(provider) = provider else {
-                write_error(stdout, id, "provider_inventory requires provider").await;
-                return;
-            };
-            match providers.provider_inventory(&provider).await {
-                Ok(inventory) => {
-                    write_json(
-                        stdout,
-                        &WireSuccess {
-                            id,
-                            ok: true,
-                            result: inventory,
-                        },
-                    )
-                    .await;
-                }
-                Err(error) => write_error(stdout, id, error.to_string()).await,
-            }
-        }
-        Operation::QuotaState => {
-            write_json(
-                stdout,
-                &WireSuccess {
-                    id,
-                    ok: true,
-                    result: providers.quota.snapshot().await,
-                },
-            )
-            .await;
-        }
         Operation::Suitability => {
             let Some(requirements) = suitability else {
                 write_error(stdout, id, "suitability requires suitability").await;
@@ -304,6 +331,94 @@ async fn handle_catalog_operation(
                 }
                 Err(error) => write_error(stdout, id, error.to_string()).await,
             }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_provider_diagnostic_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let WireRequest {
+        id,
+        op,
+        query,
+        provider,
+        probe,
+        ..
+    } = wire;
+    match op {
+        Operation::ConformanceProbe => {
+            let Some(provider) = provider.as_deref() else {
+                write_error(stdout, id, "conformance_probe requires provider").await;
+                return;
+            };
+            let Some(model) = query.as_deref() else {
+                write_error(stdout, id, "conformance_probe requires query=model").await;
+                return;
+            };
+            let Some(probe) = probe else {
+                write_error(stdout, id, "conformance_probe requires probe").await;
+                return;
+            };
+            match providers.conformance_probe(provider, model, probe).await {
+                Ok(observation) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: observation,
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        Operation::ProviderInventory => {
+            let Some(provider) = provider else {
+                write_error(stdout, id, "provider_inventory requires provider").await;
+                return;
+            };
+            match providers.provider_inventory(&provider).await {
+                Ok(inventory) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: inventory,
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        Operation::ConformanceState => {
+            write_json(
+                stdout,
+                &WireSuccess {
+                    id,
+                    ok: true,
+                    result: providers.conformance_snapshot().await,
+                },
+            )
+            .await;
+        }
+        Operation::QuotaState => {
+            write_json(
+                stdout,
+                &WireSuccess {
+                    id,
+                    ok: true,
+                    result: providers.quota.snapshot().await,
+                },
+            )
+            .await;
         }
         _ => {}
     }
@@ -442,7 +557,7 @@ async fn handle_pool_operation(
             return;
         }
     };
-    let pool = providers.pool();
+    let pool = providers.pool().await;
     let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
     let quota = QuotaExecutionContext {
         unknown_policy: QuotaUnknownPolicy::Allow,
@@ -575,12 +690,14 @@ async fn handle_openrouter_operation(
 
 async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, request: WireRequest) {
     match request.op {
-        Operation::Models
-        | Operation::ProviderInventory
-        | Operation::ResolveModel
-        | Operation::Suitability
-        | Operation::QuotaState => {
+        Operation::Models | Operation::ResolveModel | Operation::Suitability => {
             handle_catalog_operation(&providers, &stdout, request).await;
+        }
+        Operation::ProviderInventory
+        | Operation::ConformanceProbe
+        | Operation::ConformanceState
+        | Operation::QuotaState => {
+            handle_provider_diagnostic_operation(&providers, &stdout, request).await;
         }
         Operation::SubmitBatch | Operation::BatchStatus | Operation::DeleteBatch => {
             handle_batch_operation(&providers, &stdout, request).await;
@@ -693,6 +810,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nvidia: nvidia.map(|key| Arc::new(NvidiaNim::new(key))),
         groq,
         quota,
+        conformance: Arc::new(Mutex::new(ConformanceProfile::default())),
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
@@ -727,7 +845,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Operation, WireRequest, key_from_contents};
+    use super::{ConformanceProbe, Operation, WireRequest, key_from_contents};
     use serde_json::json;
 
     #[test]
@@ -769,6 +887,33 @@ mod tests {
         }))?;
         assert!(matches!(wire.op, Operation::ProviderInventory));
         assert_eq!(wire.provider.as_deref(), Some("groq"));
+        Ok(())
+    }
+
+    #[test]
+    fn conformance_state_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 1,
+            "op": "conformance_state"
+        }))?;
+        assert!(matches!(wire.op, Operation::ConformanceState));
+        Ok(())
+    }
+
+    #[test]
+    fn conformance_probe_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 1,
+            "op": "conformance_probe",
+            "provider": "groq",
+            "query": "openai/gpt-oss-120b",
+            "probe": "strict_json_schema"
+        }))?;
+        assert!(matches!(wire.op, Operation::ConformanceProbe));
+        assert!(matches!(
+            wire.probe,
+            Some(ConformanceProbe::StrictJsonSchema)
+        ));
         Ok(())
     }
 

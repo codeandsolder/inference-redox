@@ -7,10 +7,11 @@ use thiserror::Error;
 
 use crate::router::supports_request;
 use crate::{
-    Endpoint, InferenceProvider, InferenceRequest, InferenceResponse, ModelCatalog, ModelLookup,
-    ModelRouteClass, ProviderError, QuotaAdmission, QuotaAdmissionReport, QuotaAwareRoutePlan,
-    QuotaDemand, QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy, RouteCandidate,
-    RoutePlan, RoutingStrategy, SharedQuotaLedger, build_route_plan, request_prompt_tokens,
+    ConformanceProfile, Endpoint, InferenceProvider, InferenceRequest, InferenceResponse,
+    ModelCatalog, ModelLookup, ModelRouteClass, ProviderError, QuotaAdmission,
+    QuotaAdmissionReport, QuotaAwareRoutePlan, QuotaDemand, QuotaLedger, QuotaRouteKey,
+    QuotaUnknownPolicy, RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy, SharedQuotaLedger,
+    build_route_plan, request_prompt_tokens,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,6 +34,7 @@ impl ProviderInstanceKey {
 #[derive(Clone, Default)]
 pub struct InferencePool {
     providers: BTreeMap<ProviderInstanceKey, Arc<dyn InferenceProvider>>,
+    conformance: ConformanceProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -199,6 +201,11 @@ impl InferencePool {
         Self::default()
     }
 
+    /// Replace the process-local conformance evidence used to refine provider capability claims.
+    pub fn set_conformance_profile(&mut self, profile: ConformanceProfile) {
+        self.conformance = profile;
+    }
+
     pub fn register<P>(&mut self, source: impl Into<String>, provider: Arc<P>)
     where
         P: InferenceProvider + 'static,
@@ -288,6 +295,7 @@ impl InferencePool {
                     endpoint.credential.clone_from(&instance.credential);
                     endpoint.model.clone_from(&route.id);
                     endpoint.route_class = route.route_class;
+                    self.conformance.apply_to_endpoint(endpoint);
                 }
                 endpoints.extend(discovered);
             }
@@ -649,8 +657,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        Endpoint, EndpointCapabilities, EndpointStats, ModelArchitecture, ModelBenchmarks,
-        ModelCatalogEntry, ModelReasoning, ModelTopProvider, Pricing, ReasoningSupport,
+        ConformanceObservation, ConformanceOutcome, ConformanceProfile, Endpoint,
+        EndpointCapabilities, EndpointStats, ModelArchitecture, ModelBenchmarks, ModelCatalogEntry,
+        ModelReasoning, ModelTopProvider, Pricing, ReasoningSupport,
     };
 
     struct MockProvider {
@@ -878,6 +887,45 @@ mod tests {
                 entry("openrouter", "vendor/model:batch", ModelRouteClass::Batch),
             ],
         }
+    }
+
+    #[tokio::test]
+    async fn conformance_failure_vetoes_provider_claim_in_pool_routing() {
+        let mut pool = InferencePool::new();
+        pool.register(
+            "nvidia",
+            Arc::new(MockProvider {
+                source: "nvidia",
+                price: 0.0,
+                fail_execute: false,
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }),
+        );
+        pool.set_conformance_profile(ConformanceProfile {
+            observations: vec![ConformanceObservation {
+                source: "nvidia".to_owned(),
+                provider_key: "nvidia".to_owned(),
+                endpoint_id: None,
+                native_model_id: "vendor/native-model".to_owned(),
+                canonical_id: Some("vendor/model-v1".to_owned()),
+                parameter: "max_tokens".to_owned(),
+                test_id: "max-tokens".to_owned(),
+                test_version: 1,
+                outcome: ConformanceOutcome::Failed,
+                observed_unix_ms: 1,
+                detail: None,
+            }],
+        });
+        let mut request = InferenceRequest::new("vendor/model", "hi", 8);
+        request.max_output_tokens = Some(8);
+        let result = pool
+            .route(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+            )
+            .await;
+        assert!(matches!(result, Err(ProviderError::NoEligibleEndpoint(_))));
     }
 
     #[tokio::test]
