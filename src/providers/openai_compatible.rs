@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, header::RETRY_AFTER};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -147,18 +146,11 @@ impl OpenAiCompatibleProvider {
             if !status.is_success() {
                 return Err(ProviderError::Catalog(format!("HTTP {status}")));
             }
-            let envelope: ModelEnvelope = response
+            let raw: Value = response
                 .json()
                 .await
                 .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-            Ok::<Vec<NativeModelRecord>, ProviderError>(
-                envelope
-                    .data
-                    .into_iter()
-                    .filter(|model| model.active.unwrap_or(true))
-                    .map(|model| model.normalize(&self.profile))
-                    .collect(),
-            )
+            Self::decode_models(&raw, &self.profile)
         }
         .await;
 
@@ -173,6 +165,63 @@ impl OpenAiCompatibleProvider {
             }
             Err(error) => stale.ok_or(error),
         }
+    }
+
+    fn decode_models(
+        raw: &Value,
+        profile: &OpenAiCompatibleProfile,
+    ) -> Result<Vec<NativeModelRecord>, ProviderError> {
+        let data = raw.get("data").and_then(Value::as_array).ok_or_else(|| {
+            let top_level = raw
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            ProviderError::Catalog(format!(
+                "model inventory has no data array; top_level_keys={top_level:?}"
+            ))
+        })?;
+        data.iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                let Some(object) = value.as_object() else {
+                    return Some(Err(ProviderError::Catalog(format!(
+                        "model inventory item {index} is not an object"
+                    ))));
+                };
+                let id = match object.get("id").and_then(Value::as_str) {
+                    Some(id) if !id.is_empty() => id.to_owned(),
+                    _ => {
+                        let keys = object.keys().cloned().collect::<Vec<_>>();
+                        return Some(Err(ProviderError::Catalog(format!(
+                            "model inventory item {index} has no string id; keys={keys:?}"
+                        ))));
+                    }
+                };
+                if object.get("active").and_then(Value::as_bool) == Some(false) {
+                    return None;
+                }
+                let context_length = object
+                    .get("context_length")
+                    .or_else(|| object.get("context_window"))
+                    .and_then(Value::as_u64);
+                Some(Ok(NativeModelRecord {
+                    id,
+                    display_name: None,
+                    owned_by: object
+                        .get("owned_by")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    created_unix: object.get("created").and_then(Value::as_u64),
+                    context_length,
+                    max_completion_tokens: object
+                        .get("max_completion_tokens")
+                        .and_then(Value::as_u64),
+                    claimed_parameters: profile.nominal_parameters.clone(),
+                    pricing: Some(profile.pricing.clone()),
+                    route_class: Some(profile.route_class),
+                }))
+            })
+            .collect()
     }
 
     fn response_format(schema: &ResponseSchema) -> Value {
@@ -438,42 +487,6 @@ impl InferenceProvider for OpenAiCompatibleProvider {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ModelEnvelope {
-    data: Vec<OpenAiModel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiModel {
-    id: String,
-    #[serde(default)]
-    created: Option<u64>,
-    #[serde(default)]
-    owned_by: Option<String>,
-    #[serde(default)]
-    active: Option<bool>,
-    #[serde(default, alias = "context_window")]
-    context_length: Option<u64>,
-    #[serde(default)]
-    max_completion_tokens: Option<u64>,
-}
-
-impl OpenAiModel {
-    fn normalize(self, profile: &OpenAiCompatibleProfile) -> NativeModelRecord {
-        NativeModelRecord {
-            id: self.id,
-            display_name: None,
-            owned_by: self.owned_by,
-            created_unix: self.created,
-            context_length: self.context_length,
-            max_completion_tokens: self.max_completion_tokens,
-            claimed_parameters: profile.nominal_parameters.clone(),
-            pricing: Some(profile.pricing.clone()),
-            route_class: Some(profile.route_class),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,24 +547,58 @@ mod tests {
     }
 
     #[test]
-    fn model_record_accepts_groq_style_context_window() -> Result<(), serde_json::Error> {
-        let envelope: ModelEnvelope = serde_json::from_value(json!({
-            "object": "list",
-            "data": [{
-                "id": "openai/gpt-oss-120b",
-                "created": 1,
-                "owned_by": "OpenAI",
-                "active": true,
-                "context_window": 131_072
-            }]
-        }))?;
-        let model = envelope
-            .data
-            .into_iter()
-            .next()
-            .ok_or_else(|| serde_json::Error::io(std::io::Error::other("missing model")))?;
-        let normalized = model.normalize(&profile());
-        assert_eq!(normalized.context_length, Some(131_072));
+    fn model_record_accepts_groq_style_context_window() -> Result<(), ProviderError> {
+        let models = OpenAiCompatibleProvider::decode_models(
+            &json!({
+                "object": "list",
+                "data": [{
+                    "id": "openai/gpt-oss-120b",
+                    "created": 1,
+                    "owned_by": "OpenAI",
+                    "active": true,
+                    "context_window": 131_072
+                }]
+            }),
+            &profile(),
+        )?;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].context_length, Some(131_072));
         Ok(())
+    }
+
+    #[test]
+    fn model_inventory_ignores_wrong_optional_field_types() -> Result<(), ProviderError> {
+        let models = OpenAiCompatibleProvider::decode_models(
+            &json!({
+                "data": [{
+                    "id": "vendor/model",
+                    "created": "recently",
+                    "owned_by": {"name": "vendor"},
+                    "active": "yes",
+                    "context_window": "131072",
+                    "max_completion_tokens": false
+                }]
+            }),
+            &profile(),
+        )?;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "vendor/model");
+        assert_eq!(models[0].created_unix, None);
+        assert_eq!(models[0].owned_by, None);
+        assert_eq!(models[0].context_length, None);
+        assert_eq!(models[0].max_completion_tokens, None);
+        Ok(())
+    }
+
+    #[test]
+    fn model_inventory_requires_data_array_and_string_id() {
+        let missing_data =
+            OpenAiCompatibleProvider::decode_models(&json!({"models": []}), &profile());
+        assert!(matches!(missing_data, Err(ProviderError::Catalog(_))));
+        let missing_id = OpenAiCompatibleProvider::decode_models(
+            &json!({"data": [{"context_window": 1}]}),
+            &profile(),
+        );
+        assert!(matches!(missing_id, Err(ProviderError::Catalog(_))));
     }
 }

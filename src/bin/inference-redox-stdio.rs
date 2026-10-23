@@ -7,7 +7,7 @@ use std::time::Duration;
 use inference_redox::providers::{groq::Groq, nvidia::NvidiaNim, openrouter::OpenRouter};
 use inference_redox::{
     BatchInferenceItem, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
-    ModelSuitabilityRequirements, ProviderError, RetryPolicy, RoutingStrategy,
+    ModelSuitabilityRequirements, ProviderError, ProviderInventory, RetryPolicy, RoutingStrategy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +23,7 @@ enum Operation {
     InferPool,
     RoutePool,
     Models,
+    ProviderInventory,
     ResolveModel,
     Suitability,
     SubmitBatch,
@@ -60,6 +61,8 @@ struct WireRequest {
     request: Option<InferenceRequest>,
     #[serde(default)]
     query: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
     #[serde(default)]
     suitability: Option<ModelSuitabilityRequirements>,
     #[serde(default)]
@@ -112,6 +115,35 @@ impl Providers {
         Ok(catalog)
     }
 
+    async fn provider_inventory(&self, provider: &str) -> Result<ProviderInventory, ProviderError> {
+        let catalog = self.openrouter.models().await?;
+        match provider {
+            "nvidia" => {
+                self.nvidia
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ProviderError::InvalidRequest(
+                            "NVIDIA provider is not configured".to_owned(),
+                        )
+                    })?
+                    .inventory(&catalog)
+                    .await
+            }
+            "groq" => {
+                self.groq
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ProviderError::InvalidRequest("Groq provider is not configured".to_owned())
+                    })?
+                    .inventory(&catalog)
+                    .await
+            }
+            other => Err(ProviderError::InvalidRequest(format!(
+                "provider_inventory does not support {other}"
+            ))),
+        }
+    }
+
     fn pool(&self) -> InferencePool {
         let mut pool = InferencePool::new();
         pool.register("openrouter", Arc::clone(&self.openrouter));
@@ -156,6 +188,7 @@ async fn handle_catalog_operation(
         id,
         op,
         query,
+        provider,
         suitability,
         ..
     } = wire;
@@ -174,6 +207,26 @@ async fn handle_catalog_operation(
             }
             Err(error) => write_error(stdout, id, error.to_string()).await,
         },
+        Operation::ProviderInventory => {
+            let Some(provider) = provider else {
+                write_error(stdout, id, "provider_inventory requires provider").await;
+                return;
+            };
+            match providers.provider_inventory(&provider).await {
+                Ok(inventory) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: inventory,
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
         Operation::Suitability => {
             let Some(requirements) = suitability else {
                 write_error(stdout, id, "suitability requires suitability").await;
@@ -449,7 +502,10 @@ async fn handle_openrouter_operation(
 
 async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, request: WireRequest) {
     match request.op {
-        Operation::Models | Operation::ResolveModel | Operation::Suitability => {
+        Operation::Models
+        | Operation::ProviderInventory
+        | Operation::ResolveModel
+        | Operation::Suitability => {
             handle_catalog_operation(&providers, &stdout, request).await;
         }
         Operation::SubmitBatch | Operation::BatchStatus | Operation::DeleteBatch => {
@@ -610,6 +666,18 @@ mod tests {
             key_from_contents("NVIDIA_API_key=legacy", "NVIDIA_API_key").as_deref(),
             Some("legacy")
         );
+    }
+
+    #[test]
+    fn provider_inventory_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 1,
+            "op": "provider_inventory",
+            "provider": "groq"
+        }))?;
+        assert!(matches!(wire.op, Operation::ProviderInventory));
+        assert_eq!(wire.provider.as_deref(), Some("groq"));
+        Ok(())
     }
 
     #[test]
