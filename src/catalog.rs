@@ -159,6 +159,9 @@ impl ModelCatalog {
     /// identities win; unmatched native IDs become provisional canonical identities.
     pub fn ingest_provider_inventory(&mut self, inventory: &ProviderInventory) {
         for observation in &inventory.models {
+            let Some(route_class) = observation.route_class else {
+                continue;
+            };
             let canonical_id = match &observation.resolution {
                 InventoryResolution::Resolved { canonical_id, .. } => canonical_id.clone(),
                 InventoryResolution::Ambiguous { .. } => continue,
@@ -178,7 +181,7 @@ impl ModelCatalog {
             let pricing_known = observation.pricing.is_some();
             self.models.push(ModelCatalogEntry {
                 id: observation.native_id.clone(),
-                route_class: observation.route_class.unwrap_or(ModelRouteClass::Standard),
+                route_class,
                 canonical_id,
                 name: observation
                     .display_name
@@ -463,6 +466,29 @@ mod tests {
         assert_eq!(model.routes.len(), 1);
         assert_eq!(model.routes[0].source, "nvidia");
         Ok(())
+    }
+
+    #[test]
+    fn observation_only_provider_models_do_not_become_routes() {
+        let mut catalog = ModelCatalog::default();
+        let inventory = ProviderInventory {
+            provider: "provider".to_owned(),
+            models: vec![crate::ProviderModelObservation {
+                provider: "provider".to_owned(),
+                native_id: "provider/non-routable".to_owned(),
+                display_name: None,
+                owned_by: None,
+                created_unix: None,
+                context_length: None,
+                max_completion_tokens: None,
+                claimed_parameters: BTreeSet::new(),
+                pricing: None,
+                route_class: None,
+                resolution: crate::InventoryResolution::Unmatched,
+            }],
+        };
+        catalog.ingest_provider_inventory(&inventory);
+        assert_eq!(catalog.models.len(), 0);
     }
 
     #[test]

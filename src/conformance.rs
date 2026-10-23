@@ -64,14 +64,14 @@ impl ConformanceProbe {
         match self {
             Self::BasicChat => {
                 let mut request = InferenceRequest::new(model, "Reply with PROBE_OK.", 16);
-                request.max_output_tokens = Some(32);
+                request.max_output_tokens = Some(256);
                 request.temperature = Some(0.0);
                 request
             }
             Self::SystemRole => {
                 let mut request = InferenceRequest::new(model, "Reply briefly.", 16);
                 request.system_prompt = Some("This is a protocol conformance probe.".to_owned());
-                request.max_output_tokens = Some(32);
+                request.max_output_tokens = Some(256);
                 request.temperature = Some(0.0);
                 request
             }
@@ -81,7 +81,7 @@ impl ConformanceProbe {
                     "Return a JSON object whose only key is ok and whose value is true.",
                     16,
                 );
-                request.max_output_tokens = Some(256);
+                request.max_output_tokens = Some(512);
                 request.temperature = Some(0.0);
                 request.requirements = RequestRequirements {
                     response_schema: Some(ResponseSchema::JsonObject),
@@ -95,7 +95,7 @@ impl ConformanceProbe {
                     "Return the requested object with ok set to true.",
                     16,
                 );
-                request.max_output_tokens = Some(256);
+                request.max_output_tokens = Some(512);
                 request.temperature = Some(0.0);
                 request.requirements = RequestRequirements {
                     response_schema: Some(ResponseSchema::JsonSchema {
@@ -118,7 +118,7 @@ impl ConformanceProbe {
                     "Return the requested object with ok set to true.",
                     16,
                 );
-                request.max_output_tokens = Some(256);
+                request.max_output_tokens = Some(512);
                 request.temperature = Some(0.0);
                 request.requirements = RequestRequirements {
                     response_schema: Some(ResponseSchema::JsonSchema {

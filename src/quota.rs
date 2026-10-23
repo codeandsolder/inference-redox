@@ -16,6 +16,7 @@ pub struct QuotaResourceId(pub String);
 #[serde(rename_all = "snake_case")]
 pub enum QuotaScope {
     Credential,
+    NetworkOrigin,
     Account,
     Provider,
     ModelFamily,
@@ -88,6 +89,24 @@ impl QuotaResource {
             metric,
             capacity: QuotaAmount::Finite(capacity),
             remaining: QuotaAmount::Finite(remaining),
+            reset_at_unix: None,
+            observed_at_unix: None,
+        }
+    }
+
+    #[must_use]
+    pub fn known_capacity(
+        id: impl Into<String>,
+        scope: QuotaScope,
+        metric: QuotaMetric,
+        capacity: u64,
+    ) -> Self {
+        Self {
+            id: QuotaResourceId(id.into()),
+            scope,
+            metric,
+            capacity: QuotaAmount::Finite(capacity),
+            remaining: QuotaAmount::Unknown,
             reset_at_unix: None,
             observed_at_unix: None,
         }
@@ -400,20 +419,48 @@ impl QuotaObservationMap {
 #[serde(transparent)]
 pub struct QuotaReservationId(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveReservation {
     charges: BTreeMap<QuotaResourceId, u64>,
     resources: BTreeSet<QuotaResourceId>,
 }
 
 /// Local reservation/consumption ledger over provider observations.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default)]
 pub struct QuotaLedger {
     graph: QuotaGraph,
     observation_map: QuotaObservationMap,
     reserved: BTreeMap<QuotaResourceId, u64>,
     active: BTreeMap<QuotaReservationId, ActiveReservation>,
     next_reservation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaRouteBindingSnapshot {
+    pub route: QuotaRouteKey,
+    pub resource_ids: Vec<QuotaResourceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaObservationBindingSnapshot {
+    pub route: QuotaRouteKey,
+    pub bucket: String,
+    pub resource_id: QuotaResourceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaReservedSnapshot {
+    pub resource_id: QuotaResourceId,
+    pub amount: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaStateSnapshot {
+    pub resources: Vec<QuotaResource>,
+    pub route_bindings: Vec<QuotaRouteBindingSnapshot>,
+    pub observation_bindings: Vec<QuotaObservationBindingSnapshot>,
+    pub reserved: Vec<QuotaReservedSnapshot>,
+    pub active_reservations: usize,
 }
 
 /// Concurrency-safe quota state shared by asynchronous routing/execution tasks.
@@ -431,6 +478,26 @@ impl SharedQuotaLedger {
         Self {
             inner: Arc::new(Mutex::new(ledger)),
         }
+    }
+
+    /// Ensure one logical resource exists and bind an executable route to it without replacing
+    /// any learned state already held for that resource.
+    pub async fn ensure_resource_binding(
+        &self,
+        resource: QuotaResource,
+        route: QuotaRouteKey,
+    ) -> bool {
+        let mut ledger = self.inner.lock().await;
+        let resource_id = resource.id.clone();
+        if ledger.graph.resource(&resource_id).is_none() {
+            ledger.graph.insert_resource(resource);
+        }
+        ledger.graph.bind(route, &resource_id)
+    }
+
+    /// Return a JSON-safe, read-only view of the current quota topology and mutable state.
+    pub async fn diagnostic_snapshot(&self) -> QuotaStateSnapshot {
+        self.inner.lock().await.diagnostic_snapshot()
     }
 
     /// Clone the current ledger state for diagnostics or persistence.
@@ -488,6 +555,43 @@ impl QuotaLedger {
 
     pub fn observation_map_mut(&mut self) -> &mut QuotaObservationMap {
         &mut self.observation_map
+    }
+
+    #[must_use]
+    pub fn diagnostic_snapshot(&self) -> QuotaStateSnapshot {
+        QuotaStateSnapshot {
+            resources: self.graph.resources.values().cloned().collect(),
+            route_bindings: self
+                .graph
+                .bindings
+                .iter()
+                .map(|(route, resource_ids)| QuotaRouteBindingSnapshot {
+                    route: route.clone(),
+                    resource_ids: resource_ids.iter().cloned().collect(),
+                })
+                .collect(),
+            observation_bindings: self
+                .observation_map
+                .bindings
+                .iter()
+                .map(
+                    |((route, bucket), resource_id)| QuotaObservationBindingSnapshot {
+                        route: route.clone(),
+                        bucket: bucket.clone(),
+                        resource_id: resource_id.clone(),
+                    },
+                )
+                .collect(),
+            reserved: self
+                .reserved
+                .iter()
+                .map(|(resource_id, amount)| QuotaReservedSnapshot {
+                    resource_id: resource_id.clone(),
+                    amount: *amount,
+                })
+                .collect(),
+            active_reservations: self.active.len(),
+        }
     }
 
     #[must_use]
@@ -728,6 +832,61 @@ mod tests {
             provider: "provider".to_owned(),
             model: "model".to_owned(),
         }
+    }
+
+    #[test]
+    fn diagnostic_snapshot_is_json_serializable_with_structured_route_keys()
+    -> Result<(), serde_json::Error> {
+        let resource = QuotaResource::finite(
+            "shared/rpd",
+            QuotaScope::Account,
+            QuotaMetric::Requests,
+            100,
+            90,
+        );
+        let id = resource.id.clone();
+        let mut graph = QuotaGraph::new();
+        graph.insert_resource(resource);
+        assert!(graph.bind(route("key-a"), &id));
+        let snapshot = QuotaLedger::new(graph).diagnostic_snapshot();
+        let value = serde_json::to_value(snapshot)?;
+        assert_eq!(
+            value
+                .pointer("/route_bindings/0/route/credential")
+                .and_then(serde_json::Value::as_str),
+            Some("key-a")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_ledger_can_add_dynamic_resource_binding_without_overwriting_state() {
+        let ledger = SharedQuotaLedger::default();
+        let resource = QuotaResource::known_capacity(
+            "kilo/ip/free-rph",
+            QuotaScope::NetworkOrigin,
+            QuotaMetric::Requests,
+            200,
+        );
+        let id = resource.id.clone();
+        let bound = ledger
+            .ensure_resource_binding(resource, route("anonymous"))
+            .await;
+        assert!(bound);
+        let snapshot = ledger.snapshot().await;
+        let stored = snapshot.graph().resource(&id);
+        assert_eq!(
+            stored.map(|resource| resource.capacity),
+            Some(QuotaAmount::Finite(200))
+        );
+        assert_eq!(
+            stored.map(|resource| resource.remaining),
+            Some(QuotaAmount::Unknown)
+        );
+        assert_eq!(
+            stored.map(|resource| resource.scope),
+            Some(QuotaScope::NetworkOrigin)
+        );
     }
 
     #[test]

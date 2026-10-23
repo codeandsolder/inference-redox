@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use inference_redox::providers::{groq::Groq, nvidia::NvidiaNim, openrouter::OpenRouter};
+use inference_redox::providers::{
+    groq::Groq, kilo::Kilo, nvidia::NvidiaNim, openrouter::OpenRouter,
+};
 use inference_redox::{
     BatchInferenceItem, ConformanceObservation, ConformanceProbe, ConformanceProfile,
     InferencePool, InferenceProvider, InferenceRequest, ModelCatalog, ModelLookup,
@@ -105,6 +107,7 @@ struct Providers {
     openrouter: Arc<OpenRouter>,
     nvidia: Option<Arc<NvidiaNim>>,
     groq: Option<Arc<Groq>>,
+    kilo: Arc<Kilo>,
     quota: SharedQuotaLedger,
     conformance: Arc<Mutex<ConformanceProfile>>,
 }
@@ -120,6 +123,22 @@ impl Providers {
         if let Some(groq) = self.groq.as_ref()
             && let Ok(inventory) = groq.inventory(&catalog).await
         {
+            catalog.ingest_provider_inventory(&inventory);
+        }
+        if let Ok(inventory) = self.kilo.inventory(&catalog).await {
+            for model in inventory
+                .models
+                .iter()
+                .filter(|model| model.route_class == Some(inference_redox::ModelRouteClass::Free))
+            {
+                let _ = self
+                    .quota
+                    .ensure_resource_binding(
+                        Kilo::free_ip_request_resource(),
+                        Kilo::free_quota_route(model.native_id.clone()),
+                    )
+                    .await;
+            }
             catalog.ingest_provider_inventory(&inventory);
         }
         Ok(catalog)
@@ -148,6 +167,7 @@ impl Providers {
                     .inventory(&catalog)
                     .await
             }
+            "kilo" => self.kilo.inventory(&catalog).await,
             other => Err(ProviderError::InvalidRequest(format!(
                 "provider_inventory does not support {other}"
             ))),
@@ -203,6 +223,7 @@ impl Providers {
                 .ok_or_else(|| {
                     ProviderError::InvalidRequest("Groq provider is not configured".to_owned())
                 })?,
+            "kilo" => Arc::clone(&self.kilo) as Arc<dyn InferenceProvider>,
             other => {
                 return Err(ProviderError::InvalidRequest(format!(
                     "conformance_probe supports direct providers only, got {other}"
@@ -238,6 +259,7 @@ impl Providers {
         if let Some(groq) = self.groq.as_ref() {
             pool.register("groq", Arc::clone(groq));
         }
+        pool.register("kilo", Arc::clone(&self.kilo));
         pool.set_conformance_profile(self.conformance.lock().await.clone());
         pool
     }
@@ -415,7 +437,7 @@ async fn handle_provider_diagnostic_operation(
                 &WireSuccess {
                     id,
                     ok: true,
-                    result: providers.quota.snapshot().await,
+                    result: providers.quota.diagnostic_snapshot().await,
                 },
             )
             .await;
@@ -764,6 +786,7 @@ struct ApiKeys {
     openrouter: String,
     nvidia: Option<String>,
     groq: Option<String>,
+    kilo: Option<String>,
     groq_quota_pool_label: String,
 }
 
@@ -784,6 +807,7 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         .or(from_file("NVIDIA_API_KEY")?)
         .or(from_file("NVIDIA_API_key")?);
     let groq = environment_key("GROQ_API_KEY").or(from_file("GROQ_API_KEY")?);
+    let kilo = environment_key("KILOCODE_API_KEY").or(from_file("KILOCODE_API_KEY")?);
     let groq_quota_pool_label = environment_key("GROQ_QUOTA_POOL_LABEL")
         .or(from_file("GROQ_QUOTA_POOL_LABEL")?)
         .unwrap_or_else(|| "default".to_owned());
@@ -791,6 +815,7 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         openrouter,
         nvidia,
         groq,
+        kilo,
         groq_quota_pool_label,
     })
 }
@@ -801,6 +826,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         openrouter,
         nvidia,
         groq,
+        kilo,
         groq_quota_pool_label,
     } = load_api_keys()?;
     let groq = groq.map(|key| Arc::new(Groq::new_free(key)));
@@ -809,6 +835,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         openrouter: Arc::new(OpenRouter::new(openrouter)),
         nvidia: nvidia.map(|key| Arc::new(NvidiaNim::new(key))),
         groq,
+        kilo: Arc::new(Kilo::new(kilo)),
         quota,
         conformance: Arc::new(Mutex::new(ConformanceProfile::default())),
     };
@@ -854,6 +881,7 @@ mod tests {
             "export OPENROUTER_API_KEY='or-key'\r\n",
             "NVIDIA_API_KEY=\"nv-key\"\r\n",
             "GROQ_API_KEY='groq-key'\r\n",
+            "KILOCODE_API_KEY='kilo-key'\r\n",
             "GROQ_QUOTA_POOL_LABEL='pool-a'\r\n",
         );
         assert_eq!(
@@ -867,6 +895,10 @@ mod tests {
         assert_eq!(
             key_from_contents(contents, "GROQ_API_KEY").as_deref(),
             Some("groq-key")
+        );
+        assert_eq!(
+            key_from_contents(contents, "KILOCODE_API_KEY").as_deref(),
+            Some("kilo-key")
         );
         assert_eq!(
             key_from_contents(contents, "GROQ_QUOTA_POOL_LABEL").as_deref(),

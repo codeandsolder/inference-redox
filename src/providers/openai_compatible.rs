@@ -182,6 +182,35 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    fn optional_number(value: Option<&Value>) -> Option<f64> {
+        value.and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+        })
+    }
+
+    fn model_pricing(object: &serde_json::Map<String, Value>) -> Option<Pricing> {
+        let pricing = object.get("pricing")?.as_object()?;
+        Some(Pricing {
+            prompt_per_token: Self::optional_number(pricing.get("prompt"))?,
+            completion_per_token: Self::optional_number(pricing.get("completion"))?,
+            request: Self::optional_number(pricing.get("request")).unwrap_or(0.0),
+            discount: Self::optional_number(pricing.get("discount")).unwrap_or(0.0),
+            cache_read_per_token: Self::optional_number(
+                pricing
+                    .get("input_cache_read")
+                    .or_else(|| pricing.get("cache_read")),
+            ),
+            cache_write_per_token: Self::optional_number(
+                pricing
+                    .get("input_cache_write")
+                    .or_else(|| pricing.get("cache_write")),
+            ),
+            overrides: Vec::new(),
+        })
+    }
+
     fn decode_models(
         raw: &Value,
         profile: &OpenAiCompatibleProfile,
@@ -219,20 +248,42 @@ impl OpenAiCompatibleProvider {
                     .get("context_length")
                     .or_else(|| object.get("context_window"))
                     .and_then(Value::as_u64);
+                let top_provider = object.get("top_provider").and_then(Value::as_object);
+                let max_completion_tokens = object
+                    .get("max_completion_tokens")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        top_provider
+                            .and_then(|provider| provider.get("max_completion_tokens"))
+                            .and_then(Value::as_u64)
+                    });
+                let claimed_parameters = object
+                    .get("supported_parameters")
+                    .and_then(Value::as_array)
+                    .map(|parameters| {
+                        parameters
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .filter(|parameters| !parameters.is_empty())
+                    .unwrap_or_else(|| profile.nominal_parameters.clone());
                 Some(Ok(NativeModelRecord {
                     id,
-                    display_name: None,
+                    display_name: object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                     owned_by: object
                         .get("owned_by")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                     created_unix: object.get("created").and_then(Value::as_u64),
                     context_length,
-                    max_completion_tokens: object
-                        .get("max_completion_tokens")
-                        .and_then(Value::as_u64),
-                    claimed_parameters: profile.nominal_parameters.clone(),
-                    pricing: Some(profile.pricing.clone()),
+                    max_completion_tokens,
+                    claimed_parameters,
+                    pricing: Self::model_pricing(object).or_else(|| Some(profile.pricing.clone())),
                     route_class: Some(profile.route_class),
                 }))
             })
@@ -424,11 +475,14 @@ impl InferenceProvider for OpenAiCompatibleProvider {
             context_length: native.context_length,
             max_prompt_tokens: None,
             max_completion_tokens: native.max_completion_tokens,
-            pricing: self.profile.pricing.clone(),
+            pricing: native
+                .pricing
+                .clone()
+                .unwrap_or_else(|| self.profile.pricing.clone()),
             stats: EndpointStats::default(),
             capabilities: EndpointCapabilities {
                 adapter_parameters: self.profile.adapter_parameters.clone(),
-                supported_parameters: self.profile.nominal_parameters.clone(),
+                supported_parameters: native.claimed_parameters.clone(),
                 verified_parameters: BTreeSet::new(),
                 rejected_parameters: BTreeSet::new(),
                 reasoning: self.profile.reasoning_support.clone(),
@@ -569,6 +623,40 @@ mod tests {
             body.get("reasoning_effort").and_then(Value::as_str),
             Some("low")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn model_inventory_preserves_per_model_claims_pricing_and_output_limit()
+    -> Result<(), ProviderError> {
+        let raw = json!({
+            "data": [{
+                "id": "vendor/model:free",
+                "name": "Vendor Model Free",
+                "supported_parameters": ["max_tokens", "tools", 7],
+                "pricing": {
+                    "prompt": "0.000001",
+                    "completion": 0.000_002,
+                    "input_cache_read": "0.0000001"
+                },
+                "top_provider": {"max_completion_tokens": 12345}
+            }]
+        });
+        let models = OpenAiCompatibleProvider::decode_models(&raw, &profile())?;
+        let model = &models[0];
+        assert_eq!(model.display_name.as_deref(), Some("Vendor Model Free"));
+        assert_eq!(model.max_completion_tokens, Some(12_345));
+        assert_eq!(
+            model.claimed_parameters,
+            BTreeSet::from(["max_tokens".to_owned(), "tools".to_owned()])
+        );
+        let pricing = model
+            .pricing
+            .as_ref()
+            .ok_or_else(|| ProviderError::Catalog("missing normalized pricing".to_owned()))?;
+        assert_eq!(pricing.prompt_per_token, 0.000_001);
+        assert_eq!(pricing.completion_per_token, 0.000_002);
+        assert_eq!(pricing.cache_read_per_token, Some(0.000_000_1));
         Ok(())
     }
 
