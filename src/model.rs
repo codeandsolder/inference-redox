@@ -206,6 +206,9 @@ impl EndpointCapabilities {
         }
         self.verified_parameters.contains(parameter)
             || self.supported_parameters.contains(parameter)
+            || (parameter == "json_schema"
+                && (self.verified_parameters.contains("structured_outputs")
+                    || self.supported_parameters.contains("structured_outputs")))
     }
 
     /// Whether every requested parameter is currently believed to work.

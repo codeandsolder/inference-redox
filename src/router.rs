@@ -88,7 +88,7 @@ pub(crate) fn supports_request(
             let parameter = if *strict {
                 "structured_outputs"
             } else {
-                "response_format"
+                "json_schema"
             };
             if !endpoint.capabilities.supports_parameter(parameter) {
                 return false;

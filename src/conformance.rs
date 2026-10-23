@@ -23,6 +23,7 @@ pub enum ConformanceProbe {
     BasicChat,
     SystemRole,
     JsonObject,
+    JsonSchema,
     StrictJsonSchema,
     ReasoningLow,
 }
@@ -34,6 +35,7 @@ impl ConformanceProbe {
             Self::BasicChat => "basic-chat",
             Self::SystemRole => "system-role",
             Self::JsonObject => "json-object",
+            Self::JsonSchema => "json-schema",
             Self::StrictJsonSchema => "strict-json-schema",
             Self::ReasoningLow => "reasoning-low",
         }
@@ -50,6 +52,7 @@ impl ConformanceProbe {
             Self::BasicChat => "chat_completions",
             Self::SystemRole => "system_role",
             Self::JsonObject => "response_format",
+            Self::JsonSchema => "json_schema",
             Self::StrictJsonSchema => "structured_outputs",
             Self::ReasoningLow => "reasoning",
         }
@@ -82,6 +85,29 @@ impl ConformanceProbe {
                 request.temperature = Some(0.0);
                 request.requirements = RequestRequirements {
                     response_schema: Some(ResponseSchema::JsonObject),
+                    ..RequestRequirements::default()
+                };
+                request
+            }
+            Self::JsonSchema => {
+                let mut request = InferenceRequest::new(
+                    model,
+                    "Return the requested object with ok set to true.",
+                    16,
+                );
+                request.max_output_tokens = Some(256);
+                request.temperature = Some(0.0);
+                request.requirements = RequestRequirements {
+                    response_schema: Some(ResponseSchema::JsonSchema {
+                        name: "conformance".to_owned(),
+                        schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
+                            "additionalProperties": false
+                        }),
+                        strict: false,
+                    }),
                     ..RequestRequirements::default()
                 };
                 request
@@ -185,7 +211,7 @@ impl ConformanceProbe {
 
     fn validate_response(self, response: &InferenceResponse) -> Result<(), String> {
         match self {
-            Self::JsonObject | Self::StrictJsonSchema => {
+            Self::JsonObject | Self::JsonSchema | Self::StrictJsonSchema => {
                 let value: serde_json::Value = serde_json::from_str(&response.content)
                     .map_err(|error| format!("response was not JSON: {error}"))?;
                 if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {

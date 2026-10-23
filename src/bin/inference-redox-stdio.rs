@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use inference_redox::providers::{nvidia::NvidiaNim, openrouter::OpenRouter};
+use inference_redox::providers::{groq::Groq, nvidia::NvidiaNim, openrouter::OpenRouter};
 use inference_redox::{
     BatchInferenceItem, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
     ModelSuitabilityRequirements, ProviderError, RetryPolicy, RoutingStrategy,
@@ -93,6 +93,7 @@ struct WireError {
 struct Providers {
     openrouter: Arc<OpenRouter>,
     nvidia: Option<Arc<NvidiaNim>>,
+    groq: Option<Arc<Groq>>,
 }
 
 impl Providers {
@@ -100,6 +101,11 @@ impl Providers {
         let mut catalog = self.openrouter.models().await?;
         if let Some(nvidia) = self.nvidia.as_ref()
             && let Ok(inventory) = nvidia.inventory(&catalog).await
+        {
+            catalog.ingest_provider_inventory(&inventory);
+        }
+        if let Some(groq) = self.groq.as_ref()
+            && let Ok(inventory) = groq.inventory(&catalog).await
         {
             catalog.ingest_provider_inventory(&inventory);
         }
@@ -111,6 +117,9 @@ impl Providers {
         pool.register("openrouter", Arc::clone(&self.openrouter));
         if let Some(nvidia) = self.nvidia.as_ref() {
             pool.register("nvidia", Arc::clone(nvidia));
+        }
+        if let Some(groq) = self.groq.as_ref() {
+            pool.register("groq", Arc::clone(groq));
         }
         pool
     }
@@ -504,7 +513,13 @@ fn env_file_argument() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     Ok(Some(path.into()))
 }
 
-fn load_api_keys() -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+struct ApiKeys {
+    openrouter: String,
+    nvidia: Option<String>,
+    groq: Option<String>,
+}
+
+fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
     let env_file = env_file_argument()?;
     let from_file = |name: &str| -> Result<Option<String>, Box<dyn std::error::Error>> {
         env_file
@@ -520,15 +535,21 @@ fn load_api_keys() -> Result<(String, Option<String>), Box<dyn std::error::Error
         .or_else(|| environment_key("NVIDIA_API_key"))
         .or(from_file("NVIDIA_API_KEY")?)
         .or(from_file("NVIDIA_API_key")?);
-    Ok((openrouter, nvidia))
+    let groq = environment_key("GROQ_API_KEY").or(from_file("GROQ_API_KEY")?);
+    Ok(ApiKeys {
+        openrouter,
+        nvidia,
+        groq,
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (openrouter_key, nvidia_key) = load_api_keys()?;
+    let keys = load_api_keys()?;
     let providers = Providers {
-        openrouter: Arc::new(OpenRouter::new(openrouter_key)),
-        nvidia: nvidia_key.map(|key| Arc::new(NvidiaNim::new(key))),
+        openrouter: Arc::new(OpenRouter::new(keys.openrouter)),
+        nvidia: keys.nvidia.map(|key| Arc::new(NvidiaNim::new(key))),
+        groq: keys.groq.map(|key| Arc::new(Groq::new_free(key))),
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
@@ -568,7 +589,11 @@ mod tests {
 
     #[test]
     fn env_file_parser_handles_export_quotes_and_crlf() {
-        let contents = "export OPENROUTER_API_KEY='or-key'\r\nNVIDIA_API_KEY=\"nv-key\"\r\n";
+        let contents = concat!(
+            "export OPENROUTER_API_KEY='or-key'\r\n",
+            "NVIDIA_API_KEY=\"nv-key\"\r\n",
+            "GROQ_API_KEY='groq-key'\r\n",
+        );
         assert_eq!(
             key_from_contents(contents, "OPENROUTER_API_KEY").as_deref(),
             Some("or-key")
@@ -576,6 +601,10 @@ mod tests {
         assert_eq!(
             key_from_contents(contents, "NVIDIA_API_KEY").as_deref(),
             Some("nv-key")
+        );
+        assert_eq!(
+            key_from_contents(contents, "GROQ_API_KEY").as_deref(),
+            Some("groq-key")
         );
         assert_eq!(
             key_from_contents("NVIDIA_API_key=legacy", "NVIDIA_API_key").as_deref(),

@@ -1065,11 +1065,14 @@ impl OpenRouterModel {
 
 impl OpenRouterEndpoint {
     fn normalize(self, requested_model: &str) -> Endpoint {
-        let parameters: BTreeSet<String> = self
+        let mut parameters: BTreeSet<String> = self
             .supported_parameters
             .unwrap_or_default()
             .into_iter()
             .collect();
+        if parameters.contains("structured_outputs") {
+            parameters.insert("json_schema".to_owned());
+        }
         let reasoning =
             if parameters.contains("reasoning") || parameters.contains("reasoning_effort") {
                 ReasoningSupport::GatewayNormalized
@@ -1107,6 +1110,7 @@ impl OpenRouterEndpoint {
                     "max_tokens",
                     "max_completion_tokens",
                     "response_format",
+                    "json_schema",
                     "structured_outputs",
                     "temperature",
                     "reasoning",
