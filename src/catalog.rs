@@ -175,6 +175,7 @@ impl ModelCatalog {
                 continue;
             }
             let mut aliases = BTreeSet::from([observation.native_id.clone(), canonical_id.clone()]);
+            aliases.extend(observation.aliases.iter().cloned());
             if let Some(display_name) = observation.display_name.as_ref() {
                 aliases.insert(display_name.clone());
             }
@@ -477,6 +478,7 @@ mod tests {
                 provider: "provider".to_owned(),
                 native_id: "provider/non-routable".to_owned(),
                 display_name: None,
+                aliases: BTreeSet::new(),
                 owned_by: None,
                 created_unix: None,
                 context_length: None,

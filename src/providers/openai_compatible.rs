@@ -211,6 +211,56 @@ impl OpenAiCompatibleProvider {
         })
     }
 
+    fn model_claimed_parameters(
+        object: &serde_json::Map<String, Value>,
+        profile: &OpenAiCompatibleProfile,
+    ) -> BTreeSet<String> {
+        let mut claimed = object
+            .get("supported_parameters")
+            .and_then(Value::as_array)
+            .map(|parameters| {
+                parameters
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+            })
+            .filter(|parameters| !parameters.is_empty())
+            .unwrap_or_else(|| profile.nominal_parameters.clone());
+        if let Some(capabilities) = object.get("capabilities").and_then(Value::as_object) {
+            for (field, normalized) in [
+                ("completion_chat", "chat_completions"),
+                ("completion_fim", "fim"),
+                ("function_calling", "tools"),
+                ("vision", "vision"),
+                ("classification", "classification"),
+            ] {
+                if capabilities.get(field).and_then(Value::as_bool) == Some(true) {
+                    claimed.insert(normalized.to_owned());
+                }
+            }
+        }
+        claimed
+    }
+
+    fn model_aliases(object: &serde_json::Map<String, Value>) -> BTreeSet<String> {
+        let mut aliases = object
+            .get("aliases")
+            .and_then(Value::as_array)
+            .map(|aliases| {
+                aliases
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(root) = object.get("root").and_then(Value::as_str) {
+            aliases.insert(root.to_owned());
+        }
+        aliases
+    }
+
     fn decode_models(
         raw: &Value,
         profile: &OpenAiCompatibleProfile,
@@ -241,12 +291,15 @@ impl OpenAiCompatibleProvider {
                         ))));
                     }
                 };
-                if object.get("active").and_then(Value::as_bool) == Some(false) {
+                if object.get("active").and_then(Value::as_bool) == Some(false)
+                    || object.get("archived").and_then(Value::as_bool) == Some(true)
+                {
                     return None;
                 }
                 let context_length = object
                     .get("context_length")
                     .or_else(|| object.get("context_window"))
+                    .or_else(|| object.get("max_context_length"))
                     .and_then(Value::as_u64);
                 let top_provider = object.get("top_provider").and_then(Value::as_object);
                 let max_completion_tokens = object
@@ -257,24 +310,15 @@ impl OpenAiCompatibleProvider {
                             .and_then(|provider| provider.get("max_completion_tokens"))
                             .and_then(Value::as_u64)
                     });
-                let claimed_parameters = object
-                    .get("supported_parameters")
-                    .and_then(Value::as_array)
-                    .map(|parameters| {
-                        parameters
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect::<BTreeSet<_>>()
-                    })
-                    .filter(|parameters| !parameters.is_empty())
-                    .unwrap_or_else(|| profile.nominal_parameters.clone());
+                let claimed_parameters = Self::model_claimed_parameters(object, profile);
+                let aliases = Self::model_aliases(object);
                 Some(Ok(NativeModelRecord {
                     id,
                     display_name: object
                         .get("name")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
+                    aliases,
                     owned_by: object
                         .get("owned_by")
                         .and_then(Value::as_str)
@@ -623,6 +667,40 @@ mod tests {
             body.get("reasoning_effort").and_then(Value::as_str),
             Some("low")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn model_inventory_normalizes_mistral_capability_cards() -> Result<(), ProviderError> {
+        let raw = json!({
+            "data": [{
+                "id": "codestral-latest",
+                "aliases": ["codestral-2508"],
+                "root": "codestral-2508",
+                "max_context_length": 131_072,
+                "archived": false,
+                "capabilities": {
+                    "completion_chat": true,
+                    "completion_fim": true,
+                    "function_calling": true,
+                    "vision": false,
+                    "classification": false
+                }
+            }, {
+                "id": "retired",
+                "archived": true,
+                "capabilities": {"completion_chat": true}
+            }]
+        });
+        let models = OpenAiCompatibleProvider::decode_models(&raw, &profile())?;
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model.context_length, Some(131_072));
+        assert!(model.aliases.contains("codestral-2508"));
+        assert!(model.claimed_parameters.contains("chat_completions"));
+        assert!(model.claimed_parameters.contains("fim"));
+        assert!(model.claimed_parameters.contains("tools"));
+        assert!(!model.claimed_parameters.contains("vision"));
         Ok(())
     }
 

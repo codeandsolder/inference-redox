@@ -9,6 +9,7 @@ use crate::{ModelCatalog, ModelLookup, ModelMatchKind, ModelRouteClass, Pricing}
 pub struct NativeModelRecord {
     pub id: String,
     pub display_name: Option<String>,
+    pub aliases: BTreeSet<String>,
     pub owned_by: Option<String>,
     pub created_unix: Option<u64>,
     pub context_length: Option<u64>,
@@ -37,6 +38,7 @@ pub struct ProviderModelObservation {
     pub provider: String,
     pub native_id: String,
     pub display_name: Option<String>,
+    pub aliases: BTreeSet<String>,
     pub owned_by: Option<String>,
     pub created_unix: Option<u64>,
     pub context_length: Option<u64>,
@@ -64,20 +66,16 @@ impl ProviderInventory {
         let models = native_models
             .into_iter()
             .map(|native| {
-                let resolution = match catalog.resolve(&native.id) {
-                    ModelLookup::Resolved { model } => InventoryResolution::Resolved {
-                        canonical_id: model.canonical_id,
-                        match_kind: model.match_kind,
-                    },
-                    ModelLookup::Ambiguous { canonical_ids } => {
-                        InventoryResolution::Ambiguous { canonical_ids }
-                    }
-                    ModelLookup::NotFound => InventoryResolution::Unmatched,
-                };
+                let resolution = reconcile_names(
+                    std::iter::once(native.id.as_str())
+                        .chain(native.aliases.iter().map(String::as_str)),
+                    catalog,
+                );
                 ProviderModelObservation {
                     provider: provider.clone(),
                     native_id: native.id,
                     display_name: native.display_name,
+                    aliases: native.aliases,
                     owned_by: native.owned_by,
                     created_unix: native.created_unix,
                     context_length: native.context_length,
@@ -106,6 +104,46 @@ impl ProviderInventory {
             .iter()
             .filter(|model| matches!(model.resolution, InventoryResolution::Unmatched))
             .count()
+    }
+}
+
+fn reconcile_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+    catalog: &ModelCatalog,
+) -> InventoryResolution {
+    let mut canonical = std::collections::BTreeMap::<String, ModelMatchKind>::new();
+    for name in names {
+        match catalog.resolve(name) {
+            ModelLookup::Resolved { model } => {
+                canonical
+                    .entry(model.canonical_id)
+                    .or_insert(model.match_kind);
+            }
+            ModelLookup::Ambiguous { canonical_ids } => {
+                for canonical_id in canonical_ids {
+                    canonical
+                        .entry(canonical_id)
+                        .or_insert(ModelMatchKind::UniqueSlug);
+                }
+            }
+            ModelLookup::NotFound => {}
+        }
+    }
+    match canonical.len() {
+        0 => InventoryResolution::Unmatched,
+        1 => {
+            if let Some((canonical_id, match_kind)) = canonical.into_iter().next() {
+                InventoryResolution::Resolved {
+                    canonical_id,
+                    match_kind,
+                }
+            } else {
+                InventoryResolution::Unmatched
+            }
+        }
+        _ => InventoryResolution::Ambiguous {
+            canonical_ids: canonical.into_keys().collect(),
+        },
     }
 }
 
@@ -165,6 +203,31 @@ mod tests {
             &inventory.models[0].resolution,
             InventoryResolution::Resolved { canonical_id, .. }
                 if canonical_id == "stepfun/step-5-preview-20261008"
+        ));
+    }
+
+    #[test]
+    fn provider_declared_alias_can_resolve_a_latest_name() {
+        let catalog = ModelCatalog {
+            models: vec![catalog_entry(
+                "mistralai/codestral-2508",
+                "mistralai/codestral-2508",
+                &["mistralai/codestral-2508"],
+            )],
+        };
+        let inventory = ProviderInventory::reconcile(
+            "mistral",
+            vec![NativeModelRecord {
+                id: "codestral-latest".to_owned(),
+                aliases: BTreeSet::from(["codestral-2508".to_owned()]),
+                ..NativeModelRecord::default()
+            }],
+            &catalog,
+        );
+        assert!(matches!(
+            &inventory.models[0].resolution,
+            InventoryResolution::Resolved { canonical_id, .. }
+                if canonical_id == "mistralai/codestral-2508"
         ));
     }
 

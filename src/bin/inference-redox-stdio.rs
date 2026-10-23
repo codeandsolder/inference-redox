@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use inference_redox::providers::{
-    groq::Groq, kilo::Kilo, nvidia::NvidiaNim, openrouter::OpenRouter,
+    groq::Groq, kilo::Kilo, mistral::MistralInventory, nvidia::NvidiaNim, openrouter::OpenRouter,
 };
 use inference_redox::{
     BatchInferenceItem, ConformanceObservation, ConformanceProbe, ConformanceProfile,
@@ -108,6 +108,7 @@ struct Providers {
     nvidia: Option<Arc<NvidiaNim>>,
     groq: Option<Arc<Groq>>,
     kilo: Arc<Kilo>,
+    mistral: Option<Arc<MistralInventory>>,
     quota: SharedQuotaLedger,
     conformance: Arc<Mutex<ConformanceProfile>>,
 }
@@ -168,6 +169,17 @@ impl Providers {
                     .await
             }
             "kilo" => self.kilo.inventory(&catalog).await,
+            "mistral" | "codestral" => {
+                self.mistral
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ProviderError::InvalidRequest(
+                            "Mistral/Codestral inventory key is not configured".to_owned(),
+                        )
+                    })?
+                    .inventory(&catalog)
+                    .await
+            }
             other => Err(ProviderError::InvalidRequest(format!(
                 "provider_inventory does not support {other}"
             ))),
@@ -787,6 +799,7 @@ struct ApiKeys {
     nvidia: Option<String>,
     groq: Option<String>,
     kilo: Option<String>,
+    mistral: Option<String>,
     groq_quota_pool_label: String,
 }
 
@@ -808,6 +821,10 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         .or(from_file("NVIDIA_API_key")?);
     let groq = environment_key("GROQ_API_KEY").or(from_file("GROQ_API_KEY")?);
     let kilo = environment_key("KILOCODE_API_KEY").or(from_file("KILOCODE_API_KEY")?);
+    let mistral = environment_key("MISTRAL_API_KEY")
+        .or(from_file("MISTRAL_API_KEY")?)
+        .or_else(|| environment_key("CODESTRAL_API_KEY"))
+        .or(from_file("CODESTRAL_API_KEY")?);
     let groq_quota_pool_label = environment_key("GROQ_QUOTA_POOL_LABEL")
         .or(from_file("GROQ_QUOTA_POOL_LABEL")?)
         .unwrap_or_else(|| "default".to_owned());
@@ -816,6 +833,7 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         nvidia,
         groq,
         kilo,
+        mistral,
         groq_quota_pool_label,
     })
 }
@@ -827,6 +845,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nvidia,
         groq,
         kilo,
+        mistral,
         groq_quota_pool_label,
     } = load_api_keys()?;
     let groq = groq.map(|key| Arc::new(Groq::new_free(key)));
@@ -836,6 +855,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nvidia: nvidia.map(|key| Arc::new(NvidiaNim::new(key))),
         groq,
         kilo: Arc::new(Kilo::new(kilo)),
+        mistral: mistral.map(|key| Arc::new(MistralInventory::new(key))),
         quota,
         conformance: Arc::new(Mutex::new(ConformanceProfile::default())),
     };
@@ -882,6 +902,7 @@ mod tests {
             "NVIDIA_API_KEY=\"nv-key\"\r\n",
             "GROQ_API_KEY='groq-key'\r\n",
             "KILOCODE_API_KEY='kilo-key'\r\n",
+            "CODESTRAL_API_KEY='codestral-key'\r\n",
             "GROQ_QUOTA_POOL_LABEL='pool-a'\r\n",
         );
         assert_eq!(
@@ -899,6 +920,10 @@ mod tests {
         assert_eq!(
             key_from_contents(contents, "KILOCODE_API_KEY").as_deref(),
             Some("kilo-key")
+        );
+        assert_eq!(
+            key_from_contents(contents, "CODESTRAL_API_KEY").as_deref(),
+            Some("codestral-key")
         );
         assert_eq!(
             key_from_contents(contents, "GROQ_QUOTA_POOL_LABEL").as_deref(),
