@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Endpoint, InferenceRequest, InferenceResponse, QuotaObservation, RetryPolicy, RoutePlan,
-    RoutingStrategy,
+    Endpoint, InferenceRequest, InferenceResponse, QuotaLedger, QuotaObservation, QuotaRouteKey,
+    RetryPolicy, RoutePlan, RoutingStrategy,
 };
 
 /// How far an inference attempt definitely progressed before failing.
@@ -66,6 +66,19 @@ impl ProviderError {
 #[async_trait]
 pub trait InferenceProvider: Send + Sync {
     async fn endpoints(&self, model: &str) -> Result<Vec<Endpoint>, ProviderError>;
+
+    /// Declare logical quota resources for one executable route before quota admission.
+    /// Providers that do not know their quota topology leave the route unbound/indeterminate.
+    ///
+    /// # Errors
+    /// Returns an invalid-route/provider error when an adapter is asked to configure a route it does not own.
+    fn configure_quota_route(
+        &self,
+        _route: &QuotaRouteKey,
+        _ledger: &mut QuotaLedger,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
 
     async fn execute_plan(
         &self,

@@ -88,7 +88,7 @@ Benchmark snapshots use a separate one-hour cache because the upstream feed is r
 
 Name resolution is conservative: exact aliases first, normalized full names second, then a basename match only when it identifies exactly one canonical model. That lets a provider-native name such as `stepfun-ai/step-5-preview` resolve to an OpenRouter spelling such as `stepfun/step-5-preview` without maintaining a vendor-renaming table; ambiguous basenames are returned as ambiguous rather than guessed.
 
-Provider-native inventories are a separate input. A direct provider route is attached to an existing OpenRouter-backed canonical identity when resolution succeeds; otherwise its native `author/model` ID becomes a provisional canonical identity. Routes carry both `source` and `id`, so `nvidia/nemotron-...` through direct NIM is distinct from the same model string through OpenRouter. NVIDIA NIM is the first native inventory adapter. A provider's `/models` listing is only an advertisement, not proof that the route is callable.
+Provider-native inventories are a separate input. A direct provider route is attached to an existing OpenRouter-backed canonical identity when resolution succeeds; otherwise its native `author/model` ID becomes a provisional canonical identity. Routes carry both `source` and `id`, so a direct route is distinct from the same model string through OpenRouter. NVIDIA NIM and GroqCloud are native inventory/execution adapters. Every native inventory is reconciled independently against the same base OpenRouter catalog before routes are merged, so canonical identity cannot depend on provider ingestion order. A provider's `/models` listing is only an advertisement, not proof that the route is callable.
 
 This is intentionally not an availability model. A provider can advertise a model that is currently unhealthy or not entitled for a particular account, and multiple providers can expose the same canonical model under different names. Provider-local availability, health, quota and price observations belong to routing state, not model identity.
 
@@ -119,7 +119,7 @@ Execution failures carry `ExecutionFailurePhase`: `TransportUnknown` means a req
 
 ## Provider architecture
 
-Implement `InferenceProvider` for another service. The adapter owns endpoint discovery and exact request/response grammar; core routing stays independent of OpenAI-compatible assumptions. OpenRouter and direct NVIDIA NIM both implement the trait. NVIDIA currently normalizes plain chat/system prompts, max tokens, temperature and JSON response formats; reasoning/tool dialects remain deliberately unavailable until normalized and conformance-tested.
+Implement `InferenceProvider` for another service. The adapter owns endpoint discovery and exact request/response grammar; core routing stays independent of OpenAI-compatible assumptions. OpenRouter, direct NVIDIA NIM, and direct GroqCloud implement the trait. NVIDIA and Groq share a small internal OpenAI-compatible chat/retry/usage normalizer while retaining provider-specific capability and request dialects. NVIDIA currently normalizes plain chat/system prompts, max tokens, temperature and JSON response formats; reasoning/tool dialects remain deliberately unavailable until normalized and conformance-tested. Groq additionally normalizes model-specific reasoning effort and strict structured-output support for the models where Groq documents those features.
 
 ## Cache-aware routing
 
@@ -128,6 +128,8 @@ The normalized model already records endpoint cache support and cache pricing. A
 Provider responses may carry normalized quota observations (currently the standard request/token `x-ratelimit-*` family used by services such as Groq). Adapters preserve only typed limit/remaining/reset facts, never raw headers. Observation bucket names do not imply ownership: `QuotaObservationMap` explicitly maps a bucket on a specific execution-surface/credential/provider/model route to a logical quota resource, so organization-wide and key-local limits cannot be conflated by header parsing alone.
 
 Quota-aware execution can now consume mapped provider snapshots during failover. `QuotaLedger` owns both the quota graph and its `QuotaObservationMap`; `infer_with_quota` settles local usage, then applies authoritative mapped `remaining` snapshots before considering the next candidate. That means a response from one credential can immediately exhaust a shared account bucket and suppress sibling credentials, while unbound/mismatched observations remain diagnostic-only. A regression also covers concurrent reservations so releasing one request cannot erase another request\x27s held capacity.
+
+Providers can now declare route quota topology through `InferenceProvider::configure_quota_route` immediately before quota admission. Groq uses this to bind its standard request/token headers to shared model-scoped resources under an explicit opaque quota-pool label (organization/project identity, never the API secret). Two Groq credentials assigned the same pool therefore observe and consume the same logical resources. Providers with unknown topology leave routes unbound, preserving `Indeterminate` rather than fabricating ownership.
 
 ## Canonical model suitability
 

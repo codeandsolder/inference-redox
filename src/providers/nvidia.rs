@@ -3,17 +3,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use reqwest::{Client, StatusCode, header::RETRY_AFTER};
+use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 
+use super::openai_compatible::{base_chat_body, execute_chat_with_retry, response_format};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest,
     InferenceResponse, ModelCatalog, ModelRouteClass, NativeModelRecord, Pricing, ProviderError,
-    ProviderInventory, ReasoningEffort, ReasoningSupport, ResponseSchema, RetryPolicy, RoutePlan,
-    TokenUsage,
+    ProviderInventory, ReasoningEffort, ReasoningSupport, RetryPolicy, RoutePlan,
 };
 
 const DEFAULT_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
@@ -32,25 +31,6 @@ pub struct NvidiaNim {
 struct CachedNvidiaModels {
     fetched_at: Instant,
     models: Vec<NativeModelRecord>,
-}
-
-#[derive(Debug)]
-struct NvidiaAttemptFailure {
-    phase: crate::ExecutionFailurePhase,
-    detail: String,
-    retryable: bool,
-    retry_after: Option<Duration>,
-    quota_observations: Vec<crate::QuotaObservation>,
-}
-
-impl NvidiaAttemptFailure {
-    fn into_provider_error(self) -> ProviderError {
-        ProviderError::Execution {
-            phase: self.phase,
-            detail: self.detail,
-            quota_observations: self.quota_observations,
-        }
-    }
 }
 
 impl NvidiaNim {
@@ -146,159 +126,17 @@ impl NvidiaNim {
         }
     }
 
-    fn response_format(schema: &ResponseSchema) -> Value {
-        match schema {
-            ResponseSchema::JsonObject => json!({"type": "json_object"}),
-            ResponseSchema::JsonSchema {
-                name,
-                schema,
-                strict,
-            } => json!({
-                "type": "json_schema",
-                "json_schema": {
-                    "name": name,
-                    "schema": schema,
-                    "strict": strict,
-                }
-            }),
-        }
-    }
-
     fn compile_body(request: &InferenceRequest) -> Result<Value, ProviderError> {
         if request.requirements.reasoning != ReasoningEffort::None {
             return Err(ProviderError::InvalidRequest(
                 "NVIDIA reasoning controls are not normalized yet".to_owned(),
             ));
         }
-        let mut messages = Vec::with_capacity(2);
-        if let Some(system_prompt) = request.system_prompt.as_ref() {
-            messages.push(json!({"role": "system", "content": system_prompt}));
-        }
-        messages.push(json!({"role": "user", "content": request.prompt}));
-        let mut body = serde_json::Map::new();
-        body.insert("model".to_owned(), json!(request.model));
-        body.insert("messages".to_owned(), Value::Array(messages));
-        if let Some(maximum) = request.max_output_tokens {
-            body.insert("max_tokens".to_owned(), json!(maximum));
-        }
-        if let Some(temperature) = request.temperature {
-            body.insert("temperature".to_owned(), json!(temperature));
-        }
+        let mut body = base_chat_body(request, "max_tokens");
         if let Some(schema) = request.requirements.response_schema.as_ref() {
-            body.insert("response_format".to_owned(), Self::response_format(schema));
+            body.insert("response_format".to_owned(), response_format(schema));
         }
         Ok(Value::Object(body))
-    }
-
-    fn response_shape_detail(raw: &Value) -> String {
-        let message_keys = raw
-            .pointer("/choices/0/message")
-            .and_then(Value::as_object)
-            .map(|message| message.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let finish_reason = raw
-            .pointer("/choices/0/finish_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("missing");
-        let prompt_tokens = raw.pointer("/usage/prompt_tokens").and_then(Value::as_u64);
-        let completion_tokens = raw
-            .pointer("/usage/completion_tokens")
-            .and_then(Value::as_u64);
-        format!(
-            "NVIDIA response had no non-empty string content; message_keys={message_keys:?}; finish_reason={finish_reason}; prompt_tokens={prompt_tokens:?}; completion_tokens={completion_tokens:?}"
-        )
-    }
-
-    async fn execute_once(
-        &self,
-        url: &str,
-        body: &Value,
-    ) -> Result<InferenceResponse, NvidiaAttemptFailure> {
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| NvidiaAttemptFailure {
-                phase: crate::ExecutionFailurePhase::TransportUnknown,
-                detail: error.to_string(),
-                retryable: true,
-                retry_after: None,
-                quota_observations: Vec::new(),
-            })?;
-        let status = response.status();
-        let retry_after = Self::retry_after(&response);
-        let quota_observations =
-            crate::quota_headers::standard_rate_limit_observations(response.headers());
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(NvidiaAttemptFailure {
-                phase: crate::ExecutionFailurePhase::ResponseReceived,
-                detail: format!("HTTP {status}: {text}"),
-                retryable: Self::retryable_status(status),
-                retry_after,
-                quota_observations,
-            });
-        }
-        let raw: Value = response
-            .json()
-            .await
-            .map_err(|error| NvidiaAttemptFailure {
-                phase: crate::ExecutionFailurePhase::ResponseReceived,
-                detail: error.to_string(),
-                retryable: false,
-                retry_after,
-                quota_observations: quota_observations.clone(),
-            })?;
-        let Some(content) = raw
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-        else {
-            return Err(NvidiaAttemptFailure {
-                phase: crate::ExecutionFailurePhase::ResponseReceived,
-                detail: Self::response_shape_detail(&raw),
-                retryable: false,
-                retry_after,
-                quota_observations,
-            });
-        };
-        if content.is_empty() {
-            return Err(NvidiaAttemptFailure {
-                phase: crate::ExecutionFailurePhase::ResponseReceived,
-                detail: Self::response_shape_detail(&raw),
-                retryable: false,
-                retry_after,
-                quota_observations,
-            });
-        }
-        Ok(InferenceResponse {
-            content: content.to_owned(),
-            model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
-            provider: Some("nvidia".to_owned()),
-            usage_cost_usd: Some(0.0),
-            usage: TokenUsage::from_openai_compatible(&raw),
-            quota_observations,
-            raw,
-        })
-    }
-
-    fn retryable_status(status: StatusCode) -> bool {
-        status == StatusCode::REQUEST_TIMEOUT
-            || status == StatusCode::TOO_MANY_REQUESTS
-            || status.is_server_error()
-    }
-
-    fn retry_after(response: &reqwest::Response) -> Option<Duration> {
-        response
-            .headers()
-            .get(RETRY_AFTER)?
-            .to_str()
-            .ok()?
-            .parse::<u64>()
-            .ok()
-            .map(Duration::from_secs)
     }
 }
 
@@ -360,11 +198,6 @@ impl InferenceProvider for NvidiaNim {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        if retry.max_attempts == 0 {
-            return Err(ProviderError::InvalidRequest(
-                "retry.max_attempts must be at least 1".to_owned(),
-            ));
-        }
         let Some(candidate) = plan.candidates.first() else {
             return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
         };
@@ -374,42 +207,16 @@ impl InferenceProvider for NvidiaNim {
             ));
         }
         let body = Self::compile_body(request)?;
-        let url = format!("{}/chat/completions", self.base_url);
-        let mut backoff = retry.initial_backoff;
-        let mut last_error = None;
-        let mut last_phase = None;
-        let mut last_quota_observations = Vec::new();
-
-        for attempt in 1..=retry.max_attempts {
-            match self.execute_once(&url, &body).await {
-                Ok(response) => return Ok(response),
-                Err(failure) if !failure.retryable => return Err(failure.into_provider_error()),
-                Err(failure) => {
-                    if last_phase.is_none()
-                        || failure.phase == crate::ExecutionFailurePhase::ResponseReceived
-                    {
-                        last_phase = Some(failure.phase);
-                    }
-                    if !failure.quota_observations.is_empty() {
-                        last_quota_observations = failure.quota_observations;
-                    }
-                    last_error = Some(failure.detail);
-                    if attempt < retry.max_attempts {
-                        let delay = failure
-                            .retry_after
-                            .unwrap_or(backoff)
-                            .min(retry.max_backoff);
-                        sleep(delay).await;
-                        backoff = backoff.saturating_mul(2).min(retry.max_backoff);
-                    }
-                }
-            }
-        }
-        Err(ProviderError::Execution {
-            phase: last_phase.unwrap_or(crate::ExecutionFailurePhase::TransportUnknown),
-            detail: last_error.unwrap_or_else(|| "request failed without an error body".to_owned()),
-            quota_observations: last_quota_observations,
-        })
+        execute_chat_with_retry(
+            &self.client,
+            &self.api_key,
+            &format!("{}/chat/completions", self.base_url),
+            &body,
+            "nvidia",
+            Some(0.0),
+            retry,
+        )
+        .await
     }
 }
 
@@ -450,6 +257,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::ResponseSchema;
 
     fn test_plan(model: &str) -> RoutePlan {
         RoutePlan {

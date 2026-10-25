@@ -264,7 +264,7 @@ impl InferencePool {
         catalog: &ModelCatalog,
         strategy: RoutingStrategy,
         request: &InferenceRequest,
-        ledger: &QuotaLedger,
+        ledger: &mut QuotaLedger,
         unknown_policy: QuotaUnknownPolicy,
         now_unix: u64,
     ) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
@@ -277,8 +277,13 @@ impl InferencePool {
             .into_iter()
             .filter(|endpoint| supports_request(endpoint, request, prompt_tokens))
         {
-            let report =
-                ledger.evaluate(&QuotaRouteKey::from_endpoint(&endpoint), demand, now_unix);
+            let route_key = QuotaRouteKey::from_endpoint(&endpoint);
+            let instance =
+                ProviderInstanceKey::new(endpoint.source.clone(), endpoint.credential.clone());
+            if let Some(provider) = self.providers.get(&instance) {
+                provider.configure_quota_route(&route_key, ledger)?;
+            }
+            let report = ledger.evaluate(&route_key, demand, now_unix);
             let keep = match report.admission {
                 QuotaAdmission::Admitted => true,
                 QuotaAdmission::Indeterminate => unknown_policy == QuotaUnknownPolicy::Allow,
@@ -938,7 +943,7 @@ mod tests {
         graph.insert_resource(expensive_resource);
         assert!(graph.bind(cheap_route, &cheap_id));
         assert!(graph.bind(expensive_route, &expensive_id));
-        let ledger = QuotaLedger::new(graph);
+        let mut ledger = QuotaLedger::new(graph);
         let request = InferenceRequest::new("vendor/model", "hi", 8);
 
         let result = pool
@@ -946,7 +951,7 @@ mod tests {
                 &catalog(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 &request,
-                &ledger,
+                &mut ledger,
                 QuotaUnknownPolicy::Reject,
                 100,
             )
@@ -978,13 +983,13 @@ mod tests {
             }),
         );
         let request = InferenceRequest::new("vendor/model", "hi", 8);
-        let ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
         let permissive = pool
             .route_with_quota(
                 &catalog(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 &request,
-                &ledger,
+                &mut ledger,
                 QuotaUnknownPolicy::Allow,
                 100,
             )
@@ -1000,7 +1005,7 @@ mod tests {
                 &catalog(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 &request,
-                &ledger,
+                &mut ledger,
                 QuotaUnknownPolicy::Reject,
                 100,
             )
