@@ -533,6 +533,7 @@ mod tests {
                 provider: Some(self.source.to_owned()),
                 usage_cost_usd: None,
                 usage: TokenUsage::default(),
+                tool_calls: Vec::new(),
                 quota_observations: Vec::new(),
                 raw: json!({}),
             })

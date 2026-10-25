@@ -797,6 +797,7 @@ mod tests {
                     total_tokens: Some(30),
                     reasoning_tokens: None,
                 },
+                tool_calls: Vec::new(),
                 quota_observations: Vec::new(),
                 raw: json!({"native_model": request.model, "mock_price": self.price}),
             })
@@ -1097,6 +1098,9 @@ mod tests {
                 reasoning_tokens: None,
                 completion_tokens: None,
                 reasoning_chars: None,
+                reasoning_trace: None,
+                response_content: None,
+                tool_arguments: None,
                 puzzle_correct: None,
                 finish_reason: None,
                 constraint_satisfied: None,

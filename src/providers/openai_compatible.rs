@@ -265,6 +265,7 @@ pub(crate) async fn execute_chat_with_retry(
         provider: Some(provider.to_owned()),
         usage_cost_usd,
         usage: TokenUsage::from_openai_compatible(&raw),
+        tool_calls: Vec::new(),
         quota_observations,
         raw,
     })

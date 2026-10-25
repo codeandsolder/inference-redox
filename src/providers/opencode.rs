@@ -582,6 +582,7 @@ impl OpenCodeConsole {
             provider: Some(surface.source().to_owned()),
             usage_cost_usd,
             usage,
+            tool_calls: Vec::new(),
             quota_observations,
             raw,
         })

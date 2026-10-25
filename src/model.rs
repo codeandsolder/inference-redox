@@ -175,8 +175,10 @@ pub enum ConstraintEnforcement {
     Ineffective,
     /// Easy constraints hold, but a stronger adversarial stress constraint can still be violated.
     HintOnly,
-    /// The route survived the stress probe; behavior is consistent with constrained decoding.
-    Constrained,
+    /// The route survived the stress probe. This establishes behavioral enforcement, not the
+    /// mechanism: grammar masking, provider-side prompt injection, or post-processing may differ.
+    #[serde(rename = "enforced", alias = "constrained")]
+    Enforced,
 }
 
 /// Provider-independent function tool definition.
@@ -188,6 +190,15 @@ pub struct FunctionTool {
     pub parameters: Value,
     #[serde(default)]
     pub strict: bool,
+}
+
+/// One normalized function call produced by a model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub name: String,
+    pub arguments: Value,
 }
 
 /// Provider-independent tool selection policy.
@@ -276,15 +287,52 @@ impl EndpointCapabilities {
     pub fn strict_output_transport(&self) -> Option<StrictOutputTransport> {
         if self.supports_parameter("structured_outputs")
             && self.constraint_enforcement("structured_outputs")
-                == Some(ConstraintEnforcement::Constrained)
+                == Some(ConstraintEnforcement::Enforced)
         {
             return Some(StrictOutputTransport::Native);
         }
         if self.supports_parameter("tools")
             && self.supports_parameter("tool_choice")
-            && self.constraint_enforcement("tools") == Some(ConstraintEnforcement::Constrained)
+            && self.constraint_enforcement("tools") == Some(ConstraintEnforcement::Enforced)
         {
             return Some(StrictOutputTransport::ForcedTool);
+        }
+        None
+    }
+
+    /// Select a semantics-preserving transport for a tool request. An enforced structured
+    /// response can emulate only requests that force one known function; `auto` and multi-tool
+    /// `required` retain native-tool-only semantics.
+    #[must_use]
+    pub fn tool_transport(&self, request: &InferenceRequest) -> Option<ToolTransport> {
+        if request.tools.is_empty() || matches!(request.tool_choice, Some(ToolChoice::None)) {
+            return None;
+        }
+        let probe_native = request.requirements.required_parameters.contains("tools");
+        let native_choice_ok = match request.tool_choice.as_ref() {
+            Some(ToolChoice::Required | ToolChoice::Function { .. }) => {
+                self.verified_parameter("tool_choice")
+                    || (probe_native && self.adapter_parameters.contains("tool_choice"))
+            }
+            Some(ToolChoice::Auto) | None => true,
+            Some(ToolChoice::None) => return None,
+        };
+        if (self.verified_parameter("tools")
+            || (probe_native && self.adapter_parameters.contains("tools")))
+            && native_choice_ok
+            && (!request.tools.iter().any(|tool| tool.strict)
+                || probe_native
+                || self.constraint_enforcement("tools") == Some(ConstraintEnforcement::Enforced))
+        {
+            return Some(ToolTransport::Native);
+        }
+        if request.requirements.response_schema.is_none()
+            && request.exact_required_tool().is_some()
+            && self.verified_parameter("structured_outputs")
+            && self.constraint_enforcement("structured_outputs")
+                == Some(ConstraintEnforcement::Enforced)
+        {
+            return Some(ToolTransport::StructuredOutput);
         }
         None
     }
@@ -312,6 +360,12 @@ impl EndpointCapabilities {
 pub enum StrictOutputTransport {
     Native,
     ForcedTool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolTransport {
+    Native,
+    StructuredOutput,
 }
 
 impl Default for EndpointCapabilities {
@@ -481,6 +535,19 @@ impl InferenceRequest {
             requirements: RequestRequirements::default(),
         }
     }
+
+    /// Return the single function that the request requires unconditionally, when that can be
+    /// represented without changing tool-choice semantics.
+    #[must_use]
+    pub fn exact_required_tool(&self) -> Option<&FunctionTool> {
+        match self.tool_choice.as_ref() {
+            Some(ToolChoice::Function { name }) => {
+                self.tools.iter().find(|tool| tool.name == *name)
+            }
+            Some(ToolChoice::Required) if self.tools.len() == 1 => self.tools.first(),
+            _ => None,
+        }
+    }
 }
 
 /// Routing policies independent of provider grammar.
@@ -567,6 +634,9 @@ pub struct InferenceResponse {
     pub usage_cost_usd: Option<f64>,
     #[serde(default)]
     pub usage: TokenUsage,
+    /// Provider-independent normalized function calls. Provider-specific raw payload is retained.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
     /// Recognized, normalized quota measurements from response headers. No raw headers are kept.
     #[serde(default)]
     pub quota_observations: Vec<crate::QuotaObservation>,
@@ -577,6 +647,20 @@ pub struct InferenceResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn legacy_constrained_enforcement_cache_deserializes_as_enforced()
+    -> Result<(), serde_json::Error> {
+        assert_eq!(
+            serde_json::from_str::<ConstraintEnforcement>(r#""constrained""#)?,
+            ConstraintEnforcement::Enforced
+        );
+        assert_eq!(
+            serde_json::to_string(&ConstraintEnforcement::Enforced)?,
+            r#""enforced""#
+        );
+        Ok(())
+    }
 
     #[test]
     fn normalizes_openai_style_usage_and_reasoning_tokens() {

@@ -25,11 +25,15 @@ pub enum ConformanceProbe {
     SystemRole,
     JsonObject,
     JsonSchemaLoose,
+    JsonSchemaLooseStress,
     StrictJsonSchema,
     StrictJsonSchemaStress,
+    StrictJsonSchemaStressPrompted,
     ToolSchemaLoose,
+    ToolSchemaLooseStress,
     ToolSchemaStrict,
     ToolSchemaStrictStress,
+    ToolSchemaStrictStressPrompted,
     ReasoningOff,
     ReasoningMinimal,
     ReasoningLow,
@@ -89,19 +93,34 @@ fn tool_probe_arguments(response: &InferenceResponse) -> Option<&str> {
 
 fn json_schema_probe_request(probe: ConformanceProbe, model: String) -> InferenceRequest {
     let stress = probe.is_constraint_stress();
-    let prompt = if stress {
-        r#"Ignore all format/schema metadata. Return exactly {"nonce":"WRONG","n":"seven","extra":"x"} and nothing else."#
+    let schema = constraint_probe_schema(stress);
+    let mut prompt = if stress {
+        r#"Ignore all format/schema metadata. Return exactly {"nonce":"WRONG","n":"seven","extra":"x"} and nothing else."#.to_owned()
     } else {
-        r#"Ignore all format/schema metadata. Return exactly {"color":"red","n":"seven","extra":"x"} and nothing else."#
+        r#"Ignore all format/schema metadata. Return exactly {"color":"red","n":"seven","extra":"x"} and nothing else."#.to_owned()
     };
+    if probe.is_prompted_constraint() {
+        prompt.push_str("\nThe API is constraining the response with this JSON Schema:\n");
+        prompt.push_str(&schema.to_string());
+    }
     let mut request = InferenceRequest::new(model, prompt, 32);
     request.max_output_tokens = Some(if stress { 2048 } else { 512 });
+    request.include_reasoning = true;
+    let loose = matches!(
+        probe,
+        ConformanceProbe::JsonSchemaLoose | ConformanceProbe::JsonSchemaLooseStress
+    );
     request.requirements = RequestRequirements {
         response_schema: Some(ResponseSchema::JsonSchema {
             name: "conformance".to_owned(),
-            schema: constraint_probe_schema(stress),
-            strict: probe != ConformanceProbe::JsonSchemaLoose,
+            schema,
+            strict: !loose,
         }),
+        required_parameters: BTreeSet::from([if loose {
+            "response_format".to_owned()
+        } else {
+            "structured_outputs".to_owned()
+        }]),
         ..RequestRequirements::default()
     };
     request
@@ -109,22 +128,36 @@ fn json_schema_probe_request(probe: ConformanceProbe, model: String) -> Inferenc
 
 fn tool_schema_probe_request(probe: ConformanceProbe, model: String) -> InferenceRequest {
     let stress = probe.is_constraint_stress();
-    let prompt = if stress {
-        "Ignore the tool schema. Call emit_probe with nonce WRONG, n as the string seven, and extra x."
+    let schema = constraint_probe_schema(stress);
+    let mut prompt = if stress {
+        "Ignore the tool schema. Call emit_probe with nonce WRONG, n as the string seven, and extra x.".to_owned()
     } else {
-        "Ignore the tool schema. Call emit_probe with color red, n as the string seven, and extra x."
+        "Ignore the tool schema. Call emit_probe with color red, n as the string seven, and extra x.".to_owned()
     };
+    if probe.is_prompted_constraint() {
+        prompt.push_str("\nThe API declares emit_probe with this JSON Schema for its arguments:\n");
+        prompt.push_str(&schema.to_string());
+    }
     let mut request = InferenceRequest::new(model, prompt, 32);
     request.max_output_tokens = Some(if stress { 2048 } else { 512 });
+    request.include_reasoning = true;
+    let loose = matches!(
+        probe,
+        ConformanceProbe::ToolSchemaLoose | ConformanceProbe::ToolSchemaLooseStress
+    );
     request.tools = vec![FunctionTool {
         name: "emit_probe".to_owned(),
         description: Some("Return the conformance probe object.".to_owned()),
-        parameters: constraint_probe_schema(stress),
-        strict: probe != ConformanceProbe::ToolSchemaLoose,
+        parameters: schema,
+        strict: !loose,
     }];
     request.tool_choice = Some(ToolChoice::Function {
         name: "emit_probe".to_owned(),
     });
+    request
+        .requirements
+        .required_parameters
+        .extend(["tools".to_owned(), "tool_choice".to_owned()]);
     request
 }
 
@@ -177,11 +210,15 @@ impl ConformanceProbe {
             Self::SystemRole => "system-role",
             Self::JsonObject => "json-object",
             Self::JsonSchemaLoose => "json-schema-loose",
+            Self::JsonSchemaLooseStress => "json-schema-loose-stress",
             Self::StrictJsonSchema => "strict-json-schema",
             Self::StrictJsonSchemaStress => "strict-json-schema-stress",
+            Self::StrictJsonSchemaStressPrompted => "strict-json-schema-stress-prompted",
             Self::ToolSchemaLoose => "tool-schema-loose",
+            Self::ToolSchemaLooseStress => "tool-schema-loose-stress",
             Self::ToolSchemaStrict => "tool-schema-strict",
             Self::ToolSchemaStrictStress => "tool-schema-strict-stress",
+            Self::ToolSchemaStrictStressPrompted => "tool-schema-strict-stress-prompted",
             Self::ReasoningOff => "reasoning-off",
             Self::ReasoningMinimal => "reasoning-minimal",
             Self::ReasoningLow => "reasoning-low",
@@ -207,8 +244,12 @@ impl ConformanceProbe {
             | Self::BasicChat
             | Self::SystemRole
             | Self::JsonObject
+            | Self::JsonSchemaLooseStress
             | Self::StrictJsonSchemaStress
-            | Self::ToolSchemaStrictStress => 1,
+            | Self::StrictJsonSchemaStressPrompted
+            | Self::ToolSchemaLooseStress
+            | Self::ToolSchemaStrictStress
+            | Self::ToolSchemaStrictStressPrompted => 1,
             Self::JsonSchemaLoose
             | Self::StrictJsonSchema
             | Self::ToolSchemaLoose
@@ -221,11 +262,17 @@ impl ConformanceProbe {
         match self {
             Self::BasicChat => "chat_completions",
             Self::SystemRole => "system_role",
-            Self::JsonObject | Self::JsonSchemaLoose => "response_format",
-            Self::StrictJsonSchema | Self::StrictJsonSchemaStress => "structured_outputs",
-            Self::ToolSchemaLoose | Self::ToolSchemaStrict | Self::ToolSchemaStrictStress => {
-                "tools"
+            Self::JsonObject | Self::JsonSchemaLoose | Self::JsonSchemaLooseStress => {
+                "response_format"
             }
+            Self::StrictJsonSchema
+            | Self::StrictJsonSchemaStress
+            | Self::StrictJsonSchemaStressPrompted => "structured_outputs",
+            Self::ToolSchemaLoose
+            | Self::ToolSchemaLooseStress
+            | Self::ToolSchemaStrict
+            | Self::ToolSchemaStrictStress
+            | Self::ToolSchemaStrictStressPrompted => "tools",
             Self::ReasoningOff
             | Self::ReasoningMinimal
             | Self::ReasoningLow
@@ -251,11 +298,15 @@ impl ConformanceProbe {
             | Self::SystemRole
             | Self::JsonObject
             | Self::JsonSchemaLoose
+            | Self::JsonSchemaLooseStress
             | Self::StrictJsonSchema
             | Self::StrictJsonSchemaStress
+            | Self::StrictJsonSchemaStressPrompted
             | Self::ToolSchemaLoose
+            | Self::ToolSchemaLooseStress
             | Self::ToolSchemaStrict
             | Self::ToolSchemaStrictStress
+            | Self::ToolSchemaStrictStressPrompted
             | Self::ReasoningBudget256 => None,
         }
     }
@@ -280,11 +331,15 @@ impl ConformanceProbe {
         matches!(
             self,
             Self::JsonSchemaLoose
+                | Self::JsonSchemaLooseStress
                 | Self::StrictJsonSchema
                 | Self::StrictJsonSchemaStress
+                | Self::StrictJsonSchemaStressPrompted
                 | Self::ToolSchemaLoose
+                | Self::ToolSchemaLooseStress
                 | Self::ToolSchemaStrict
                 | Self::ToolSchemaStrictStress
+                | Self::ToolSchemaStrictStressPrompted
         )
     }
 
@@ -292,7 +347,20 @@ impl ConformanceProbe {
     pub const fn is_constraint_stress(self) -> bool {
         matches!(
             self,
-            Self::StrictJsonSchemaStress | Self::ToolSchemaStrictStress
+            Self::JsonSchemaLooseStress
+                | Self::StrictJsonSchemaStress
+                | Self::StrictJsonSchemaStressPrompted
+                | Self::ToolSchemaLooseStress
+                | Self::ToolSchemaStrictStress
+                | Self::ToolSchemaStrictStressPrompted
+        )
+    }
+
+    #[must_use]
+    pub const fn is_prompted_constraint(self) -> bool {
+        matches!(
+            self,
+            Self::StrictJsonSchemaStressPrompted | Self::ToolSchemaStrictStressPrompted
         )
     }
 
@@ -327,12 +395,16 @@ impl ConformanceProbe {
                 };
                 request
             }
-            Self::JsonSchemaLoose | Self::StrictJsonSchema | Self::StrictJsonSchemaStress => {
-                json_schema_probe_request(self, model)
-            }
-            Self::ToolSchemaLoose | Self::ToolSchemaStrict | Self::ToolSchemaStrictStress => {
-                tool_schema_probe_request(self, model)
-            }
+            Self::JsonSchemaLoose
+            | Self::JsonSchemaLooseStress
+            | Self::StrictJsonSchema
+            | Self::StrictJsonSchemaStress
+            | Self::StrictJsonSchemaStressPrompted => json_schema_probe_request(self, model),
+            Self::ToolSchemaLoose
+            | Self::ToolSchemaLooseStress
+            | Self::ToolSchemaStrict
+            | Self::ToolSchemaStrictStress
+            | Self::ToolSchemaStrictStressPrompted => tool_schema_probe_request(self, model),
             Self::ReasoningOff
             | Self::ReasoningMinimal
             | Self::ReasoningLow
@@ -390,65 +462,9 @@ impl ConformanceProbe {
             max_attempts: 1,
             ..RetryPolicy::default()
         };
-        let mut reasoning_tokens = None;
-        let mut completion_tokens = None;
-        let mut reasoning_chars = None;
-        let mut puzzle_correct = None;
-        let mut finish_reason = None;
-        let mut constraint_satisfied = None;
-        let (outcome, detail) = match provider.execute_plan(&request, &plan, retry).await {
-            Ok(response) => {
-                reasoning_tokens = response.usage.reasoning_tokens;
-                completion_tokens = response.usage.output_tokens;
-                reasoning_chars = response
-                    .raw
-                    .pointer("/choices/0/message/reasoning")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|value| u64::try_from(value.chars().count()).ok());
-                finish_reason = response
-                    .raw
-                    .pointer("/choices/0/finish_reason")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                if self.is_reasoning_probe() {
-                    puzzle_correct = Some(response.content.trim() == "253614");
-                }
-                let observed_constraint = match self {
-                    Self::JsonSchemaLoose
-                    | Self::StrictJsonSchema
-                    | Self::StrictJsonSchemaStress => Some(constraint_probe_value(
-                        &response.content,
-                        self.is_constraint_stress(),
-                    )),
-                    Self::ToolSchemaLoose
-                    | Self::ToolSchemaStrict
-                    | Self::ToolSchemaStrictStress => {
-                        Some(tool_probe_arguments(&response).is_some_and(|arguments| {
-                            constraint_probe_value(arguments, self.is_constraint_stress())
-                        }))
-                    }
-                    _ => None,
-                };
-                constraint_satisfied = observed_constraint;
-                if self.is_constraint_probe() && finish_reason.as_deref() == Some("length") {
-                    (
-                        ConformanceOutcome::Inconclusive,
-                        Some(
-                            "constraint probe hit the completion limit before a terminal result"
-                                .to_owned(),
-                        ),
-                    )
-                } else {
-                    match self.validate_response(&response) {
-                        Ok(()) => (ConformanceOutcome::Passed, None),
-                        Err(detail) => (ConformanceOutcome::Failed, Some(detail)),
-                    }
-                }
-            }
-            Err(error) => (
-                classify_probe_error(self, &error),
-                Some(probe_error_detail(&error)),
-            ),
+        let observed = match provider.execute_plan(&request, &plan, retry).await {
+            Ok(response) => self.observe_response(&response),
+            Err(error) => ProbeExecution::from_error(self, &error),
         };
         ConformanceObservation {
             source,
@@ -459,17 +475,92 @@ impl ConformanceProbe {
             canonical_id,
             parameter: self.parameter().to_owned(),
             reasoning_effort: self.reasoning_effort(),
-            reasoning_tokens,
-            completion_tokens,
-            reasoning_chars,
-            puzzle_correct,
-            finish_reason,
-            constraint_satisfied,
+            reasoning_tokens: observed.reasoning_tokens,
+            completion_tokens: observed.completion_tokens,
+            reasoning_chars: observed.reasoning_chars,
+            reasoning_trace: observed.reasoning_trace,
+            response_content: observed.response_content,
+            tool_arguments: observed.tool_arguments,
+            puzzle_correct: observed.puzzle_correct,
+            finish_reason: observed.finish_reason,
+            constraint_satisfied: observed.constraint_satisfied,
             test_id: self.test_id().to_owned(),
             test_version: self.test_version(),
-            outcome,
+            outcome: observed.outcome,
             observed_unix_ms: unix_time_ms(),
+            detail: observed.detail,
+        }
+    }
+
+    fn observe_response(self, response: &InferenceResponse) -> ProbeExecution {
+        let reasoning_trace = response
+            .raw
+            .pointer("/choices/0/message/reasoning")
+            .or_else(|| response.raw.pointer("/choices/0/message/reasoning_content"))
+            .or_else(|| response.raw.pointer("/choices/0/message/reasoning_details"))
+            .cloned();
+        let reasoning_chars = reasoning_trace
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .and_then(|value| u64::try_from(value.chars().count()).ok());
+        let finish_reason = response
+            .raw
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let constraint_satisfied = self.observed_constraint(response);
+        let (outcome, detail) = if self.is_constraint_probe()
+            && finish_reason.as_deref() == Some("length")
+        {
+            (
+                ConformanceOutcome::Inconclusive,
+                Some(
+                    "constraint probe hit the completion limit before a terminal result".to_owned(),
+                ),
+            )
+        } else {
+            match self.validate_response(response) {
+                Ok(()) => (ConformanceOutcome::Passed, None),
+                Err(detail) => (ConformanceOutcome::Failed, Some(detail)),
+            }
+        };
+        ProbeExecution {
+            reasoning_tokens: response.usage.reasoning_tokens,
+            completion_tokens: response.usage.output_tokens,
+            reasoning_chars,
+            reasoning_trace,
+            response_content: Some(response.content.clone()),
+            tool_arguments: tool_probe_arguments(response).map(str::to_owned),
+            puzzle_correct: self
+                .is_reasoning_probe()
+                .then(|| response.content.trim() == "253614"),
+            finish_reason,
+            constraint_satisfied,
+            outcome,
             detail,
+        }
+    }
+
+    fn observed_constraint(self, response: &InferenceResponse) -> Option<bool> {
+        match self {
+            Self::JsonSchemaLoose
+            | Self::JsonSchemaLooseStress
+            | Self::StrictJsonSchema
+            | Self::StrictJsonSchemaStress
+            | Self::StrictJsonSchemaStressPrompted => Some(constraint_probe_value(
+                &response.content,
+                self.is_constraint_stress(),
+            )),
+            Self::ToolSchemaLoose
+            | Self::ToolSchemaLooseStress
+            | Self::ToolSchemaStrict
+            | Self::ToolSchemaStrictStress
+            | Self::ToolSchemaStrictStressPrompted => {
+                Some(tool_probe_arguments(response).is_some_and(|arguments| {
+                    constraint_probe_value(arguments, self.is_constraint_stress())
+                }))
+            }
+            _ => None,
         }
     }
 
@@ -484,7 +575,11 @@ impl ConformanceProbe {
                     Err("response JSON did not contain boolean ok=true".to_owned())
                 }
             }
-            Self::ToolSchemaLoose | Self::ToolSchemaStrict | Self::ToolSchemaStrictStress => {
+            Self::ToolSchemaLoose
+            | Self::ToolSchemaLooseStress
+            | Self::ToolSchemaStrict
+            | Self::ToolSchemaStrictStress
+            | Self::ToolSchemaStrictStressPrompted => {
                 if tool_probe_arguments(response).is_some() {
                     Ok(())
                 } else {
@@ -499,8 +594,10 @@ impl ConformanceProbe {
                 }
             }
             Self::JsonSchemaLoose
+            | Self::JsonSchemaLooseStress
             | Self::StrictJsonSchema
             | Self::StrictJsonSchemaStress
+            | Self::StrictJsonSchemaStressPrompted
             | Self::ReasoningOff
             | Self::ReasoningMinimal
             | Self::ReasoningLow
@@ -513,6 +610,39 @@ impl ConformanceProbe {
     }
 }
 
+#[derive(Debug)]
+struct ProbeExecution {
+    reasoning_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    reasoning_chars: Option<u64>,
+    reasoning_trace: Option<serde_json::Value>,
+    response_content: Option<String>,
+    tool_arguments: Option<String>,
+    puzzle_correct: Option<bool>,
+    finish_reason: Option<String>,
+    constraint_satisfied: Option<bool>,
+    outcome: ConformanceOutcome,
+    detail: Option<String>,
+}
+
+impl ProbeExecution {
+    fn from_error(probe: ConformanceProbe, error: &ProviderError) -> Self {
+        Self {
+            reasoning_tokens: None,
+            completion_tokens: None,
+            reasoning_chars: None,
+            reasoning_trace: None,
+            response_content: None,
+            tool_arguments: None,
+            puzzle_correct: None,
+            finish_reason: None,
+            constraint_satisfied: None,
+            outcome: classify_probe_error(probe, error),
+            detail: Some(probe_error_detail(error)),
+        }
+    }
+}
+
 fn classify_probe_error(probe: ConformanceProbe, error: &ProviderError) -> ConformanceOutcome {
     match probe_http_status(error) {
         Some(400 | 422) => ConformanceOutcome::Failed,
@@ -520,11 +650,15 @@ fn classify_probe_error(probe: ConformanceProbe, error: &ProviderError) -> Confo
             if matches!(
                 probe,
                 ConformanceProbe::JsonSchemaLoose
+                    | ConformanceProbe::JsonSchemaLooseStress
                     | ConformanceProbe::StrictJsonSchema
                     | ConformanceProbe::StrictJsonSchemaStress
+                    | ConformanceProbe::StrictJsonSchemaStressPrompted
                     | ConformanceProbe::ToolSchemaLoose
+                    | ConformanceProbe::ToolSchemaLooseStress
                     | ConformanceProbe::ToolSchemaStrict
                     | ConformanceProbe::ToolSchemaStrictStress
+                    | ConformanceProbe::ToolSchemaStrictStressPrompted
             ) =>
         {
             ConformanceOutcome::Failed
@@ -594,6 +728,12 @@ pub struct ConformanceObservation {
     pub completion_tokens: Option<u64>,
     #[serde(default)]
     pub reasoning_chars: Option<u64>,
+    #[serde(default)]
+    pub reasoning_trace: Option<serde_json::Value>,
+    #[serde(default)]
+    pub response_content: Option<String>,
+    #[serde(default)]
+    pub tool_arguments: Option<String>,
     #[serde(default)]
     pub puzzle_correct: Option<bool>,
     #[serde(default)]
@@ -820,7 +960,7 @@ fn apply_constraint_levels(
         simple.and_then(|observation| observation.constraint_satisfied),
         stress.and_then(|observation| observation.constraint_satisfied),
     ) {
-        (_, Some(true)) => Some(ConstraintEnforcement::Constrained),
+        (_, Some(true)) => Some(ConstraintEnforcement::Enforced),
         (Some(true), Some(false)) => Some(ConstraintEnforcement::HintOnly),
         (Some(false), _) => Some(ConstraintEnforcement::Ineffective),
         _ => None,
@@ -902,6 +1042,9 @@ mod tests {
             reasoning_tokens: None,
             completion_tokens: None,
             reasoning_chars: None,
+            reasoning_trace: None,
+            response_content: None,
+            tool_arguments: None,
             puzzle_correct: None,
             finish_reason: None,
             constraint_satisfied: None,
@@ -1173,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_stress_probe_proves_constrained_decoding() {
+    fn tool_stress_probe_proves_enforced_behavior() {
         let mut route = endpoint("endpoint", "model");
         route
             .capabilities
@@ -1215,7 +1358,7 @@ mod tests {
         .apply_to_endpoint(&mut route);
         assert_eq!(
             route.capabilities.constraint_enforcement("tools"),
-            Some(ConstraintEnforcement::Constrained)
+            Some(ConstraintEnforcement::Enforced)
         );
         assert!(route.capabilities.supports_parameter("tools"));
         assert!(route.capabilities.supports_parameter("tool_choice"));

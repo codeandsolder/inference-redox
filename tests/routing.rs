@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use inference_redox::{
-    ConstraintEnforcement, Endpoint, EndpointCapabilities, EndpointStats, InferenceRequest,
-    Percentiles, Pricing, ReasoningEffort, ReasoningSupport, RequestRequirements, ResponseSchema,
-    RoutingStrategy, build_route_plan,
+    ConstraintEnforcement, Endpoint, EndpointCapabilities, EndpointStats, FunctionTool,
+    InferenceRequest, Percentiles, Pricing, ReasoningEffort, ReasoningSupport, RequestRequirements,
+    ResponseSchema, RoutingStrategy, ToolChoice, build_route_plan,
 };
 use serde_json::json;
 
@@ -136,7 +136,7 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
         ReasoningSupport::Exact([ReasoningEffort::High].into_iter().collect());
     capable.capabilities.constraint_enforcement.insert(
         "structured_outputs".to_owned(),
-        ConstraintEnforcement::Constrained,
+        ConstraintEnforcement::Enforced,
     );
     let mut cheap_but_missing_schema = endpoint("cheap", 0.1e-6, 0.1e-6, 0.1, 100.0);
     cheap_but_missing_schema
@@ -151,7 +151,7 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
         .constraint_enforcement
         .insert(
             "structured_outputs".to_owned(),
-            ConstraintEnforcement::Constrained,
+            ConstraintEnforcement::Enforced,
         );
 
     let mut request = InferenceRequest::new("x/model", "x", 100);
@@ -394,7 +394,7 @@ fn verified_parameter_can_fill_missing_provider_claim() -> Result<(), inference_
         .insert("structured_outputs".to_owned());
     understated.capabilities.constraint_enforcement.insert(
         "structured_outputs".to_owned(),
-        ConstraintEnforcement::Constrained,
+        ConstraintEnforcement::Enforced,
     );
 
     let mut request = InferenceRequest::new("x/model", "x", 100);
@@ -418,7 +418,7 @@ fn verified_parameter_can_fill_missing_provider_claim() -> Result<(), inference_
 }
 
 #[test]
-fn strict_schema_can_use_verified_constrained_tool_fallback()
+fn strict_schema_can_use_verified_enforced_tool_fallback()
 -> Result<(), inference_redox::ProviderError> {
     let mut route = endpoint("tool-fallback", 1e-6, 1e-6, 0.1, 100.0);
     route
@@ -436,7 +436,7 @@ fn strict_schema_can_use_verified_constrained_tool_fallback()
     route
         .capabilities
         .constraint_enforcement
-        .insert("tools".to_owned(), ConstraintEnforcement::Constrained);
+        .insert("tools".to_owned(), ConstraintEnforcement::Enforced);
 
     let mut request = InferenceRequest::new("x/model", "x", 10);
     request.prompt_tokens = Some(10);
@@ -513,7 +513,7 @@ fn strict_schema_does_not_repurpose_tools_when_request_already_has_tools() {
     route
         .capabilities
         .constraint_enforcement
-        .insert("tools".to_owned(), ConstraintEnforcement::Constrained);
+        .insert("tools".to_owned(), ConstraintEnforcement::Enforced);
     let mut request = InferenceRequest::new("x/model", "x", 10);
     request.prompt_tokens = Some(10);
     request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
@@ -595,6 +595,97 @@ fn ordinary_tools_require_observed_tool_surface_not_catalog_claim()
     )?;
     assert_eq!(plan.candidates.len(), 1);
     Ok(())
+}
+
+#[test]
+fn exact_forced_tool_can_use_enforced_structured_output_transport()
+-> Result<(), inference_redox::ProviderError> {
+    let mut route = endpoint("schema-only", 1e-6, 1e-6, 0.1, 100.0);
+    route.capabilities.supported_parameters.remove("tools");
+    route
+        .capabilities
+        .supported_parameters
+        .remove("tool_choice");
+    route
+        .capabilities
+        .verified_parameters
+        .insert("structured_outputs".to_owned());
+    route.capabilities.constraint_enforcement.insert(
+        "structured_outputs".to_owned(),
+        ConstraintEnforcement::Enforced,
+    );
+    let mut request = InferenceRequest::new("x/model", "call lookup", 16);
+    request.prompt_tokens = Some(10);
+    request.tools.push(FunctionTool {
+        name: "lookup".to_owned(),
+        description: None,
+        parameters: json!({
+            "type":"object",
+            "properties":{"value":{"type":"integer"}},
+            "required":["value"],
+            "additionalProperties":false
+        }),
+        strict: true,
+    });
+    request.tool_choice = Some(ToolChoice::Function {
+        name: "lookup".to_owned(),
+    });
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn lossy_tool_choices_do_not_translate_through_structured_output() {
+    let mut route = endpoint("schema-only", 1e-6, 1e-6, 0.1, 100.0);
+    route.capabilities.supported_parameters.remove("tools");
+    route
+        .capabilities
+        .supported_parameters
+        .remove("tool_choice");
+    route
+        .capabilities
+        .verified_parameters
+        .insert("structured_outputs".to_owned());
+    route.capabilities.constraint_enforcement.insert(
+        "structured_outputs".to_owned(),
+        ConstraintEnforcement::Enforced,
+    );
+    let tool = |name: &str| FunctionTool {
+        name: name.to_owned(),
+        description: None,
+        parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+        strict: true,
+    };
+    let mut auto = InferenceRequest::new("x/model", "maybe call", 16);
+    auto.prompt_tokens = Some(10);
+    auto.tools.push(tool("lookup"));
+    auto.tool_choice = Some(ToolChoice::Auto);
+    assert!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &auto,
+            vec![route.clone()],
+        )
+        .is_err()
+    );
+
+    let mut required = InferenceRequest::new("x/model", "call one", 16);
+    required.prompt_tokens = Some(10);
+    required.tools.extend([tool("a"), tool("b")]);
+    required.tool_choice = Some(ToolChoice::Required);
+    assert!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &required,
+            vec![route],
+        )
+        .is_err()
+    );
 }
 
 #[test]

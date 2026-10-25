@@ -38,7 +38,7 @@ pub use model::{
     EndpointStats, FunctionTool, InferenceRequest, InferenceResponse, Percentiles, Pricing,
     PricingOverride, ReasoningEffort, ReasoningSupport, RequestRequirements, ResponseSchema,
     RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy, StrictOutputTransport, TokenUsage,
-    ToolChoice, WorkloadPolicy,
+    ToolCall, ToolChoice, ToolTransport, WorkloadPolicy,
 };
 pub use pool::{
     InferencePool, PooledInferenceResponse, QuotaExecutionContext, QuotaInferenceError,

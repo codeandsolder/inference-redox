@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::{
     AgenticPolicy, Endpoint, InferenceRequest, ProviderError, ReasoningEffort, ResponseSchema,
-    RouteCandidate, RoutePlan, RoutingStrategy, StrictOutputTransport,
+    RouteCandidate, RoutePlan, RoutingStrategy, StrictOutputTransport, ToolChoice,
 };
 
 /// Cheap cross-model token estimate used only for routing/cost prediction.
@@ -108,18 +108,13 @@ fn supports_behavioral_request(endpoint: &Endpoint, request: &InferenceRequest) 
     {
         return false;
     }
-    if !request.tools.is_empty() {
-        if !endpoint.capabilities.verified_parameter("tools") {
+    if request.tools.is_empty() {
+        if request.tool_choice.is_some() && !matches!(request.tool_choice, Some(ToolChoice::None)) {
             return false;
         }
-        if request.tools.iter().any(|tool| tool.strict)
-            && endpoint.capabilities.constraint_enforcement("tools")
-                != Some(crate::ConstraintEnforcement::Constrained)
-        {
-            return false;
-        }
-    }
-    if request.tool_choice.is_some() && !endpoint.capabilities.verified_parameter("tool_choice") {
+    } else if !matches!(request.tool_choice, Some(ToolChoice::None))
+        && endpoint.capabilities.tool_transport(request).is_none()
+    {
         return false;
     }
     match request.requirements.response_schema.as_ref() {
