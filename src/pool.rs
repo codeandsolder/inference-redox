@@ -49,6 +49,11 @@ pub struct QuotaPooledInferenceResponse {
     pub response: InferenceResponse,
 }
 
+pub(crate) struct QuotaEndpointDiscovery {
+    pub endpoints: Vec<crate::Endpoint>,
+    pub reports: Vec<QuotaAdmissionReport>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaExecutionContext {
     pub unknown_policy: QuotaUnknownPolicy,
@@ -192,8 +197,8 @@ impl InferencePool {
     /// Route classes not admitted by the request are not queried.
     ///
     /// # Errors
-    /// Returns an error when model identity is ambiguous/unresolved or no registered provider
-    /// exposes an eligible route class for it.
+    /// Returns an error when model identity is ambiguous/unresolved, every matching provider
+    /// discovery fails, or no registered provider exposes an eligible route class for it.
     pub async fn endpoints(
         &self,
         catalog: &ModelCatalog,
@@ -214,6 +219,7 @@ impl InferencePool {
         };
 
         let mut endpoints = Vec::new();
+        let mut discovery_error = None;
         for route in resolved.routes {
             if !request
                 .requirements
@@ -227,8 +233,13 @@ impl InferencePool {
                 .iter()
                 .filter(|(instance, _)| instance.source == route.source)
             {
-                let Ok(mut discovered) = provider.endpoints(&route.id).await else {
-                    continue;
+                let mut discovered = match provider.endpoints(&route.id).await {
+                    Ok(discovered) => discovered,
+                    Err(ProviderError::NoEligibleEndpoint(_)) => continue,
+                    Err(error) => {
+                        discovery_error = Some(error);
+                        continue;
+                    }
                 };
                 for endpoint in &mut discovered {
                     // Catalog identity and registry credential are authoritative over adapter hints.
@@ -243,7 +254,8 @@ impl InferencePool {
         }
 
         if endpoints.is_empty() {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
+            return Err(discovery_error
+                .unwrap_or_else(|| ProviderError::NoEligibleEndpoint(request.model.clone())));
         }
         Ok(endpoints)
     }
@@ -262,24 +274,18 @@ impl InferencePool {
         build_route_plan(strategy, request, endpoints)
     }
 
-    /// Build a route plan after quota filtering, before computing the request cost floor.
-    ///
-    /// # Errors
-    /// Returns provider/routing errors normally, or a quota-specific failure carrying every
-    /// shape-eligible route's admission report when quota removes all candidates.
-    pub async fn route_with_quota(
+    pub(crate) async fn quota_admitted_endpoints(
         &self,
         catalog: &ModelCatalog,
-        strategy: RoutingStrategy,
         request: &InferenceRequest,
         ledger: &mut QuotaLedger,
         unknown_policy: QuotaUnknownPolicy,
         now_unix: u64,
-    ) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
+    ) -> Result<QuotaEndpointDiscovery, ProviderError> {
         let endpoints = self.endpoints(catalog, request).await?;
         let prompt_tokens = request_prompt_tokens(request);
         let demand = QuotaDemand::for_request(request);
-        let mut quota_reports = Vec::new();
+        let mut reports = Vec::new();
         let mut admitted = Vec::new();
         for endpoint in endpoints
             .into_iter()
@@ -300,18 +306,41 @@ impl InferencePool {
             if keep {
                 admitted.push(endpoint);
             }
-            quota_reports.push(report);
+            reports.push(report);
         }
-        if admitted.is_empty() {
+        Ok(QuotaEndpointDiscovery {
+            endpoints: admitted,
+            reports,
+        })
+    }
+
+    /// Build a route plan after quota filtering, before computing the request cost floor.
+    ///
+    /// # Errors
+    /// Returns provider/routing errors normally, or a quota-specific failure carrying every
+    /// shape-eligible route's admission report when quota removes all candidates.
+    pub async fn route_with_quota(
+        &self,
+        catalog: &ModelCatalog,
+        strategy: RoutingStrategy,
+        request: &InferenceRequest,
+        ledger: &mut QuotaLedger,
+        unknown_policy: QuotaUnknownPolicy,
+        now_unix: u64,
+    ) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
+        let discovery = self
+            .quota_admitted_endpoints(catalog, request, ledger, unknown_policy, now_unix)
+            .await?;
+        if discovery.endpoints.is_empty() {
             return Err(QuotaRoutingError::NoQuotaAdmissible {
                 model: request.model.clone(),
-                reports: Box::new(quota_reports),
+                reports: Box::new(discovery.reports),
             });
         }
-        let plan = build_route_plan(strategy, request, admitted)?;
+        let plan = build_route_plan(strategy, request, discovery.endpoints)?;
         Ok(QuotaAwareRoutePlan {
             plan,
-            quota_reports,
+            quota_reports: discovery.reports,
         })
     }
 

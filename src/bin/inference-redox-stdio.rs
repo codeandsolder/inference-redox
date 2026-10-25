@@ -10,10 +10,11 @@ use inference_redox::providers::{
 };
 use inference_redox::{
     BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, ConformanceProbe,
-    ConformanceProfile, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
-    ModelLookup, ModelSuitabilityReport, ModelSuitabilityRequirements, ProviderError,
+    ConformanceProfile, InferencePool, InferenceProvider, InferenceRequest,
+    InferenceRequestTemplate, ModelCatalog, ModelLookup, ModelSelectionEvidence,
+    ModelSelectionPolicy, ModelSuitabilityReport, ModelSuitabilityRequirements, ProviderError,
     QuotaExecutionContext, QuotaGraph, QuotaGraphSnapshot, QuotaLedger, QuotaObservationBinding,
-    QuotaUnknownPolicy, RetryPolicy, RoutingStrategy,
+    QuotaUnknownPolicy, RetryPolicy, RoutingStrategy, SuitabilityUnknownPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,6 +31,7 @@ enum Operation {
     RoutePool,
     InferPoolQuota,
     RoutePoolQuota,
+    SelectPoolQuota,
     QuotaState,
     Models,
     ResolveModel,
@@ -76,6 +78,13 @@ struct WireConformanceRequest {
     probes: Vec<ConformanceProbe>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct WireModelSelectionPolicy {
+    unknown_suitability: SuitabilityUnknownPolicy,
+    discovery_limit: usize,
+    quota_unknown_policy: QuotaUnknownPolicy,
+}
+
 #[derive(Debug, Deserialize)]
 struct WireRequest {
     id: Value,
@@ -92,6 +101,10 @@ struct WireRequest {
     benchmark_task_type: Option<BenchmarkTaskType>,
     #[serde(default)]
     conformance: Option<WireConformanceRequest>,
+    #[serde(default)]
+    request_template: Option<InferenceRequestTemplate>,
+    #[serde(default)]
+    selection: Option<WireModelSelectionPolicy>,
     #[serde(default)]
     batch_model: Option<String>,
     #[serde(default)]
@@ -200,15 +213,23 @@ fn unix_time_seconds() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+async fn benchmark_catalog(
+    providers: &Providers,
+    requirements: &ModelSuitabilityRequirements,
+) -> Result<BenchmarkCatalog, ProviderError> {
+    let mut benchmarks = BenchmarkCatalog::default();
+    for (source, task_type) in requirements.benchmark_queries() {
+        benchmarks.ingest(providers.openrouter.benchmarks(source, task_type).await?);
+    }
+    Ok(benchmarks)
+}
+
 async fn suitability_reports(
     providers: &Providers,
     requirements: &ModelSuitabilityRequirements,
 ) -> Result<Vec<ModelSuitabilityReport>, ProviderError> {
     let catalog = providers.catalog().await?;
-    let mut benchmarks = BenchmarkCatalog::default();
-    for (source, task_type) in requirements.benchmark_queries() {
-        benchmarks.ingest(providers.openrouter.benchmarks(source, task_type).await?);
-    }
+    let benchmarks = benchmark_catalog(providers, requirements).await?;
     Ok(catalog.suitability_reports_with_benchmarks(requirements, &benchmarks))
 }
 
@@ -627,6 +648,85 @@ async fn handle_pool_operation(
     }
 }
 
+async fn handle_model_selection_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let WireRequest {
+        id,
+        suitability,
+        request_template,
+        selection,
+        fastest_response_cheap,
+        ..
+    } = wire;
+    let (Some(suitability), Some(request_template), Some(selection), Some(multiplier)) = (
+        suitability,
+        request_template,
+        selection,
+        fastest_response_cheap,
+    ) else {
+        write_error(
+            stdout,
+            id,
+            "select_pool_quota requires suitability, request_template, selection, and fastest_response_cheap",
+        )
+        .await;
+        return;
+    };
+    let catalog = match providers.catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            write_error(stdout, id, error.to_string()).await;
+            return;
+        }
+    };
+    let benchmarks = match benchmark_catalog(providers, &suitability).await {
+        Ok(benchmarks) => benchmarks,
+        Err(error) => {
+            write_error(stdout, id, error.to_string()).await;
+            return;
+        }
+    };
+    let evidence = ModelSelectionEvidence {
+        catalog: &catalog,
+        benchmarks: Some(&benchmarks),
+        suitability: &suitability,
+    };
+    let policy = ModelSelectionPolicy {
+        unknown_suitability: selection.unknown_suitability,
+        discovery_limit: selection.discovery_limit,
+        quota_unknown_policy: selection.quota_unknown_policy,
+        now_unix: unix_time_seconds(),
+    };
+    let pool = providers.pool().await;
+    let mut ledger = providers.quota.lock().await;
+    match pool
+        .select_with_quota(
+            evidence,
+            &request_template,
+            RoutingStrategy::FastestResponseCheap(multiplier),
+            policy,
+            &mut ledger,
+        )
+        .await
+    {
+        Ok(result) => {
+            write_json(
+                stdout,
+                &WireSuccess {
+                    id,
+                    ok: true,
+                    result,
+                },
+            )
+            .await;
+        }
+        Err(error) => write_error(stdout, id, error.to_string()).await,
+    }
+}
+
 async fn handle_quota_pool_operation(
     providers: &Providers,
     stdout: &Arc<Mutex<tokio::io::Stdout>>,
@@ -834,6 +934,9 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
         Operation::RoutePoolQuota | Operation::InferPoolQuota => {
             handle_quota_pool_operation(&providers, &stdout, request).await;
         }
+        Operation::SelectPoolQuota => {
+            handle_model_selection_operation(&providers, &stdout, request).await;
+        }
         Operation::QuotaState => {
             handle_quota_state_operation(&providers, &stdout, request.id).await;
         }
@@ -1027,6 +1130,7 @@ mod tests {
     };
     use inference_redox::{
         ConformanceObservation, ConformanceOutcome, ConformanceProfile, QuotaUnknownPolicy,
+        SuitabilityUnknownPolicy,
     };
     use serde_json::json;
     use std::fs;
@@ -1173,6 +1277,55 @@ mod tests {
         let loaded = load_conformance_profile(&path).map_err(|error| error.to_string())?;
         let _ = fs::remove_file(&path);
         assert_eq!(loaded, profile);
+        Ok(())
+    }
+
+    #[test]
+    fn model_selection_wire_request_is_model_less_and_explicit() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 7,
+            "op": "select_pool_quota",
+            "fastest_response_cheap": 1.5,
+            "suitability": {"minimum_coding_index": 70.0},
+            "request_template": {
+                "prompt": "solve this",
+                "expected_output_tokens": 64,
+                "max_output_tokens": 128,
+                "requirements": {
+                    "allowed_route_classes": ["free", "standard"],
+                    "response_schema": null,
+                    "reasoning": "none",
+                    "required_parameters": [],
+                    "minimum_uptime_30m": null
+                }
+            },
+            "selection": {
+                "unknown_suitability": "reject",
+                "discovery_limit": 4,
+                "quota_unknown_policy": "allow"
+            }
+        }))?;
+        assert!(matches!(wire.op, Operation::SelectPoolQuota));
+        assert_eq!(
+            wire.request_template
+                .as_ref()
+                .map(|request| request.prompt.as_str()),
+            Some("solve this")
+        );
+        assert_eq!(
+            wire.selection.map(|selection| selection.discovery_limit),
+            Some(4)
+        );
+        assert_eq!(
+            wire.selection
+                .map(|selection| selection.unknown_suitability),
+            Some(SuitabilityUnknownPolicy::Reject)
+        );
+        assert_eq!(
+            wire.selection
+                .map(|selection| selection.quota_unknown_policy),
+            Some(QuotaUnknownPolicy::Allow)
+        );
         Ok(())
     }
 

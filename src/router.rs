@@ -141,6 +141,19 @@ fn tokens_as_f64(tokens: u64) -> f64 {
     tokens as f64
 }
 
+pub(crate) fn validate_strategy(strategy: RoutingStrategy) -> Result<f64, ProviderError> {
+    match strategy {
+        RoutingStrategy::FastestResponseCheap(multiplier)
+            if multiplier.is_finite() && multiplier >= 1.0 =>
+        {
+            Ok(multiplier)
+        }
+        RoutingStrategy::FastestResponseCheap(multiplier) => Err(ProviderError::InvalidStrategy(
+            format!("cost multiplier must be finite and >= 1.0, got {multiplier}"),
+        )),
+    }
+}
+
 /// Filter and rank provider endpoints for a request shape.
 ///
 /// # Errors
@@ -161,18 +174,7 @@ pub fn build_route_plan(
         )));
     }
 
-    let multiplier = match strategy {
-        RoutingStrategy::FastestResponseCheap(multiplier)
-            if multiplier.is_finite() && multiplier >= 1.0 =>
-        {
-            multiplier
-        }
-        RoutingStrategy::FastestResponseCheap(multiplier) => {
-            return Err(ProviderError::InvalidStrategy(format!(
-                "cost multiplier must be finite and >= 1.0, got {multiplier}"
-            )));
-        }
-    };
+    let multiplier = validate_strategy(strategy)?;
 
     let mut eligible: Vec<RouteCandidate> = endpoints
         .into_iter()

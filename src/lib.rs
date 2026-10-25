@@ -11,6 +11,7 @@ mod provider;
 mod quota;
 mod quota_headers;
 mod router;
+mod selection;
 mod suitability;
 
 pub mod providers;
@@ -51,6 +52,10 @@ pub use quota::{
     QuotaResourceId, QuotaRouteBinding, QuotaRouteKey, QuotaScope, QuotaUnknownPolicy,
 };
 pub use router::{approximate_prompt_tokens, build_route_plan, request_prompt_tokens};
+pub use selection::{
+    InferenceRequestTemplate, ModelRouteSelectionCandidate, ModelSelectionEvidence,
+    ModelSelectionPlan, ModelSelectionPolicy, ModelSelectionRejection, SuitabilityUnknownPolicy,
+};
 pub use suitability::{
     BenchmarkAggregation, BenchmarkKind, BenchmarkRequirement, ModelSuitabilityReport,
     ModelSuitabilityRequirements, SuitabilityCheck, SuitabilityStatus,
