@@ -209,7 +209,7 @@ impl InferenceProvider for NvidiaNim {
         let body = Self::compile_body(request)?;
         execute_chat_with_retry(
             &self.client,
-            &self.api_key,
+            Some(&self.api_key),
             &format!("{}/chat/completions", self.base_url),
             &body,
             "nvidia",
@@ -246,6 +246,7 @@ impl NvidiaModel {
             claimed_parameters: BTreeSet::new(),
             pricing: Some(Pricing::default()),
             route_class: Some(ModelRouteClass::Free),
+            virtual_route: false,
         }
     }
 }

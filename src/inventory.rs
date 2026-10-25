@@ -16,6 +16,9 @@ pub struct NativeModelRecord {
     pub claimed_parameters: BTreeSet<String>,
     pub pricing: Option<Pricing>,
     pub route_class: Option<ModelRouteClass>,
+    /// True for virtual/dynamic router IDs that must not be mistaken for an underlying model.
+    #[serde(default)]
+    pub virtual_route: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,15 +67,19 @@ impl ProviderInventory {
         let models = native_models
             .into_iter()
             .map(|native| {
-                let resolution = match catalog.resolve(&native.id) {
-                    ModelLookup::Resolved { model } => InventoryResolution::Resolved {
-                        canonical_id: model.canonical_id,
-                        match_kind: model.match_kind,
-                    },
-                    ModelLookup::Ambiguous { canonical_ids } => {
-                        InventoryResolution::Ambiguous { canonical_ids }
+                let resolution = if native.virtual_route {
+                    InventoryResolution::Unmatched
+                } else {
+                    match catalog.resolve(&native.id) {
+                        ModelLookup::Resolved { model } => InventoryResolution::Resolved {
+                            canonical_id: model.canonical_id,
+                            match_kind: model.match_kind,
+                        },
+                        ModelLookup::Ambiguous { canonical_ids } => {
+                            InventoryResolution::Ambiguous { canonical_ids }
+                        }
+                        ModelLookup::NotFound => InventoryResolution::Unmatched,
                     }
-                    ModelLookup::NotFound => InventoryResolution::Unmatched,
                 };
                 ProviderModelObservation {
                     provider: provider.clone(),
@@ -165,6 +172,30 @@ mod tests {
             &inventory.models[0].resolution,
             InventoryResolution::Resolved { canonical_id, .. }
                 if canonical_id == "stepfun/step-5-preview-20261008"
+        ));
+    }
+
+    #[test]
+    fn virtual_routes_never_basename_bridge_into_canonical_models() {
+        let catalog = ModelCatalog {
+            models: vec![catalog_entry(
+                "openrouter/free",
+                "openrouter/free",
+                &["openrouter/free"],
+            )],
+        };
+        let inventory = ProviderInventory::reconcile(
+            "kilo",
+            vec![NativeModelRecord {
+                id: "kilo-auto/free".to_owned(),
+                virtual_route: true,
+                ..NativeModelRecord::default()
+            }],
+            &catalog,
+        );
+        assert!(matches!(
+            inventory.models[0].resolution,
+            InventoryResolution::Unmatched
         ));
     }
 

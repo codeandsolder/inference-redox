@@ -126,25 +126,23 @@ fn response_shape_detail(provider: &str, raw: &Value) -> String {
 
 async fn execute_once(
     client: &Client,
-    api_key: &str,
+    api_key: Option<&str>,
     url: &str,
     body: &Value,
     provider: &str,
     usage_cost_usd: Option<f64>,
 ) -> Result<InferenceResponse, AttemptFailure> {
-    let response = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(body)
-        .send()
-        .await
-        .map_err(|error| AttemptFailure {
-            phase: ExecutionFailurePhase::TransportUnknown,
-            detail: error.to_string(),
-            retryable: true,
-            retry_after: None,
-            quota_observations: Vec::new(),
-        })?;
+    let mut request = client.post(url).json(body);
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await.map_err(|error| AttemptFailure {
+        phase: ExecutionFailurePhase::TransportUnknown,
+        detail: error.to_string(),
+        retryable: true,
+        retry_after: None,
+        quota_observations: Vec::new(),
+    })?;
     let status = response.status();
     let retry_after = retry_after(&response);
     let quota_observations =
@@ -190,7 +188,7 @@ async fn execute_once(
 
 pub(crate) async fn execute_chat_with_retry(
     client: &Client,
-    api_key: &str,
+    api_key: Option<&str>,
     url: &str,
     body: &Value,
     provider: &str,

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use inference_redox::providers::{groq::GroqCloud, nvidia::NvidiaNim, openrouter::OpenRouter};
+use inference_redox::providers::{
+    groq::GroqCloud, kilo::KiloGateway, nvidia::NvidiaNim, openrouter::OpenRouter,
+};
 use inference_redox::{
     BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, ConformanceProbe,
     ConformanceProfile, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
@@ -115,6 +117,7 @@ struct Providers {
     openrouter: Arc<OpenRouter>,
     nvidia: Option<Arc<NvidiaNim>>,
     groq: Option<Arc<GroqCloud>>,
+    kilo: Arc<KiloGateway>,
     conformance: Arc<Mutex<ConformanceProfile>>,
 }
 
@@ -130,6 +133,9 @@ impl Providers {
         if let Some(groq) = self.groq.as_ref()
             && let Ok(inventory) = groq.inventory(&base_catalog).await
         {
+            inventories.push(inventory);
+        }
+        if let Ok(inventory) = self.kilo.inventory(&base_catalog).await {
             inventories.push(inventory);
         }
         let mut catalog = base_catalog;
@@ -149,6 +155,7 @@ impl Providers {
         if let Some(groq) = self.groq.as_ref() {
             pool.register("groq", Arc::clone(groq));
         }
+        pool.register("kilo", Arc::clone(&self.kilo));
         pool
     }
 
@@ -163,6 +170,7 @@ impl Providers {
                 .groq
                 .as_ref()
                 .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
+            "kilo" => Some(self.kilo.clone()),
             _ => None,
         }
     }
@@ -710,6 +718,7 @@ struct ApiKeys {
     openrouter: String,
     nvidia: Option<String>,
     groq: Option<String>,
+    kilo: Option<String>,
 }
 
 fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
@@ -729,10 +738,12 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         .or(from_file("NVIDIA_API_KEY")?)
         .or(from_file("NVIDIA_API_key")?);
     let groq = environment_key("GROQ_API_KEY").or(from_file("GROQ_API_KEY")?);
+    let kilo = environment_key("KILO_API_KEY").or(from_file("KILO_API_KEY")?);
     Ok(ApiKeys {
         openrouter,
         nvidia,
         groq,
+        kilo,
     })
 }
 
@@ -745,6 +756,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         groq: keys
             .groq
             .map(|key| Arc::new(GroqCloud::new(key).with_quota_pool("default"))),
+        kilo: Arc::new(KiloGateway::new(keys.kilo).with_quota_pool("default-egress")),
         conformance: Arc::new(Mutex::new(ConformanceProfile::default())),
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));

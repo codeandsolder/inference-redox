@@ -340,7 +340,7 @@ impl InferenceProvider for GroqCloud {
         let body = Self::compile_body(request)?;
         execute_chat_with_retry(
             &self.client,
-            &self.api_key,
+            Some(&self.api_key),
             &format!("{}/chat/completions", self.base_url),
             &body,
             "groq",
@@ -384,6 +384,7 @@ impl GroqModel {
             claimed_parameters,
             pricing: Some(Pricing::default()),
             route_class: Some(ModelRouteClass::Free),
+            virtual_route: false,
         }
     }
 }
