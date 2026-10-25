@@ -1,6 +1,7 @@
 #![doc = "Provider-agnostic inference routing with shape-aware endpoint selection."]
 
 mod batch;
+mod benchmarks;
 mod catalog;
 mod conformance;
 mod inventory;
@@ -15,6 +16,10 @@ mod suitability;
 pub mod providers;
 
 pub use batch::{BatchInferenceItem, BatchJob};
+pub use benchmarks::{
+    BenchmarkCatalog, BenchmarkObservation, BenchmarkSnapshot, BenchmarkSnapshotMeta,
+    BenchmarkSource, BenchmarkTaskType, BenchmarkUnit,
+};
 pub use catalog::{
     ArtificialAnalysisBenchmarks, DesignArenaBenchmark, ModelArchitecture, ModelBenchmarks,
     ModelCatalog, ModelCatalogEntry, ModelLookup, ModelMatchKind, ModelReasoning, ModelRouteClass,

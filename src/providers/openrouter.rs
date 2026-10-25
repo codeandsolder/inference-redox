@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,12 +10,13 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::{
-    ArtificialAnalysisBenchmarks, BatchInferenceItem, BatchJob, DesignArenaBenchmark, Endpoint,
-    EndpointCapabilities, EndpointStats, ExecutionFailurePhase, InferenceProvider,
-    InferenceRequest, InferenceResponse, ModelArchitecture, ModelBenchmarks, ModelCatalog,
-    ModelCatalogEntry, ModelLookup, ModelReasoning, ModelRouteClass, ModelTopProvider, Percentiles,
-    Pricing, PricingOverride, ProviderError, ReasoningEffort, ReasoningSupport, ResponseSchema,
-    RetryPolicy, RouteCandidate, RoutePlan, TokenUsage,
+    ArtificialAnalysisBenchmarks, BatchInferenceItem, BatchJob, BenchmarkObservation,
+    BenchmarkSnapshot, BenchmarkSnapshotMeta, BenchmarkSource, BenchmarkTaskType, BenchmarkUnit,
+    DesignArenaBenchmark, Endpoint, EndpointCapabilities, EndpointStats, ExecutionFailurePhase,
+    InferenceProvider, InferenceRequest, InferenceResponse, ModelArchitecture, ModelBenchmarks,
+    ModelCatalog, ModelCatalogEntry, ModelLookup, ModelReasoning, ModelRouteClass,
+    ModelTopProvider, Percentiles, Pricing, PricingOverride, ProviderError, ReasoningEffort,
+    ReasoningSupport, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan, TokenUsage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -30,7 +31,9 @@ pub struct OpenRouter {
     http_referer: Option<String>,
     catalog_cache: Arc<Mutex<HashMap<String, CachedEndpoints>>>,
     model_cache: Arc<Mutex<Option<CachedModels>>>,
+    benchmark_cache: Arc<Mutex<HashMap<(BenchmarkSource, BenchmarkTaskType), CachedBenchmarks>>>,
     catalog_ttl: Duration,
+    benchmark_ttl: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +46,12 @@ struct CachedEndpoints {
 struct CachedModels {
     fetched_at: Instant,
     catalog: ModelCatalog,
+}
+
+#[derive(Debug, Clone)]
+struct CachedBenchmarks {
+    fetched_at: Instant,
+    snapshot: BenchmarkSnapshot,
 }
 
 #[derive(Debug)]
@@ -92,7 +101,9 @@ impl OpenRouter {
             http_referer: None,
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
             model_cache: Arc::new(Mutex::new(None)),
+            benchmark_cache: Arc::new(Mutex::new(HashMap::new())),
             catalog_ttl: Duration::from_secs(60),
+            benchmark_ttl: Duration::from_secs(3_600),
         }
     }
 
@@ -118,6 +129,12 @@ impl OpenRouter {
     #[must_use]
     pub fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
+        self
+    }
+
+    #[must_use]
+    pub fn with_benchmark_ttl(mut self, ttl: Duration) -> Self {
+        self.benchmark_ttl = ttl;
         self
     }
 
@@ -708,6 +725,80 @@ impl OpenRouter {
         }
     }
 
+    /// Fetch and cache one normalized `OpenRouter` benchmark source/task snapshot.
+    ///
+    /// The endpoint is rate-limited, so successful snapshots are cached for the benchmark TTL and
+    /// stale data is retained as a fallback when refresh fails.
+    ///
+    /// # Errors
+    /// Returns a catalog error when no cached snapshot exists and the benchmark API fails.
+    pub async fn benchmarks(
+        &self,
+        source: BenchmarkSource,
+        task_type: BenchmarkTaskType,
+    ) -> Result<BenchmarkSnapshot, ProviderError> {
+        let key = (source, task_type);
+        let mut cache = self.benchmark_cache.lock().await;
+        if let Some(cached) = cache.get(&key)
+            && cached.fetched_at.elapsed() <= self.benchmark_ttl
+        {
+            return Ok(cached.snapshot.clone());
+        }
+        let stale = cache.get(&key).map(|cached| cached.snapshot.clone());
+        drop(cache);
+
+        let url = format!(
+            "{}/benchmarks?source={}&task_type={}&max_results=1000",
+            self.base_url,
+            source.as_query_str(),
+            task_type.as_query_str()
+        );
+        let fetched = async {
+            let response = self
+                .request(reqwest::Method::GET, url)
+                .send()
+                .await
+                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(ProviderError::Catalog(format!("HTTP {status}: {body}")));
+            }
+            let value: Value = response
+                .json()
+                .await
+                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+            let shape = benchmark_response_shape(&value);
+            let envelope: BenchmarkEnvelope = serde_json::from_value(value).map_err(|error| {
+                ProviderError::Catalog(format!("invalid benchmark response shape {shape}: {error}"))
+            })?;
+            normalize_benchmark_snapshot(source, task_type, envelope)
+        }
+        .await;
+
+        match fetched {
+            Ok(snapshot) => {
+                cache = self.benchmark_cache.lock().await;
+                cache.insert(
+                    key,
+                    CachedBenchmarks {
+                        fetched_at: Instant::now(),
+                        snapshot: snapshot.clone(),
+                    },
+                );
+                Ok(snapshot)
+            }
+            Err(error) => {
+                if let Some(mut snapshot) = stale {
+                    snapshot.meta.stale = true;
+                    Ok(snapshot)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     /// Resolve a human or provider-native model name through the `OpenRouter` catalog.
     ///
     /// # Errors
@@ -724,6 +815,223 @@ impl OpenRouter {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs)
     }
+}
+
+fn benchmark_response_shape(value: &Value) -> String {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+            keys.sort_unstable();
+            format!("object keys=[{}]", keys.join(","))
+        }
+        Value::Array(values) => format!("array len={}", values.len()),
+        Value::Null => "null".to_owned(),
+        Value::Bool(_) => "boolean".to_owned(),
+        Value::Number(_) => "number".to_owned(),
+        Value::String(_) => "string".to_owned(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchmarkEnvelope {
+    data: Vec<Value>,
+    meta: OpenRouterBenchmarkMeta,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterBenchmarkMeta {
+    as_of: Option<String>,
+    citation: Option<String>,
+    model_count: Option<u64>,
+    source: String,
+    source_url: Option<String>,
+    task_type: String,
+    version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtificialAnalysisRow {
+    model_permaslug: String,
+    display_name: Option<String>,
+    intelligence_index: Option<f64>,
+    coding_index: Option<f64>,
+    agentic_index: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DesignArenaRow {
+    model_permaslug: String,
+    display_name: Option<String>,
+    arena: Option<String>,
+    category: Option<String>,
+    elo: Option<f64>,
+    win_rate: Option<f64>,
+    avg_generation_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterBenchmarkRow {
+    model_permaslug: String,
+    display_name: Option<String>,
+    benchmark_type: String,
+    accuracy: Option<f64>,
+    accuracy_stddev: Option<f64>,
+    avg_cost_per_task: Option<f64>,
+    last_run_timestamp: Option<String>,
+    total_tasks: Option<u64>,
+}
+
+fn normalize_benchmark_snapshot(
+    source: BenchmarkSource,
+    task_type: BenchmarkTaskType,
+    envelope: BenchmarkEnvelope,
+) -> Result<BenchmarkSnapshot, ProviderError> {
+    if envelope.meta.source != source.as_query_str()
+        || envelope.meta.task_type != task_type.as_query_str()
+    {
+        return Err(ProviderError::Catalog(format!(
+            "benchmark response identity mismatch: requested {}/{}, got {}/{}",
+            source.as_query_str(),
+            task_type.as_query_str(),
+            envelope.meta.source,
+            envelope.meta.task_type
+        )));
+    }
+    let observations = match source {
+        BenchmarkSource::ArtificialAnalysis => {
+            normalize_artificial_analysis(task_type, envelope.meta.as_of.as_deref(), envelope.data)?
+        }
+        BenchmarkSource::DesignArena => {
+            normalize_design_arena(task_type, envelope.meta.as_of.as_deref(), envelope.data)?
+        }
+        BenchmarkSource::Openrouter => normalize_openrouter_evals(task_type, envelope.data)?,
+    };
+    Ok(BenchmarkSnapshot {
+        meta: BenchmarkSnapshotMeta {
+            source,
+            task_type,
+            as_of: envelope.meta.as_of,
+            citation: envelope.meta.citation,
+            source_url: envelope.meta.source_url,
+            version: envelope.meta.version,
+            model_count: envelope.meta.model_count,
+            stale: false,
+        },
+        observations,
+    })
+}
+
+fn normalize_artificial_analysis(
+    task_type: BenchmarkTaskType,
+    as_of: Option<&str>,
+    rows: Vec<Value>,
+) -> Result<Vec<BenchmarkObservation>, ProviderError> {
+    let mut observations = Vec::new();
+    for raw in rows {
+        let row: ArtificialAnalysisRow = serde_json::from_value(raw)
+            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+        let (metric, score) = match task_type {
+            BenchmarkTaskType::Coding => ("coding_index", row.coding_index),
+            BenchmarkTaskType::Intelligence => ("intelligence_index", row.intelligence_index),
+            BenchmarkTaskType::Agentic => ("agentic_index", row.agentic_index),
+        };
+        let Some(score) = score else {
+            continue;
+        };
+        observations.push(BenchmarkObservation {
+            canonical_id: row.model_permaslug,
+            source: BenchmarkSource::ArtificialAnalysis,
+            task_type,
+            metric: metric.to_owned(),
+            score,
+            unit: BenchmarkUnit::Index,
+            configuration: row.display_name,
+            qualifiers: BTreeMap::new(),
+            sample_count: None,
+            standard_deviation: None,
+            average_cost_usd: None,
+            average_generation_time_ms: None,
+            observed_at: as_of.map(str::to_owned),
+        });
+    }
+    Ok(observations)
+}
+
+fn normalize_design_arena(
+    task_type: BenchmarkTaskType,
+    as_of: Option<&str>,
+    rows: Vec<Value>,
+) -> Result<Vec<BenchmarkObservation>, ProviderError> {
+    let mut observations = Vec::new();
+    for raw in rows {
+        let row: DesignArenaRow = serde_json::from_value(raw)
+            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+        let mut qualifiers = BTreeMap::new();
+        if let Some(arena) = row.arena {
+            qualifiers.insert("arena".to_owned(), arena);
+        }
+        if let Some(category) = row.category {
+            qualifiers.insert("category".to_owned(), category);
+        }
+        for (metric, score, unit) in [
+            ("design_arena_elo", row.elo, BenchmarkUnit::Elo),
+            (
+                "design_arena_win_rate",
+                row.win_rate,
+                BenchmarkUnit::Percent,
+            ),
+        ] {
+            let Some(score) = score else {
+                continue;
+            };
+            observations.push(BenchmarkObservation {
+                canonical_id: row.model_permaslug.clone(),
+                source: BenchmarkSource::DesignArena,
+                task_type,
+                metric: metric.to_owned(),
+                score,
+                unit,
+                configuration: row.display_name.clone(),
+                qualifiers: qualifiers.clone(),
+                sample_count: None,
+                standard_deviation: None,
+                average_cost_usd: None,
+                average_generation_time_ms: row.avg_generation_time_ms,
+                observed_at: as_of.map(str::to_owned),
+            });
+        }
+    }
+    Ok(observations)
+}
+
+fn normalize_openrouter_evals(
+    task_type: BenchmarkTaskType,
+    rows: Vec<Value>,
+) -> Result<Vec<BenchmarkObservation>, ProviderError> {
+    let mut observations = Vec::new();
+    for raw in rows {
+        let row: OpenRouterBenchmarkRow = serde_json::from_value(raw)
+            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+        let Some(score) = row.accuracy else {
+            continue;
+        };
+        observations.push(BenchmarkObservation {
+            canonical_id: row.model_permaslug,
+            source: BenchmarkSource::Openrouter,
+            task_type,
+            metric: row.benchmark_type,
+            score,
+            unit: BenchmarkUnit::Fraction,
+            configuration: row.display_name,
+            qualifiers: BTreeMap::new(),
+            sample_count: row.total_tasks,
+            standard_deviation: row.accuracy_stddev,
+            average_cost_usd: row.avg_cost_per_task,
+            average_generation_time_ms: None,
+            observed_at: row.last_run_timestamp,
+        });
+    }
+    Ok(observations)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1706,6 +2014,128 @@ mod tests {
         let normalized = endpoint.normalize("deepseek/deepseek-v4.1-flash");
         assert!(normalized.pricing.prompt_per_token > 0.0);
         assert!(normalized.pricing.completion_per_token > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn benchmark_response_shape_does_not_echo_error_body() {
+        let value = json!({
+            "error": {
+                "message": "upstream detail that should not be copied into diagnostics",
+                "request_id": "opaque"
+            }
+        });
+        assert_eq!(benchmark_response_shape(&value), "object keys=[error]");
+    }
+
+    #[test]
+    fn normalizes_artificial_analysis_benchmark_payload() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let envelope: BenchmarkEnvelope = serde_json::from_value(json!({
+            "data": [{
+                "agentic_index": 57.9,
+                "coding_index": 81.6,
+                "display_name": "Claude Fable 5.1 (Max, Default Fallback)",
+                "intelligence_index": 53.4,
+                "model_permaslug": "anthropic/claude-fable-5.1-20260831",
+                "source": "artificial-analysis"
+            }],
+            "meta": {
+                "as_of": "2026-10-22T12:01:07.781Z",
+                "citation": "AA via OpenRouter",
+                "model_count": 1,
+                "source": "artificial-analysis",
+                "source_url": "https://artificialanalysis.ai",
+                "task_type": "coding",
+                "version": "v1"
+            }
+        }))?;
+        let snapshot = normalize_benchmark_snapshot(
+            BenchmarkSource::ArtificialAnalysis,
+            BenchmarkTaskType::Coding,
+            envelope,
+        )?;
+        assert_eq!(snapshot.observations.len(), 1);
+        assert_eq!(snapshot.observations[0].metric, "coding_index");
+        assert_eq!(snapshot.observations[0].score, 81.6);
+        assert_eq!(snapshot.observations[0].unit, BenchmarkUnit::Index);
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_design_arena_configuration_without_flattening()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let envelope: BenchmarkEnvelope = serde_json::from_value(json!({
+            "data": [{
+                "arena": "models",
+                "avg_generation_time_ms": 288_179,
+                "category": "codecategories",
+                "display_name": "Claude Opus 5.5",
+                "elo": 1389,
+                "model_permaslug": "anthropic/claude-opus-5.5-20260921",
+                "source": "design-arena",
+                "win_rate": 63.8
+            }],
+            "meta": {
+                "as_of": "2026-10-22T12:01:11.227Z",
+                "citation": "Design Arena via OpenRouter",
+                "model_count": 1,
+                "source": "design-arena",
+                "source_url": "https://www.designarena.ai",
+                "task_type": "coding",
+                "version": "v1"
+            }
+        }))?;
+        let snapshot = normalize_benchmark_snapshot(
+            BenchmarkSource::DesignArena,
+            BenchmarkTaskType::Coding,
+            envelope,
+        )?;
+        assert_eq!(snapshot.observations.len(), 2);
+        assert!(snapshot.observations.iter().all(|observation| {
+            observation.configuration.as_deref() == Some("Claude Opus 5.5")
+        }));
+        assert!(snapshot.observations.iter().any(|observation| {
+            observation.metric == "design_arena_elo"
+                && (observation.score - 1389.0).abs() < f64::EPSILON
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_openrouter_eval_provenance() -> Result<(), Box<dyn std::error::Error>> {
+        let envelope: BenchmarkEnvelope = serde_json::from_value(json!({
+            "data": [{
+                "accuracy": 0.801_818_181_818_181_8,
+                "accuracy_stddev": 0.026_222_075_532_643_652,
+                "avg_cost_per_task": 0.918_943_667_272_727_2,
+                "benchmark_type": "tau_bench_verified_airline",
+                "display_name": "Anthropic: Claude Fable 5",
+                "last_run_timestamp": "2026-10-17T10:30:43.110Z",
+                "model_permaslug": "anthropic/claude-5-fable-20260609",
+                "source": "openrouter",
+                "total_tasks": 550
+            }],
+            "meta": {
+                "as_of": "2026-10-21T18:18:28.156Z",
+                "citation": "OpenRouter evals",
+                "model_count": 1,
+                "source": "openrouter",
+                "source_url": "https://openrouter.ai/rankings",
+                "task_type": "agentic",
+                "version": "v1"
+            }
+        }))?;
+        let snapshot = normalize_benchmark_snapshot(
+            BenchmarkSource::Openrouter,
+            BenchmarkTaskType::Agentic,
+            envelope,
+        )?;
+        let observation = &snapshot.observations[0];
+        assert_eq!(observation.metric, "tau_bench_verified_airline");
+        assert_eq!(observation.unit, BenchmarkUnit::Fraction);
+        assert_eq!(observation.sample_count, Some(550));
+        assert_eq!(observation.average_cost_usd, Some(0.918_943_667_272_727_2));
         Ok(())
     }
 }

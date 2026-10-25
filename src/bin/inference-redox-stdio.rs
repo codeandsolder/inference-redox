@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use inference_redox::providers::{nvidia::NvidiaNim, openrouter::OpenRouter};
 use inference_redox::{
-    BatchInferenceItem, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
-    ModelSuitabilityRequirements, ProviderError, RetryPolicy, RoutingStrategy,
+    BatchInferenceItem, BenchmarkSource, BenchmarkTaskType, InferencePool, InferenceProvider,
+    InferenceRequest, ModelCatalog, ModelSuitabilityRequirements, ProviderError, RetryPolicy,
+    RoutingStrategy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +26,7 @@ enum Operation {
     Models,
     ResolveModel,
     Suitability,
+    Benchmarks,
     SubmitBatch,
     BatchStatus,
     DeleteBatch,
@@ -62,6 +64,10 @@ struct WireRequest {
     query: Option<String>,
     #[serde(default)]
     suitability: Option<ModelSuitabilityRequirements>,
+    #[serde(default)]
+    benchmark_source: Option<BenchmarkSource>,
+    #[serde(default)]
+    benchmark_task_type: Option<BenchmarkTaskType>,
     #[serde(default)]
     batch_model: Option<String>,
     #[serde(default)]
@@ -148,6 +154,8 @@ async fn handle_catalog_operation(
         op,
         query,
         suitability,
+        benchmark_source,
+        benchmark_task_type,
         ..
     } = wire;
     match op {
@@ -178,6 +186,30 @@ async fn handle_catalog_operation(
                             id,
                             ok: true,
                             result: catalog.suitability_reports(&requirements),
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        Operation::Benchmarks => {
+            let Some(source) = benchmark_source else {
+                write_error(stdout, id, "benchmarks requires benchmark_source").await;
+                return;
+            };
+            let Some(task_type) = benchmark_task_type else {
+                write_error(stdout, id, "benchmarks requires benchmark_task_type").await;
+                return;
+            };
+            match providers.openrouter.benchmarks(source, task_type).await {
+                Ok(snapshot) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result: snapshot,
                         },
                     )
                     .await;
@@ -440,7 +472,10 @@ async fn handle_openrouter_operation(
 
 async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, request: WireRequest) {
     match request.op {
-        Operation::Models | Operation::ResolveModel | Operation::Suitability => {
+        Operation::Models
+        | Operation::ResolveModel
+        | Operation::Suitability
+        | Operation::Benchmarks => {
             handle_catalog_operation(&providers, &stdout, request).await;
         }
         Operation::SubmitBatch | Operation::BatchStatus | Operation::DeleteBatch => {
@@ -563,7 +598,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Operation, WireRequest, key_from_contents};
+    use super::{BenchmarkSource, BenchmarkTaskType, Operation, WireRequest, key_from_contents};
     use serde_json::json;
 
     #[test]
@@ -596,6 +631,23 @@ mod tests {
                 .and_then(|value| value.minimum_coding_index),
             Some(50.0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn benchmarks_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 2,
+            "op": "benchmarks",
+            "benchmark_source": "artificial-analysis",
+            "benchmark_task_type": "coding"
+        }))?;
+        assert!(matches!(wire.op, Operation::Benchmarks));
+        assert_eq!(
+            wire.benchmark_source,
+            Some(BenchmarkSource::ArtificialAnalysis)
+        );
+        assert_eq!(wire.benchmark_task_type, Some(BenchmarkTaskType::Coding));
         Ok(())
     }
 }
