@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use inference_redox::providers::{groq::GroqCloud, nvidia::NvidiaNim, openrouter::OpenRouter};
 use inference_redox::{
-    BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, InferencePool,
-    InferenceProvider, InferenceRequest, ModelCatalog, ModelSuitabilityReport,
-    ModelSuitabilityRequirements, ProviderError, RetryPolicy, RoutingStrategy,
+    BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, ConformanceProbe,
+    ConformanceProfile, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
+    ModelLookup, ModelSuitabilityReport, ModelSuitabilityRequirements, ProviderError, RetryPolicy,
+    RoutingStrategy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +28,7 @@ enum Operation {
     ResolveModel,
     Suitability,
     Benchmarks,
+    Conformance,
     SubmitBatch,
     BatchStatus,
     DeleteBatch,
@@ -55,6 +57,17 @@ impl WireRetryPolicy {
 }
 
 #[derive(Debug, Deserialize)]
+struct WireConformanceRequest {
+    model: String,
+    source: String,
+    #[serde(default)]
+    route_id: Option<String>,
+    #[serde(default)]
+    provider_key: Option<String>,
+    probes: Vec<ConformanceProbe>,
+}
+
+#[derive(Debug, Deserialize)]
 struct WireRequest {
     id: Value,
     op: Operation,
@@ -68,6 +81,8 @@ struct WireRequest {
     benchmark_source: Option<BenchmarkSource>,
     #[serde(default)]
     benchmark_task_type: Option<BenchmarkTaskType>,
+    #[serde(default)]
+    conformance: Option<WireConformanceRequest>,
     #[serde(default)]
     batch_model: Option<String>,
     #[serde(default)]
@@ -100,6 +115,7 @@ struct Providers {
     openrouter: Arc<OpenRouter>,
     nvidia: Option<Arc<NvidiaNim>>,
     groq: Option<Arc<GroqCloud>>,
+    conformance: Arc<Mutex<ConformanceProfile>>,
 }
 
 impl Providers {
@@ -123,8 +139,9 @@ impl Providers {
         Ok(catalog)
     }
 
-    fn pool(&self) -> InferencePool {
-        let mut pool = InferencePool::new();
+    async fn pool(&self) -> InferencePool {
+        let profile = self.conformance.lock().await.clone();
+        let mut pool = InferencePool::new().with_conformance_profile(profile);
         pool.register("openrouter", Arc::clone(&self.openrouter));
         if let Some(nvidia) = self.nvidia.as_ref() {
             pool.register("nvidia", Arc::clone(nvidia));
@@ -133,6 +150,21 @@ impl Providers {
             pool.register("groq", Arc::clone(groq));
         }
         pool
+    }
+
+    fn provider(&self, source: &str) -> Option<Arc<dyn InferenceProvider>> {
+        match source {
+            "openrouter" => Some(self.openrouter.clone()),
+            "nvidia" => self
+                .nvidia
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
+            "groq" => self
+                .groq
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
+            _ => None,
+        }
     }
 }
 
@@ -168,6 +200,112 @@ async fn write_error(stdout: &Arc<Mutex<tokio::io::Stdout>>, id: Value, error: i
         },
     )
     .await;
+}
+
+async fn run_conformance(
+    providers: &Providers,
+    spec: WireConformanceRequest,
+) -> Result<Vec<inference_redox::ConformanceObservation>, ProviderError> {
+    if spec.probes.is_empty() {
+        return Err(ProviderError::InvalidRequest(
+            "conformance requires at least one probe".to_owned(),
+        ));
+    }
+    let catalog = providers.catalog().await?;
+    let resolved = match catalog.resolve(&spec.model) {
+        ModelLookup::Resolved { model } => model,
+        ModelLookup::Ambiguous { canonical_ids } => {
+            return Err(ProviderError::InvalidRequest(format!(
+                "ambiguous model {}: {}",
+                spec.model,
+                canonical_ids.join(", ")
+            )));
+        }
+        ModelLookup::NotFound => {
+            return Err(ProviderError::NoEligibleEndpoint(spec.model));
+        }
+    };
+    let matching_routes = resolved
+        .routes
+        .iter()
+        .filter(|route| route.source == spec.source)
+        .filter(|route| spec.route_id.as_ref().is_none_or(|id| &route.id == id))
+        .collect::<Vec<_>>();
+    let [route] = matching_routes.as_slice() else {
+        return Err(ProviderError::InvalidRequest(format!(
+            "conformance route selection for {} on {} matched {} routes; specify route_id",
+            spec.model,
+            spec.source,
+            matching_routes.len()
+        )));
+    };
+    let provider = providers.provider(&spec.source).ok_or_else(|| {
+        ProviderError::InvalidRequest(format!(
+            "provider source is not configured: {}",
+            spec.source
+        ))
+    })?;
+    let matching_endpoints = provider
+        .endpoints(&route.id)
+        .await?
+        .into_iter()
+        .filter(|endpoint| {
+            spec.provider_key
+                .as_ref()
+                .is_none_or(|provider_key| &endpoint.provider_key == provider_key)
+        })
+        .collect::<Vec<_>>();
+    let [endpoint] = matching_endpoints.as_slice() else {
+        return Err(ProviderError::InvalidRequest(format!(
+            "conformance endpoint selection matched {} endpoints; specify provider_key",
+            matching_endpoints.len()
+        )));
+    };
+    let mut observations = Vec::with_capacity(spec.probes.len());
+    for probe in spec.probes {
+        observations.push(
+            probe
+                .run_provider_model(
+                    provider.as_ref(),
+                    endpoint.clone(),
+                    Some(resolved.canonical_id.clone()),
+                )
+                .await,
+        );
+    }
+    Ok(observations)
+}
+
+async fn handle_conformance_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let id = wire.id;
+    let Some(spec) = wire.conformance else {
+        write_error(stdout, id, "conformance requires conformance").await;
+        return;
+    };
+    match run_conformance(providers, spec).await {
+        Ok(observations) => {
+            providers
+                .conformance
+                .lock()
+                .await
+                .observations
+                .extend(observations.clone());
+            write_json(
+                stdout,
+                &WireSuccess {
+                    id,
+                    ok: true,
+                    result: observations,
+                },
+            )
+            .await;
+        }
+        Err(error) => write_error(stdout, id, error.to_string()).await,
+    }
 }
 
 async fn handle_catalog_operation(
@@ -394,7 +532,7 @@ async fn handle_pool_operation(
             return;
         }
     };
-    let pool = providers.pool();
+    let pool = providers.pool().await;
     let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
     match op {
         Operation::RoutePool => match pool.route(&catalog, strategy, &request).await {
@@ -504,6 +642,9 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
         | Operation::Benchmarks => {
             handle_catalog_operation(&providers, &stdout, request).await;
         }
+        Operation::Conformance => {
+            handle_conformance_operation(&providers, &stdout, request).await;
+        }
         Operation::SubmitBatch | Operation::BatchStatus | Operation::DeleteBatch => {
             handle_batch_operation(&providers, &stdout, request).await;
         }
@@ -604,6 +745,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         groq: keys
             .groq
             .map(|key| Arc::new(GroqCloud::new(key).with_quota_pool("default"))),
+        conformance: Arc::new(Mutex::new(ConformanceProfile::default())),
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
@@ -710,6 +852,25 @@ mod tests {
             wire.suitability
                 .map(|requirements| requirements.benchmark_requirements.len()),
             Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conformance_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 4,
+            "op": "conformance",
+            "conformance": {
+                "model": "openai/gpt-oss-120b",
+                "source": "groq",
+                "probes": ["basic_chat", "strict_json_schema", "reasoning_low"]
+            }
+        }))?;
+        assert!(matches!(wire.op, Operation::Conformance));
+        assert_eq!(
+            wire.conformance.as_ref().map(|spec| spec.probes.len()),
+            Some(3)
         );
         Ok(())
     }

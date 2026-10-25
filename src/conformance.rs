@@ -61,14 +61,14 @@ impl ConformanceProbe {
         match self {
             Self::BasicChat => {
                 let mut request = InferenceRequest::new(model, "Reply with PROBE_OK.", 16);
-                request.max_output_tokens = Some(32);
+                request.max_output_tokens = Some(256);
                 request.temperature = Some(0.0);
                 request
             }
             Self::SystemRole => {
                 let mut request = InferenceRequest::new(model, "Reply briefly.", 16);
                 request.system_prompt = Some("This is a protocol conformance probe.".to_owned());
-                request.max_output_tokens = Some(32);
+                request.max_output_tokens = Some(256);
                 request.temperature = Some(0.0);
                 request
             }

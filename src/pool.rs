@@ -6,10 +6,10 @@ use thiserror::Error;
 
 use crate::router::supports_request;
 use crate::{
-    InferenceProvider, InferenceRequest, InferenceResponse, ModelCatalog, ModelLookup,
-    ModelRouteClass, ProviderError, QuotaAdmission, QuotaAdmissionReport, QuotaAwareRoutePlan,
-    QuotaDemand, QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy, RouteCandidate,
-    RoutePlan, RoutingStrategy, build_route_plan, request_prompt_tokens,
+    ConformanceProfile, InferenceProvider, InferenceRequest, InferenceResponse, ModelCatalog,
+    ModelLookup, ModelRouteClass, ProviderError, QuotaAdmission, QuotaAdmissionReport,
+    QuotaAwareRoutePlan, QuotaDemand, QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy,
+    RouteCandidate, RoutePlan, RoutingStrategy, build_route_plan, request_prompt_tokens,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,6 +32,7 @@ impl ProviderInstanceKey {
 #[derive(Clone, Default)]
 pub struct InferencePool {
     providers: BTreeMap<ProviderInstanceKey, Arc<dyn InferenceProvider>>,
+    conformance: ConformanceProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,6 +141,12 @@ impl InferencePool {
         Self::default()
     }
 
+    #[must_use]
+    pub fn with_conformance_profile(mut self, profile: ConformanceProfile) -> Self {
+        self.conformance = profile;
+        self
+    }
+
     pub fn register<P>(&mut self, source: impl Into<String>, provider: Arc<P>)
     where
         P: InferenceProvider + 'static,
@@ -229,6 +236,7 @@ impl InferencePool {
                     endpoint.credential.clone_from(&instance.credential);
                     endpoint.model.clone_from(&route.id);
                     endpoint.route_class = route.route_class;
+                    self.conformance.apply_to_endpoint(endpoint);
                 }
                 endpoints.extend(discovered);
             }
@@ -662,6 +670,50 @@ mod tests {
                 entry("openrouter", "vendor/model:batch", ModelRouteClass::Batch),
             ],
         }
+    }
+
+    #[tokio::test]
+    async fn discovered_endpoints_apply_conformance_profile() -> Result<(), ProviderError> {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let profile = ConformanceProfile {
+            observations: vec![crate::ConformanceObservation {
+                source: "nvidia".to_owned(),
+                provider_key: "nvidia".to_owned(),
+                endpoint_id: None,
+                native_model_id: "vendor/native-model".to_owned(),
+                canonical_id: Some("vendor/model-v1".to_owned()),
+                parameter: "max_tokens".to_owned(),
+                test_id: "max-tokens-test".to_owned(),
+                test_version: 1,
+                outcome: crate::ConformanceOutcome::Failed,
+                observed_unix_ms: 1,
+                detail: None,
+            }],
+        };
+        let mut pool = InferencePool::new().with_conformance_profile(profile);
+        pool.register(
+            "nvidia",
+            Arc::new(MockProvider {
+                source: "nvidia",
+                price: 0.0,
+                fail_execute: false,
+                calls,
+            }),
+        );
+        let request = InferenceRequest::new("vendor/native-model", "hi", 8);
+        let endpoints = pool.endpoints(&catalog(), &request).await?;
+        let endpoint = endpoints
+            .iter()
+            .find(|endpoint| endpoint.source == "nvidia")
+            .ok_or_else(|| ProviderError::Response("missing nvidia endpoint".to_owned()))?;
+        assert!(
+            endpoint
+                .capabilities
+                .rejected_parameters
+                .contains("max_tokens")
+        );
+        assert!(!endpoint.capabilities.supports_parameter("max_tokens"));
+        Ok(())
     }
 
     #[tokio::test]

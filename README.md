@@ -74,7 +74,7 @@ println!("{} via {} candidates", response.content, route.candidates.len());
 
 ## Long-lived stdio bridge
 
-`inference-redox-stdio` exposes the same normalized request and routing semantics to non-Rust callers as multiplexed JSONL. It keeps one provider instance and endpoint-catalog cache warm, supports concurrent in-flight `route` and `infer` requests keyed by caller IDs, and drains outstanding requests before shutdown. Credentials may come from the process environment or `--env-file <path>`.
+`inference-redox-stdio` exposes the same normalized request and routing semantics to non-Rust callers as multiplexed JSONL. It keeps provider instances, endpoint/model/benchmark caches, and a live conformance profile warm, supports concurrent in-flight requests keyed by caller IDs, and drains outstanding requests before shutdown. Credentials may come from the process environment or `--env-file <path>`.
 
 The bridge is deliberately thin: provider-specific request grammar, capability filtering, request-shape cost calculation, service-tier handling, fallback and retry policy remain in the Rust adapter rather than being reimplemented by callers.
 
@@ -93,6 +93,8 @@ Provider-native inventories are a separate input. A direct provider route is att
 This is intentionally not an availability model. A provider can advertise a model that is currently unhealthy or not entitled for a particular account, and multiple providers can expose the same canonical model under different names. Provider-local availability, health, quota and price observations belong to routing state, not model identity.
 
 Capabilities have three independent evidence layers. `adapter_parameters` says what inference-redox can actually encode on the wire; `supported_parameters` is the provider/catalog's nominal claim; versioned conformance observations can verify or reject claims for one execution-surface/provider/model scope. Effective support requires adapter support and either a provider claim or successful probe, while a failed probe vetoes both. This prevents optimistic provider metadata from advertising features the adapter cannot even send yet. Transient HTTP errors remain inconclusive rather than becoming negative capability evidence.
+
+The stdio `conformance` operation runs selected versioned probes (`basic_chat`, `system_role`, `json_object`, `strict_json_schema`, `reasoning_low`) against one explicitly selected source/model route. Optional `route_id` and `provider_key` selectors make ambiguous gateway routes fail closed instead of guessing. Returned observations are appended to the bridge's in-process `ConformanceProfile`; subsequent pool endpoint discovery applies that profile before capability filtering. Because stdio requests are multiplexed concurrently, callers that need probe evidence to affect a later request must wait for the conformance response before sending the dependent request.
 
 The stdio bridge exposes `models` and `resolve_model` alongside the existing OpenRouter-only `route` / `infer`. Experimental `route_pool` / `infer_pool` operations resolve canonical identity into native OpenRouter/NVIDIA routes and rank them together; keeping these opt-in avoids changing production callers before direct-provider health/quota learning is mature. Interactive requests admit standard + free routes by default. Batch is opt-in and cannot pass through synchronous `infer_pool`.
 
