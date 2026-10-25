@@ -112,10 +112,10 @@ pub(crate) fn supports_request(
         let parameter_supported = endpoint.capabilities.supports_parameter("reasoning")
             || endpoint.capabilities.supports_parameter("reasoning_effort");
         if !parameter_supported
-            || !endpoint
-                .capabilities
-                .reasoning
-                .supports(request.requirements.reasoning)
+            || !endpoint.capabilities.supports_reasoning_effort(
+                request.requirements.reasoning,
+                request.requirements.require_verified_reasoning,
+            )
         {
             return false;
         }

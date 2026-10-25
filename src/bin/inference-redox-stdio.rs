@@ -1419,6 +1419,7 @@ mod tests {
                 native_model_id: "openai/gpt-oss-120b".to_owned(),
                 canonical_id: Some("openai/gpt-oss-120b".to_owned()),
                 parameter: "chat_completions".to_owned(),
+                reasoning_effort: None,
                 test_id: "basic-chat".to_owned(),
                 test_version: 1,
                 outcome: ConformanceOutcome::Passed,

@@ -70,6 +70,8 @@ fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f6
             .collect(),
             verified_parameters: BTreeSet::new(),
             rejected_parameters: BTreeSet::new(),
+            verified_reasoning_efforts: BTreeSet::new(),
+            rejected_reasoning_efforts: BTreeSet::new(),
             reasoning: ReasoningSupport::GatewayNormalized,
             supports_implicit_caching: true,
         },
@@ -156,6 +158,74 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
     )?;
     assert_eq!(plan.candidates.len(), 1);
     assert_eq!(plan.candidates[0].endpoint.id, "capable");
+    Ok(())
+}
+
+#[test]
+fn verified_reasoning_requirement_rejects_nominal_only_support()
+-> Result<(), inference_redox::ProviderError> {
+    let mut route = endpoint("reasoning", 1e-6, 1e-6, 0.1, 100.0);
+    route.capabilities.reasoning = ReasoningSupport::GatewayNormalized;
+
+    let mut request = InferenceRequest::new("x/model", "x", 100);
+    request.prompt_tokens = Some(100);
+    request.requirements.reasoning = ReasoningEffort::High;
+    request.requirements.require_verified_reasoning = true;
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route.clone()],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+
+    route
+        .capabilities
+        .verified_reasoning_efforts
+        .insert(ReasoningEffort::High);
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn rejected_reasoning_effort_does_not_poison_other_levels()
+-> Result<(), inference_redox::ProviderError> {
+    let mut route = endpoint("reasoning", 1e-6, 1e-6, 0.1, 100.0);
+    route.capabilities.reasoning = ReasoningSupport::GatewayNormalized;
+    route
+        .capabilities
+        .rejected_reasoning_efforts
+        .insert(ReasoningEffort::High);
+
+    let mut low = InferenceRequest::new("x/model", "x", 100);
+    low.prompt_tokens = Some(100);
+    low.requirements.reasoning = ReasoningEffort::Low;
+    assert_eq!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &low,
+            vec![route.clone()],
+        )?
+        .candidates
+        .len(),
+        1
+    );
+
+    low.requirements.reasoning = ReasoningEffort::High;
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &low,
+            vec![route],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
     Ok(())
 }
 

@@ -187,6 +187,8 @@ impl InferenceProvider for KiloGateway {
                 supported_parameters: native.claimed_parameters.clone(),
                 verified_parameters: BTreeSet::new(),
                 rejected_parameters: BTreeSet::new(),
+                verified_reasoning_efforts: BTreeSet::new(),
+                rejected_reasoning_efforts: BTreeSet::new(),
                 reasoning: ReasoningSupport::None,
                 supports_implicit_caching: false,
             },

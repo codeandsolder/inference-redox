@@ -1441,6 +1441,8 @@ impl OpenRouterEndpoint {
                 supported_parameters: parameters,
                 verified_parameters: BTreeSet::new(),
                 rejected_parameters: BTreeSet::new(),
+                verified_reasoning_efforts: BTreeSet::new(),
+                rejected_reasoning_efforts: BTreeSet::new(),
                 reasoning,
                 supports_implicit_caching: self.supports_implicit_caching.unwrap_or(false),
             },

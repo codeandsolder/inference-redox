@@ -4,9 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Endpoint, EndpointCapabilities, InferenceProvider, InferenceRequest, InferenceResponse,
-    ProviderError, ReasoningEffort, RequestRequirements, ResponseSchema, RetryPolicy,
-    RouteCandidate, RoutePlan, approximate_prompt_tokens,
+    AgenticPolicy, Endpoint, EndpointCapabilities, InferenceProvider, InferenceRequest,
+    InferenceResponse, ProviderError, ReasoningEffort, RequestRequirements, ResponseSchema,
+    RetryPolicy, RouteCandidate, RoutePlan, approximate_prompt_tokens,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +24,12 @@ pub enum ConformanceProbe {
     SystemRole,
     JsonObject,
     StrictJsonSchema,
+    ReasoningMinimal,
     ReasoningLow,
+    ReasoningMedium,
+    ReasoningHigh,
+    ReasoningXhigh,
+    ReasoningMax,
 }
 
 impl ConformanceProbe {
@@ -35,13 +40,21 @@ impl ConformanceProbe {
             Self::SystemRole => "system-role",
             Self::JsonObject => "json-object",
             Self::StrictJsonSchema => "strict-json-schema",
+            Self::ReasoningMinimal => "reasoning-minimal",
             Self::ReasoningLow => "reasoning-low",
+            Self::ReasoningMedium => "reasoning-medium",
+            Self::ReasoningHigh => "reasoning-high",
+            Self::ReasoningXhigh => "reasoning-xhigh",
+            Self::ReasoningMax => "reasoning-max",
         }
     }
 
     #[must_use]
     pub const fn test_version(self) -> u32 {
-        1
+        match self.reasoning_effort() {
+            Some(_) => 3,
+            None => 1,
+        }
     }
 
     #[must_use]
@@ -51,7 +64,25 @@ impl ConformanceProbe {
             Self::SystemRole => "system_role",
             Self::JsonObject => "response_format",
             Self::StrictJsonSchema => "structured_outputs",
-            Self::ReasoningLow => "reasoning",
+            Self::ReasoningMinimal
+            | Self::ReasoningLow
+            | Self::ReasoningMedium
+            | Self::ReasoningHigh
+            | Self::ReasoningXhigh
+            | Self::ReasoningMax => "reasoning",
+        }
+    }
+
+    #[must_use]
+    pub const fn reasoning_effort(self) -> Option<ReasoningEffort> {
+        match self {
+            Self::ReasoningMinimal => Some(ReasoningEffort::Minimal),
+            Self::ReasoningLow => Some(ReasoningEffort::Low),
+            Self::ReasoningMedium => Some(ReasoningEffort::Medium),
+            Self::ReasoningHigh => Some(ReasoningEffort::High),
+            Self::ReasoningXhigh => Some(ReasoningEffort::Xhigh),
+            Self::ReasoningMax => Some(ReasoningEffort::Max),
+            Self::BasicChat | Self::SystemRole | Self::JsonObject | Self::StrictJsonSchema => None,
         }
     }
 
@@ -109,11 +140,20 @@ impl ConformanceProbe {
                 };
                 request
             }
-            Self::ReasoningLow => {
-                let mut request = InferenceRequest::new(model, "What is 2 + 2?", 16);
-                request.max_output_tokens = Some(256);
-                request.temperature = Some(0.0);
-                request.requirements.reasoning = ReasoningEffort::Low;
+            Self::ReasoningMinimal
+            | Self::ReasoningLow
+            | Self::ReasoningMedium
+            | Self::ReasoningHigh
+            | Self::ReasoningXhigh
+            | Self::ReasoningMax => {
+                let mut request = InferenceRequest::new(
+                    model,
+                    "What is 17 * 19? Reply with the number only.",
+                    16,
+                );
+                request.max_output_tokens = Some(512);
+                request.requirements.reasoning =
+                    self.reasoning_effort().unwrap_or(ReasoningEffort::None);
                 request
             }
         }
@@ -133,7 +173,13 @@ impl ConformanceProbe {
         let provider_key = endpoint.provider_key.clone();
         let endpoint_id = Some(endpoint.id.clone());
         let native_model_id = endpoint.model.clone();
-        let request = self.request(native_model_id.clone());
+        let mut request = self.request(native_model_id.clone());
+        if endpoint.workload_policy.agentic == AgenticPolicy::Required {
+            request.agentic = true;
+        }
+        if endpoint.workload_policy.requires_stable_session {
+            request.session_id = Some("inference-redox-conformance".to_owned());
+        }
         let prompt_tokens = request.prompt_tokens.unwrap_or_else(|| {
             request
                 .system_prompt
@@ -178,6 +224,7 @@ impl ConformanceProbe {
             native_model_id,
             canonical_id,
             parameter: self.parameter().to_owned(),
+            reasoning_effort: self.reasoning_effort(),
             test_id: self.test_id().to_owned(),
             test_version: self.test_version(),
             outcome,
@@ -197,7 +244,14 @@ impl ConformanceProbe {
                     Err("response JSON did not contain boolean ok=true".to_owned())
                 }
             }
-            Self::BasicChat | Self::SystemRole | Self::ReasoningLow => {
+            Self::BasicChat
+            | Self::SystemRole
+            | Self::ReasoningMinimal
+            | Self::ReasoningLow
+            | Self::ReasoningMedium
+            | Self::ReasoningHigh
+            | Self::ReasoningXhigh
+            | Self::ReasoningMax => {
                 if response.content.trim().is_empty() {
                     Err("response content was empty".to_owned())
                 } else {
@@ -268,6 +322,8 @@ pub struct ConformanceObservation {
     pub native_model_id: String,
     pub canonical_id: Option<String>,
     pub parameter: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub test_id: String,
     pub test_version: u32,
     pub outcome: ConformanceOutcome,
@@ -335,6 +391,18 @@ impl ConformanceProfile {
 }
 
 impl ConformanceObservation {
+    fn effective_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort.or(match self.test_id.as_str() {
+            "reasoning-minimal" => Some(ReasoningEffort::Minimal),
+            "reasoning-low" => Some(ReasoningEffort::Low),
+            "reasoning-medium" => Some(ReasoningEffort::Medium),
+            "reasoning-high" => Some(ReasoningEffort::High),
+            "reasoning-xhigh" => Some(ReasoningEffort::Xhigh),
+            "reasoning-max" => Some(ReasoningEffort::Max),
+            _ => None,
+        })
+    }
+
     fn matches_endpoint(&self, endpoint: &Endpoint) -> bool {
         self.source == endpoint.source
             && self.credential == endpoint.credential
@@ -377,7 +445,23 @@ fn apply_observations<'a>(
 
     let mut passed = BTreeSet::new();
     let mut failed = BTreeSet::new();
+    let mut reasoning_passed = BTreeSet::new();
+    let mut reasoning_failed = BTreeSet::new();
     for observation in latest.values() {
+        if let Some(effort) = observation.effective_reasoning_effort() {
+            match observation.outcome {
+                ConformanceOutcome::Passed => {
+                    reasoning_passed.insert(effort);
+                    // A successful level proves that the normalized reasoning control itself works.
+                    passed.insert("reasoning".to_owned());
+                }
+                ConformanceOutcome::Failed => {
+                    reasoning_failed.insert(effort);
+                }
+                ConformanceOutcome::Inconclusive => {}
+            }
+            continue;
+        }
         match observation.outcome {
             ConformanceOutcome::Passed => {
                 passed.insert(observation.parameter.clone());
@@ -396,6 +480,14 @@ fn apply_observations<'a>(
     for parameter in failed {
         capabilities.verified_parameters.remove(&parameter);
         capabilities.rejected_parameters.insert(parameter);
+    }
+    for effort in reasoning_passed.difference(&reasoning_failed) {
+        capabilities.rejected_reasoning_efforts.remove(effort);
+        capabilities.verified_reasoning_efforts.insert(*effort);
+    }
+    for effort in reasoning_failed {
+        capabilities.verified_reasoning_efforts.remove(&effort);
+        capabilities.rejected_reasoning_efforts.insert(effort);
     }
 }
 
@@ -462,6 +554,7 @@ mod tests {
             native_model_id: model.to_owned(),
             canonical_id: None,
             parameter: parameter.to_owned(),
+            reasoning_effort: None,
             test_id: test_id.to_owned(),
             test_version: version,
             outcome,
@@ -609,6 +702,99 @@ mod tests {
         .apply_to_endpoint(&mut route);
         assert!(route.capabilities.verified_parameters.contains("seed"));
         assert!(route.capabilities.rejected_parameters.is_empty());
+    }
+
+    #[test]
+    fn reasoning_evidence_is_scoped_to_exact_effort() {
+        let mut route = endpoint("endpoint", "model");
+        route
+            .capabilities
+            .supported_parameters
+            .insert("reasoning".to_owned());
+        route.capabilities.reasoning = crate::ReasoningSupport::GatewayNormalized;
+
+        let mut low = observation(
+            "endpoint",
+            "model",
+            "reasoning",
+            "reasoning-low",
+            3,
+            10,
+            ConformanceOutcome::Passed,
+        );
+        low.reasoning_effort = Some(ReasoningEffort::Low);
+        let mut high = observation(
+            "endpoint",
+            "model",
+            "reasoning",
+            "reasoning-high",
+            3,
+            10,
+            ConformanceOutcome::Failed,
+        );
+        high.reasoning_effort = Some(ReasoningEffort::High);
+
+        ConformanceProfile {
+            observations: vec![low, high],
+        }
+        .apply_to_endpoint(&mut route);
+
+        assert!(
+            route
+                .capabilities
+                .verified_reasoning_efforts
+                .contains(&ReasoningEffort::Low)
+        );
+        assert!(
+            route
+                .capabilities
+                .rejected_reasoning_efforts
+                .contains(&ReasoningEffort::High)
+        );
+        assert!(
+            route
+                .capabilities
+                .supports_reasoning_effort(ReasoningEffort::Low, true)
+        );
+        assert!(
+            !route
+                .capabilities
+                .supports_reasoning_effort(ReasoningEffort::High, false)
+        );
+        assert!(
+            route
+                .capabilities
+                .supports_reasoning_effort(ReasoningEffort::Medium, false)
+        );
+    }
+
+    #[test]
+    fn historical_reasoning_probe_ids_recover_effort_scope() {
+        let mut route = endpoint("endpoint", "model");
+        route
+            .capabilities
+            .supported_parameters
+            .insert("reasoning".to_owned());
+        route.capabilities.reasoning = crate::ReasoningSupport::GatewayNormalized;
+        ConformanceProfile {
+            observations: vec![observation(
+                "endpoint",
+                "model",
+                "reasoning",
+                "reasoning-low",
+                1,
+                10,
+                ConformanceOutcome::Failed,
+            )],
+        }
+        .apply_to_endpoint(&mut route);
+        assert!(
+            route
+                .capabilities
+                .rejected_reasoning_efforts
+                .contains(&ReasoningEffort::Low)
+        );
+        assert!(!route.capabilities.rejected_parameters.contains("reasoning"));
     }
 
     #[test]

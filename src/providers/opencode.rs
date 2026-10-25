@@ -610,6 +610,8 @@ impl InferenceProvider for OpenCodeConsole {
                 supported_parameters: model_metadata.claimed_parameters(),
                 verified_parameters: BTreeSet::new(),
                 rejected_parameters: BTreeSet::new(),
+                verified_reasoning_efforts: BTreeSet::new(),
+                rejected_reasoning_efforts: BTreeSet::new(),
                 reasoning: model_metadata.reasoning_support(),
                 supports_implicit_caching: false,
             },

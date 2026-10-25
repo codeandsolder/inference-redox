@@ -191,6 +191,12 @@ pub struct EndpointCapabilities {
     /// Parameters observed to fail despite provider/catalog claims.
     #[serde(default)]
     pub rejected_parameters: BTreeSet<String>,
+    /// Reasoning effort levels observed to work on this exact provider/model route.
+    #[serde(default)]
+    pub verified_reasoning_efforts: BTreeSet<ReasoningEffort>,
+    /// Reasoning effort levels observed to fail on this exact provider/model route.
+    #[serde(default)]
+    pub rejected_reasoning_efforts: BTreeSet<ReasoningEffort>,
     pub reasoning: ReasoningSupport,
     pub supports_implicit_caching: bool,
 }
@@ -215,6 +221,27 @@ impl EndpointCapabilities {
             .iter()
             .all(|parameter| self.supports_parameter(parameter))
     }
+
+    /// Effective support for one normalized reasoning effort. Exact conformance evidence
+    /// overrides nominal provider metadata. When `require_verified` is true, nominal metadata
+    /// alone is insufficient.
+    #[must_use]
+    pub fn supports_reasoning_effort(
+        &self,
+        effort: ReasoningEffort,
+        require_verified: bool,
+    ) -> bool {
+        if effort == ReasoningEffort::None {
+            return true;
+        }
+        if self.rejected_reasoning_efforts.contains(&effort) {
+            return false;
+        }
+        if self.verified_reasoning_efforts.contains(&effort) {
+            return true;
+        }
+        !require_verified && self.reasoning.supports(effort)
+    }
 }
 
 impl Default for EndpointCapabilities {
@@ -224,6 +251,8 @@ impl Default for EndpointCapabilities {
             supported_parameters: BTreeSet::new(),
             verified_parameters: BTreeSet::new(),
             rejected_parameters: BTreeSet::new(),
+            verified_reasoning_efforts: BTreeSet::new(),
+            rejected_reasoning_efforts: BTreeSet::new(),
             reasoning: ReasoningSupport::None,
             supports_implicit_caching: false,
         }
@@ -296,6 +325,9 @@ pub struct RequestRequirements {
     pub allowed_route_classes: BTreeSet<ModelRouteClass>,
     pub response_schema: Option<ResponseSchema>,
     pub reasoning: ReasoningEffort,
+    /// Require positive conformance evidence for the requested reasoning effort.
+    #[serde(default)]
+    pub require_verified_reasoning: bool,
     pub required_parameters: BTreeSet<String>,
     pub minimum_uptime_30m: Option<f64>,
 }
@@ -314,6 +346,7 @@ impl Default for RequestRequirements {
             allowed_route_classes: default_allowed_route_classes(),
             response_schema: None,
             reasoning: ReasoningEffort::None,
+            require_verified_reasoning: false,
             required_parameters: BTreeSet::new(),
             minimum_uptime_30m: Some(95.0),
         }
