@@ -45,10 +45,10 @@ pub use pool::{
 pub use provider::{ExecutionFailurePhase, InferenceProvider, ProviderError};
 pub use quota::{
     QuotaAdmission, QuotaAdmissionReport, QuotaAmount, QuotaAwareRoutePlan, QuotaCheck,
-    QuotaCheckStatus, QuotaDemand, QuotaGraph, QuotaLedger, QuotaMetric, QuotaObservation,
-    QuotaObservationApplyResult, QuotaObservationApplyStatus, QuotaObservationMap,
-    QuotaReservationId, QuotaResource, QuotaResourceId, QuotaRouteKey, QuotaScope,
-    QuotaUnknownPolicy,
+    QuotaCheckStatus, QuotaDemand, QuotaGraph, QuotaGraphSnapshot, QuotaLedger, QuotaMetric,
+    QuotaObservation, QuotaObservationApplyResult, QuotaObservationApplyStatus,
+    QuotaObservationBinding, QuotaObservationMap, QuotaReservationId, QuotaResource,
+    QuotaResourceId, QuotaRouteBinding, QuotaRouteKey, QuotaScope, QuotaUnknownPolicy,
 };
 pub use router::{approximate_prompt_tokens, build_route_plan, request_prompt_tokens};
 pub use suitability::{

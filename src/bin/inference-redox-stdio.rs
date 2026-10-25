@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use inference_redox::providers::{
     groq::GroqCloud, kilo::KiloGateway, nvidia::NvidiaNim, openrouter::OpenRouter,
@@ -11,8 +11,9 @@ use inference_redox::providers::{
 use inference_redox::{
     BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, ConformanceProbe,
     ConformanceProfile, InferencePool, InferenceProvider, InferenceRequest, ModelCatalog,
-    ModelLookup, ModelSuitabilityReport, ModelSuitabilityRequirements, ProviderError, RetryPolicy,
-    RoutingStrategy,
+    ModelLookup, ModelSuitabilityReport, ModelSuitabilityRequirements, ProviderError,
+    QuotaExecutionContext, QuotaGraph, QuotaGraphSnapshot, QuotaLedger, QuotaObservationBinding,
+    QuotaUnknownPolicy, RetryPolicy, RoutingStrategy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +28,9 @@ enum Operation {
     Route,
     InferPool,
     RoutePool,
+    InferPoolQuota,
+    RoutePoolQuota,
+    QuotaState,
     Models,
     ResolveModel,
     Suitability,
@@ -98,6 +102,8 @@ struct WireRequest {
     batch_id: Option<String>,
     #[serde(default)]
     fastest_response_cheap: Option<f64>,
+    #[serde(default)]
+    quota_unknown_policy: Option<QuotaUnknownPolicy>,
     retry: Option<WireRetryPolicy>,
 }
 
@@ -115,6 +121,12 @@ struct WireError {
     error: String,
 }
 
+#[derive(Debug, Serialize)]
+struct WireQuotaState {
+    graph: QuotaGraphSnapshot,
+    observation_bindings: Vec<QuotaObservationBinding>,
+}
+
 #[derive(Clone)]
 struct Providers {
     openrouter: Arc<OpenRouter>,
@@ -124,6 +136,7 @@ struct Providers {
     conformance: Arc<Mutex<ConformanceProfile>>,
     conformance_probe_lock: Arc<Mutex<()>>,
     conformance_cache_path: Arc<PathBuf>,
+    quota: Arc<Mutex<QuotaLedger>>,
 }
 
 impl Providers {
@@ -179,6 +192,12 @@ impl Providers {
             _ => None,
         }
     }
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 async fn suitability_reports(
@@ -608,6 +627,129 @@ async fn handle_pool_operation(
     }
 }
 
+async fn handle_quota_pool_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let WireRequest {
+        id,
+        op,
+        request,
+        fastest_response_cheap,
+        quota_unknown_policy,
+        retry,
+        ..
+    } = wire;
+    let Some(request) = request else {
+        write_error(stdout, id, "quota pool operation requires request").await;
+        return;
+    };
+    let Some(multiplier) = fastest_response_cheap else {
+        write_error(
+            stdout,
+            id,
+            "quota pool operation requires fastest_response_cheap",
+        )
+        .await;
+        return;
+    };
+    let Some(unknown_policy) = quota_unknown_policy else {
+        write_error(
+            stdout,
+            id,
+            "quota pool operation requires quota_unknown_policy",
+        )
+        .await;
+        return;
+    };
+    let catalog = match providers.catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            write_error(stdout, id, error.to_string()).await;
+            return;
+        }
+    };
+    let pool = providers.pool().await;
+    let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
+    let now_unix = unix_time_seconds();
+    let mut ledger = providers.quota.lock().await;
+    match op {
+        Operation::RoutePoolQuota => {
+            match pool
+                .route_with_quota(
+                    &catalog,
+                    strategy,
+                    &request,
+                    &mut ledger,
+                    unknown_policy,
+                    now_unix,
+                )
+                .await
+            {
+                Ok(result) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result,
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        Operation::InferPoolQuota => {
+            let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
+            let quota = QuotaExecutionContext {
+                unknown_policy,
+                now_unix,
+            };
+            match pool
+                .infer_with_quota(&catalog, strategy, &request, retry, &mut ledger, quota)
+                .await
+            {
+                Ok(result) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result,
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_quota_state_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    id: Value,
+) {
+    let ledger = providers.quota.lock().await;
+    let result = WireQuotaState {
+        graph: ledger.graph().snapshot(),
+        observation_bindings: ledger.observation_map().snapshot(),
+    };
+    write_json(
+        stdout,
+        &WireSuccess {
+            id,
+            ok: true,
+            result,
+        },
+    )
+    .await;
+}
+
 async fn handle_openrouter_operation(
     providers: &Providers,
     stdout: &Arc<Mutex<tokio::io::Stdout>>,
@@ -688,6 +830,12 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
         }
         Operation::RoutePool | Operation::InferPool => {
             handle_pool_operation(&providers, &stdout, request).await;
+        }
+        Operation::RoutePoolQuota | Operation::InferPoolQuota => {
+            handle_quota_pool_operation(&providers, &stdout, request).await;
+        }
+        Operation::QuotaState => {
+            handle_quota_state_operation(&providers, &stdout, request.id).await;
         }
         Operation::Route | Operation::Infer => {
             handle_openrouter_operation(&providers, &stdout, request).await;
@@ -838,6 +986,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         conformance: Arc::new(Mutex::new(conformance)),
         conformance_probe_lock: Arc::new(Mutex::new(())),
         conformance_cache_path: Arc::new(conformance_cache_path),
+        quota: Arc::new(Mutex::new(QuotaLedger::new(QuotaGraph::new()))),
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
@@ -876,7 +1025,9 @@ mod tests {
         BenchmarkSource, BenchmarkTaskType, Operation, WireRequest, key_from_contents,
         load_conformance_profile, save_conformance_profile,
     };
-    use inference_redox::{ConformanceObservation, ConformanceOutcome, ConformanceProfile};
+    use inference_redox::{
+        ConformanceObservation, ConformanceOutcome, ConformanceProfile, QuotaUnknownPolicy,
+    };
     use serde_json::json;
     use std::fs;
     use std::process;
@@ -1022,6 +1173,31 @@ mod tests {
         let loaded = load_conformance_profile(&path).map_err(|error| error.to_string())?;
         let _ = fs::remove_file(&path);
         assert_eq!(loaded, profile);
+        Ok(())
+    }
+
+    #[test]
+    fn quota_pool_wire_request_requires_explicit_policy_shape() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 6,
+            "op": "route_pool_quota",
+            "fastest_response_cheap": 1.5,
+            "quota_unknown_policy": "reject",
+            "request": {
+                "model": "openai/gpt-oss-120b",
+                "prompt": "hi",
+                "expected_output_tokens": 8,
+                "requirements": {
+                    "allowed_route_classes": ["free"],
+                    "response_schema": null,
+                    "reasoning": "none",
+                    "required_parameters": [],
+                    "minimum_uptime_30m": null
+                }
+            }
+        }))?;
+        assert!(matches!(wire.op, Operation::RoutePoolQuota));
+        assert_eq!(wire.quota_unknown_policy, Some(QuotaUnknownPolicy::Reject));
         Ok(())
     }
 

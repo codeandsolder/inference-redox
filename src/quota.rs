@@ -249,10 +249,37 @@ pub struct QuotaGraph {
     bindings: BTreeMap<QuotaRouteKey, BTreeSet<QuotaResourceId>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaRouteBinding {
+    pub route: QuotaRouteKey,
+    pub resource_ids: Vec<QuotaResourceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaGraphSnapshot {
+    pub resources: Vec<QuotaResource>,
+    pub bindings: Vec<QuotaRouteBinding>,
+}
+
 impl QuotaGraph {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> QuotaGraphSnapshot {
+        QuotaGraphSnapshot {
+            resources: self.resources.values().cloned().collect(),
+            bindings: self
+                .bindings
+                .iter()
+                .map(|(route, resource_ids)| QuotaRouteBinding {
+                    route: route.clone(),
+                    resource_ids: resource_ids.iter().cloned().collect(),
+                })
+                .collect(),
+        }
     }
 
     pub fn insert_resource(&mut self, resource: QuotaResource) {
@@ -317,10 +344,29 @@ pub struct QuotaObservationApplyResult {
     pub remaining_refreshed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaObservationBinding {
+    pub route: QuotaRouteKey,
+    pub bucket: String,
+    pub resource_id: QuotaResourceId,
+}
+
 impl QuotaObservationMap {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<QuotaObservationBinding> {
+        self.bindings
+            .iter()
+            .map(|((route, bucket), resource_id)| QuotaObservationBinding {
+                route: route.clone(),
+                bucket: bucket.clone(),
+                resource_id: resource_id.clone(),
+            })
+            .collect()
     }
 
     pub fn bind(
@@ -1257,5 +1303,31 @@ mod tests {
                 .admission,
             QuotaAdmission::Admitted
         );
+    }
+
+    #[test]
+    fn quota_snapshots_are_json_safe_with_structured_route_keys() -> Result<(), serde_json::Error> {
+        let route = route("key-a");
+        let resource = QuotaResource::unknown(
+            "provider/account/requests",
+            QuotaScope::Account,
+            QuotaMetric::Requests,
+        );
+        let resource_id = resource.id.clone();
+        let mut graph = QuotaGraph::new();
+        graph.insert_resource(resource);
+        assert!(graph.bind(route.clone(), &resource_id));
+        let mut observations = QuotaObservationMap::new();
+        observations.bind(route, "rate_limit.requests", resource_id);
+        let graph_json = serde_json::to_value(graph.snapshot())?;
+        let observation_json = serde_json::to_value(observations.snapshot())?;
+        assert!(
+            graph_json
+                .get("bindings")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+        );
+        assert!(observation_json.as_array().is_some());
+        Ok(())
     }
 }
