@@ -1,8 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ModelCatalog, ModelCatalogEntry, ModelRouteClass};
+use crate::{
+    BenchmarkCatalog, BenchmarkObservation, BenchmarkSource, BenchmarkTaskType, BenchmarkUnit,
+    ModelCatalog, ModelCatalogEntry, ModelRouteClass,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,11 +23,44 @@ pub enum BenchmarkKind {
     Agentic,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkAggregation {
+    /// Require exactly one matching observation. Multiple configurations stay ambiguous.
+    #[default]
+    Unique,
+    /// Use the highest score among matching observations.
+    Best,
+    /// Use the lowest score among matching observations.
+    Worst,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkRequirement {
+    pub source: BenchmarkSource,
+    pub task_type: BenchmarkTaskType,
+    pub metric: String,
+    pub unit: BenchmarkUnit,
+    pub minimum: f64,
+    /// Exact evaluated-configuration label when one specific configuration is required.
+    pub configuration: Option<String>,
+    /// Required qualifier subset, e.g. Design Arena `arena=models` + `category=codecategories`.
+    #[serde(default)]
+    pub qualifiers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub aggregation: BenchmarkAggregation,
+    /// Stale cache fallback is excluded by default.
+    #[serde(default)]
+    pub allow_stale: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelSuitabilityRequirements {
     pub minimum_intelligence_index: Option<f64>,
     pub minimum_coding_index: Option<f64>,
     pub minimum_agentic_index: Option<f64>,
+    #[serde(default)]
+    pub benchmark_requirements: Vec<BenchmarkRequirement>,
     #[serde(default)]
     pub required_input_modalities: BTreeSet<String>,
     #[serde(default)]
@@ -42,6 +78,13 @@ pub enum SuitabilityCheck {
     Benchmark {
         benchmark: BenchmarkKind,
         minimum: f64,
+        observed: Option<f64>,
+        status: SuitabilityStatus,
+    },
+    RichBenchmark {
+        requirement: BenchmarkRequirement,
+        matched_observations: usize,
+        snapshot_stale: bool,
         observed: Option<f64>,
         status: SuitabilityStatus,
     },
@@ -66,6 +109,7 @@ impl SuitabilityCheck {
     fn status(&self) -> SuitabilityStatus {
         match self {
             Self::Benchmark { status, .. }
+            | Self::RichBenchmark { status, .. }
             | Self::InputModality { status, .. }
             | Self::OutputModality { status, .. }
             | Self::ModelParameter { status, .. }
@@ -86,7 +130,33 @@ pub struct ModelSuitabilityReport {
 impl ModelSuitabilityRequirements {
     #[must_use]
     pub fn evaluate(&self, entry: &ModelCatalogEntry) -> ModelSuitabilityReport {
+        self.evaluate_with_optional_benchmarks(entry, None)
+    }
+
+    #[must_use]
+    pub fn evaluate_with_benchmarks(
+        &self,
+        entry: &ModelCatalogEntry,
+        benchmarks: &BenchmarkCatalog,
+    ) -> ModelSuitabilityReport {
+        self.evaluate_with_optional_benchmarks(entry, Some(benchmarks))
+    }
+
+    #[must_use]
+    pub fn benchmark_queries(&self) -> BTreeSet<(BenchmarkSource, BenchmarkTaskType)> {
+        self.benchmark_requirements
+            .iter()
+            .map(|requirement| (requirement.source, requirement.task_type))
+            .collect()
+    }
+
+    fn evaluate_with_optional_benchmarks(
+        &self,
+        entry: &ModelCatalogEntry,
+        benchmarks: Option<&BenchmarkCatalog>,
+    ) -> ModelSuitabilityReport {
         let mut checks = self.benchmark_checks(entry);
+        checks.extend(self.rich_benchmark_checks(entry, benchmarks));
         checks.extend(self.modality_checks(entry));
         checks.extend(self.parameter_checks(entry));
         if self.require_reasoning {
@@ -134,6 +204,63 @@ impl ModelSuitabilityRequirements {
         .collect()
     }
 
+    fn rich_benchmark_checks(
+        &self,
+        entry: &ModelCatalogEntry,
+        benchmarks: Option<&BenchmarkCatalog>,
+    ) -> Vec<SuitabilityCheck> {
+        self.benchmark_requirements
+            .iter()
+            .cloned()
+            .map(|requirement| {
+                let snapshot_stale = benchmarks
+                    .and_then(|catalog| {
+                        catalog.snapshots.iter().find(|meta| {
+                            meta.source == requirement.source
+                                && meta.task_type == requirement.task_type
+                        })
+                    })
+                    .is_some_and(|meta| meta.stale);
+                let matches = benchmarks.map_or_else(Vec::new, |catalog| {
+                    catalog
+                        .observations
+                        .iter()
+                        .filter(|observation| {
+                            observation.canonical_id == entry.canonical_id
+                                && observation.source == requirement.source
+                                && observation.task_type == requirement.task_type
+                                && observation.metric == requirement.metric
+                                && observation.unit == requirement.unit
+                                && requirement
+                                    .configuration
+                                    .as_ref()
+                                    .is_none_or(|configuration| {
+                                        observation.configuration.as_ref() == Some(configuration)
+                                    })
+                                && requirement.qualifiers.iter().all(|(key, value)| {
+                                    observation.qualifiers.get(key) == Some(value)
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let matched_observations = matches.len();
+                let observed = if snapshot_stale && !requirement.allow_stale {
+                    None
+                } else {
+                    aggregate_benchmark_observations(&matches, requirement.aggregation)
+                };
+                let status = threshold_status(observed, requirement.minimum);
+                SuitabilityCheck::RichBenchmark {
+                    requirement,
+                    matched_observations,
+                    snapshot_stale,
+                    observed,
+                    status,
+                }
+            })
+            .collect()
+    }
+
     fn modality_checks(&self, entry: &ModelCatalogEntry) -> Vec<SuitabilityCheck> {
         self.required_input_modalities
             .iter()
@@ -160,19 +287,40 @@ impl ModelSuitabilityRequirements {
             .collect()
     }
 }
-
 impl ModelCatalog {
-    /// Evaluate one metadata representative per canonical model.
+    /// Evaluate one metadata representative per canonical model without external benchmark snapshots.
     #[must_use]
     pub fn suitability_reports(
         &self,
         requirements: &ModelSuitabilityRequirements,
     ) -> Vec<ModelSuitabilityReport> {
+        self.suitability_reports_inner(requirements, None)
+    }
+
+    /// Evaluate one metadata representative per canonical model with rich benchmark evidence.
+    #[must_use]
+    pub fn suitability_reports_with_benchmarks(
+        &self,
+        requirements: &ModelSuitabilityRequirements,
+        benchmarks: &BenchmarkCatalog,
+    ) -> Vec<ModelSuitabilityReport> {
+        self.suitability_reports_inner(requirements, Some(benchmarks))
+    }
+
+    fn suitability_reports_inner(
+        &self,
+        requirements: &ModelSuitabilityRequirements,
+        benchmarks: Option<&BenchmarkCatalog>,
+    ) -> Vec<ModelSuitabilityReport> {
         self.canonical_models()
             .into_iter()
             .filter_map(|model| {
-                self.metadata_entry(&model.canonical_id)
-                    .map(|entry| requirements.evaluate(entry))
+                self.metadata_entry(&model.canonical_id).map(|entry| {
+                    benchmarks.map_or_else(
+                        || requirements.evaluate(entry),
+                        |catalog| requirements.evaluate_with_benchmarks(entry, catalog),
+                    )
+                })
             })
             .collect()
     }
@@ -190,6 +338,23 @@ impl ModelCatalog {
                 };
                 (source_rank, route_rank, entry.id.len(), entry.id.as_str())
             })
+    }
+}
+
+fn aggregate_benchmark_observations(
+    observations: &[&BenchmarkObservation],
+    aggregation: BenchmarkAggregation,
+) -> Option<f64> {
+    match aggregation {
+        BenchmarkAggregation::Unique => (observations.len() == 1).then(|| observations[0].score),
+        BenchmarkAggregation::Best => observations
+            .iter()
+            .map(|observation| observation.score)
+            .max_by(f64::total_cmp),
+        BenchmarkAggregation::Worst => observations
+            .iter()
+            .map(|observation| observation.score)
+            .min_by(f64::total_cmp),
     }
 }
 
@@ -337,6 +502,121 @@ mod tests {
         };
         assert_eq!(
             requirements.evaluate(&model).status,
+            SuitabilityStatus::Suitable
+        );
+    }
+
+    fn rich_catalog(scores: &[f64], stale: bool) -> BenchmarkCatalog {
+        BenchmarkCatalog {
+            snapshots: vec![crate::BenchmarkSnapshotMeta {
+                source: BenchmarkSource::DesignArena,
+                task_type: BenchmarkTaskType::Coding,
+                as_of: Some("now".to_owned()),
+                citation: None,
+                source_url: None,
+                version: Some("v1".to_owned()),
+                model_count: Some(1),
+                stale,
+            }],
+            observations: scores
+                .iter()
+                .enumerate()
+                .map(|(index, score)| BenchmarkObservation {
+                    canonical_id: "vendor/model-v1".to_owned(),
+                    source: BenchmarkSource::DesignArena,
+                    task_type: BenchmarkTaskType::Coding,
+                    metric: "design_arena_elo".to_owned(),
+                    score: *score,
+                    unit: BenchmarkUnit::Elo,
+                    configuration: Some(format!("config-{index}")),
+                    qualifiers: BTreeMap::from([("arena".to_owned(), "models".to_owned())]),
+                    sample_count: None,
+                    standard_deviation: None,
+                    average_cost_usd: None,
+                    average_generation_time_ms: None,
+                    observed_at: Some("now".to_owned()),
+                })
+                .collect(),
+        }
+    }
+
+    fn rich_requirement(aggregation: BenchmarkAggregation) -> BenchmarkRequirement {
+        BenchmarkRequirement {
+            source: BenchmarkSource::DesignArena,
+            task_type: BenchmarkTaskType::Coding,
+            metric: "design_arena_elo".to_owned(),
+            unit: BenchmarkUnit::Elo,
+            minimum: 1_300.0,
+            configuration: None,
+            qualifiers: BTreeMap::from([("arena".to_owned(), "models".to_owned())]),
+            aggregation,
+            allow_stale: false,
+        }
+    }
+
+    #[test]
+    fn rich_benchmark_unique_keeps_multiple_configurations_unknown() {
+        let model = entry("openrouter", "vendor/model", ModelRouteClass::Standard);
+        let requirements = ModelSuitabilityRequirements {
+            benchmark_requirements: vec![rich_requirement(BenchmarkAggregation::Unique)],
+            ..ModelSuitabilityRequirements::default()
+        };
+        let report = requirements
+            .evaluate_with_benchmarks(&model, &rich_catalog(&[1_250.0, 1_400.0], false));
+        assert_eq!(report.status, SuitabilityStatus::Unknown);
+        assert!(matches!(
+            &report.checks[0],
+            SuitabilityCheck::RichBenchmark {
+                matched_observations: 2,
+                observed: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rich_benchmark_best_is_explicit_opt_in() {
+        let model = entry("openrouter", "vendor/model", ModelRouteClass::Standard);
+        let requirements = ModelSuitabilityRequirements {
+            benchmark_requirements: vec![rich_requirement(BenchmarkAggregation::Best)],
+            ..ModelSuitabilityRequirements::default()
+        };
+        let report = requirements
+            .evaluate_with_benchmarks(&model, &rich_catalog(&[1_250.0, 1_400.0], false));
+        assert_eq!(report.status, SuitabilityStatus::Suitable);
+        assert!(matches!(
+            &report.checks[0],
+            SuitabilityCheck::RichBenchmark {
+                observed: Some(value),
+                status: SuitabilityStatus::Suitable,
+                ..
+            } if (*value - 1_400.0).abs() < f64::EPSILON
+        ));
+    }
+
+    #[test]
+    fn stale_rich_benchmark_requires_explicit_opt_in() {
+        let model = entry("openrouter", "vendor/model", ModelRouteClass::Standard);
+        let mut requirement = rich_requirement(BenchmarkAggregation::Best);
+        let requirements = ModelSuitabilityRequirements {
+            benchmark_requirements: vec![requirement.clone()],
+            ..ModelSuitabilityRequirements::default()
+        };
+        assert_eq!(
+            requirements
+                .evaluate_with_benchmarks(&model, &rich_catalog(&[1_400.0], true))
+                .status,
+            SuitabilityStatus::Unknown
+        );
+        requirement.allow_stale = true;
+        let requirements = ModelSuitabilityRequirements {
+            benchmark_requirements: vec![requirement],
+            ..ModelSuitabilityRequirements::default()
+        };
+        assert_eq!(
+            requirements
+                .evaluate_with_benchmarks(&model, &rich_catalog(&[1_400.0], true))
+                .status,
             SuitabilityStatus::Suitable
         );
     }

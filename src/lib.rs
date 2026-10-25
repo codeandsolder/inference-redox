@@ -52,6 +52,6 @@ pub use quota::{
 };
 pub use router::{approximate_prompt_tokens, build_route_plan, request_prompt_tokens};
 pub use suitability::{
-    BenchmarkKind, ModelSuitabilityReport, ModelSuitabilityRequirements, SuitabilityCheck,
-    SuitabilityStatus,
+    BenchmarkAggregation, BenchmarkKind, BenchmarkRequirement, ModelSuitabilityReport,
+    ModelSuitabilityRequirements, SuitabilityCheck, SuitabilityStatus,
 };

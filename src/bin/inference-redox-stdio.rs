@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use inference_redox::providers::{nvidia::NvidiaNim, openrouter::OpenRouter};
 use inference_redox::{
-    BatchInferenceItem, BenchmarkSource, BenchmarkTaskType, InferencePool, InferenceProvider,
-    InferenceRequest, ModelCatalog, ModelSuitabilityRequirements, ProviderError, RetryPolicy,
-    RoutingStrategy,
+    BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, InferencePool,
+    InferenceProvider, InferenceRequest, ModelCatalog, ModelSuitabilityReport,
+    ModelSuitabilityRequirements, ProviderError, RetryPolicy, RoutingStrategy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -122,6 +122,18 @@ impl Providers {
     }
 }
 
+async fn suitability_reports(
+    providers: &Providers,
+    requirements: &ModelSuitabilityRequirements,
+) -> Result<Vec<ModelSuitabilityReport>, ProviderError> {
+    let catalog = providers.catalog().await?;
+    let mut benchmarks = BenchmarkCatalog::default();
+    for (source, task_type) in requirements.benchmark_queries() {
+        benchmarks.ingest(providers.openrouter.benchmarks(source, task_type).await?);
+    }
+    Ok(catalog.suitability_reports_with_benchmarks(requirements, &benchmarks))
+}
+
 async fn write_json<T: Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
     let Ok(mut bytes) = serde_json::to_vec(value) else {
         return;
@@ -178,14 +190,14 @@ async fn handle_catalog_operation(
                 write_error(stdout, id, "suitability requires suitability").await;
                 return;
             };
-            match providers.catalog().await {
-                Ok(catalog) => {
+            match suitability_reports(providers, &requirements).await {
+                Ok(result) => {
                     write_json(
                         stdout,
                         &WireSuccess {
                             id,
                             ok: true,
-                            result: catalog.suitability_reports(&requirements),
+                            result,
                         },
                     )
                     .await;
@@ -630,6 +642,38 @@ mod tests {
             wire.suitability
                 .and_then(|value| value.minimum_coding_index),
             Some(50.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rich_benchmark_suitability_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 3,
+            "op": "suitability",
+            "suitability": {
+                "benchmark_requirements": [{
+                    "source": "design-arena",
+                    "task_type": "coding",
+                    "metric": "design_arena_elo",
+                    "unit": "elo",
+                    "minimum": 1300.0,
+                    "configuration": null,
+                    "qualifiers": {"arena": "models", "category": "codecategories"},
+                    "aggregation": "best"
+                }]
+            }
+        }))?;
+        assert_eq!(
+            wire.suitability
+                .as_ref()
+                .map(|requirements| requirements.benchmark_queries().len()),
+            Some(1)
+        );
+        assert_eq!(
+            wire.suitability
+                .map(|requirements| requirements.benchmark_requirements.len()),
+            Some(1)
         );
         Ok(())
     }
