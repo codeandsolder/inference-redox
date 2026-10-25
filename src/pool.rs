@@ -6,10 +6,11 @@ use thiserror::Error;
 
 use crate::router::supports_request;
 use crate::{
-    ConformanceProfile, InferenceProvider, InferenceRequest, InferenceResponse, ModelCatalog,
-    ModelLookup, ModelRouteClass, ProviderError, QuotaAdmission, QuotaAdmissionReport,
-    QuotaAwareRoutePlan, QuotaDemand, QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy,
-    RouteCandidate, RoutePlan, RoutingStrategy, build_route_plan, request_prompt_tokens,
+    ConformanceProfile, InferenceProvider, InferenceRequest, InferenceRequestTemplate,
+    InferenceResponse, ModelCatalog, ModelLookup, ModelRouteClass, ModelRouteSelectionCandidate,
+    ProviderError, QuotaAdmission, QuotaAdmissionReport, QuotaAwareRoutePlan, QuotaDemand,
+    QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy, RouteCandidate, RoutePlan,
+    RoutingStrategy, build_route_plan, request_prompt_tokens,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,6 +59,39 @@ pub(crate) struct QuotaEndpointDiscovery {
 pub struct QuotaExecutionContext {
     pub unknown_policy: QuotaUnknownPolicy,
     pub now_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SelectedRouteExecutionPolicy {
+    pub quota_unknown_policy: QuotaUnknownPolicy,
+    pub now_unix: u64,
+    pub max_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectedRouteValidation {
+    pub candidate: RouteCandidate,
+    /// Worst-case request cost using `max_output_tokens` when supplied.
+    pub maximum_cost_usd: f64,
+    pub quota: QuotaAdmissionReport,
+}
+
+#[derive(Debug, Error)]
+pub enum SelectedRouteExecutionError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error("selected route is no longer available: {0}")]
+    RouteUnavailable(String),
+    #[error("selected route is a batch route and requires the batch lifecycle")]
+    BatchRoute,
+    #[error("revalidated maximum request cost {cost_usd} USD exceeds maximum {maximum_usd} USD")]
+    CostExceeded { cost_usd: f64, maximum_usd: f64 },
+    #[error("invalid selected-route execution policy: {0}")]
+    InvalidPolicy(String),
+    #[error("selected route has no quota admission: {report:?}")]
+    QuotaUnavailable { report: Box<QuotaAdmissionReport> },
+    #[error("quota accounting invariant failed: {0}")]
+    Accounting(String),
 }
 
 #[derive(Debug, Error)]
@@ -342,6 +376,170 @@ impl InferencePool {
             plan,
             quota_reports: discovery.reports,
         })
+    }
+
+    /// Revalidate one previously selected concrete route against current endpoint, capability,
+    /// pricing, and quota evidence.
+    ///
+    /// # Errors
+    /// Returns an error when the exact route disappeared, the request shape no longer fits,
+    /// the current expected cost exceeds policy, or quota does not admit the route.
+    pub async fn revalidate_selected_with_quota(
+        &self,
+        catalog: &ModelCatalog,
+        selected: &ModelRouteSelectionCandidate,
+        request_template: &InferenceRequestTemplate,
+        ledger: &mut QuotaLedger,
+        policy: SelectedRouteExecutionPolicy,
+    ) -> Result<SelectedRouteValidation, SelectedRouteExecutionError> {
+        if !policy.max_cost_usd.is_finite() || policy.max_cost_usd < 0.0 {
+            return Err(SelectedRouteExecutionError::InvalidPolicy(
+                "max_cost_usd must be finite and non-negative".to_owned(),
+            ));
+        }
+        let request = request_template.for_model(selected.canonical_id.clone());
+        let endpoints = self.endpoints(catalog, &request).await?;
+        let wanted = &selected.route.endpoint;
+        let endpoint = endpoints
+            .into_iter()
+            .find(|endpoint| {
+                endpoint.source == wanted.source
+                    && endpoint.credential == wanted.credential
+                    && endpoint.provider_key == wanted.provider_key
+                    && endpoint.id == wanted.id
+                    && endpoint.model == wanted.model
+                    && endpoint.route_class == wanted.route_class
+            })
+            .ok_or_else(|| {
+                SelectedRouteExecutionError::RouteUnavailable(format!(
+                    "{}/{}/{}",
+                    wanted.source, wanted.provider_key, wanted.model
+                ))
+            })?;
+        let current_plan = build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.0),
+            &request,
+            vec![endpoint],
+        )?;
+        let Some(candidate) = current_plan.candidates.into_iter().next() else {
+            return Err(SelectedRouteExecutionError::RouteUnavailable(
+                selected.canonical_id.clone(),
+            ));
+        };
+        let maximum_output_tokens = request
+            .max_output_tokens
+            .unwrap_or(request.expected_output_tokens);
+        let maximum_cost_usd = candidate
+            .endpoint
+            .pricing
+            .expected_cost(current_plan.prompt_tokens, maximum_output_tokens);
+        if !maximum_cost_usd.is_finite() || maximum_cost_usd < 0.0 {
+            return Err(SelectedRouteExecutionError::InvalidPolicy(
+                "revalidated route produced a non-finite or negative maximum cost".to_owned(),
+            ));
+        }
+        if maximum_cost_usd > policy.max_cost_usd + f64::EPSILON {
+            return Err(SelectedRouteExecutionError::CostExceeded {
+                cost_usd: maximum_cost_usd,
+                maximum_usd: policy.max_cost_usd,
+            });
+        }
+        let route = QuotaRouteKey::from_endpoint(&candidate.endpoint);
+        let instance = ProviderInstanceKey::new(
+            candidate.endpoint.source.clone(),
+            candidate.endpoint.credential.clone(),
+        );
+        let provider = self.providers.get(&instance).ok_or_else(|| {
+            SelectedRouteExecutionError::RouteUnavailable(selected.canonical_id.clone())
+        })?;
+        provider.configure_quota_route(&route, ledger)?;
+        let report = ledger.evaluate(&route, QuotaDemand::for_request(&request), policy.now_unix);
+        let admitted = match report.admission {
+            QuotaAdmission::Admitted => true,
+            QuotaAdmission::Indeterminate => {
+                policy.quota_unknown_policy == QuotaUnknownPolicy::Allow
+            }
+            QuotaAdmission::Rejected => false,
+        };
+        if !admitted {
+            return Err(SelectedRouteExecutionError::QuotaUnavailable {
+                report: Box::new(report),
+            });
+        }
+        Ok(SelectedRouteValidation {
+            candidate,
+            maximum_cost_usd,
+            quota: report,
+        })
+    }
+
+    /// Execute one exact previously selected synchronous route after fresh revalidation.
+    ///
+    /// # Errors
+    /// Returns revalidation, quota-accounting, provider-execution, or batch-lifecycle errors.
+    pub async fn infer_selected_with_quota(
+        &self,
+        catalog: &ModelCatalog,
+        selected: &ModelRouteSelectionCandidate,
+        request_template: &InferenceRequestTemplate,
+        retry: RetryPolicy,
+        ledger: &mut QuotaLedger,
+        policy: SelectedRouteExecutionPolicy,
+    ) -> Result<QuotaPooledInferenceResponse, SelectedRouteExecutionError> {
+        if selected.route.endpoint.route_class == ModelRouteClass::Batch {
+            return Err(SelectedRouteExecutionError::BatchRoute);
+        }
+        let validation = self
+            .revalidate_selected_with_quota(catalog, selected, request_template, ledger, policy)
+            .await?;
+        let candidate = validation.candidate.clone();
+        let route = QuotaRouteKey::from_endpoint(&candidate.endpoint);
+        let request = request_template.for_model(candidate.endpoint.model.clone());
+        let demand = QuotaDemand::for_request(&request);
+        let reservation = ledger
+            .reserve_with_policy(&route, demand, policy.now_unix, policy.quota_unknown_policy)
+            .map_err(|report| SelectedRouteExecutionError::QuotaUnavailable { report })?;
+        let instance = ProviderInstanceKey::new(
+            candidate.endpoint.source.clone(),
+            candidate.endpoint.credential.clone(),
+        );
+        let provider = self.providers.get(&instance).ok_or_else(|| {
+            SelectedRouteExecutionError::RouteUnavailable(selected.canonical_id.clone())
+        })?;
+        let plan = RoutePlan {
+            prompt_tokens: request_prompt_tokens(&request),
+            expected_output_tokens: request.expected_output_tokens,
+            cheapest_cost_usd: candidate.expected_cost_usd,
+            cost_ceiling_usd: candidate.expected_cost_usd,
+            candidates: vec![candidate.clone()],
+        };
+        match provider.execute_plan(&request, &plan, retry).await {
+            Ok(response) => {
+                commit_successful_quota(
+                    ledger,
+                    reservation,
+                    &route,
+                    demand,
+                    &response,
+                    policy.now_unix,
+                )
+                .map_err(|error| SelectedRouteExecutionError::Accounting(error.to_string()))?;
+                Ok(QuotaPooledInferenceResponse {
+                    quota_plan: QuotaAwareRoutePlan {
+                        plan,
+                        quota_reports: vec![validation.quota],
+                    },
+                    selected: candidate,
+                    response,
+                })
+            }
+            Err(error) => {
+                settle_failed_quota(ledger, reservation, &route, &error, policy.now_unix).map_err(
+                    |accounting| SelectedRouteExecutionError::Accounting(accounting.to_string()),
+                )?;
+                Err(SelectedRouteExecutionError::Provider(error))
+            }
+        }
     }
 
     /// Execute a synchronous route with quota reservation and conservative post-call accounting.
@@ -675,7 +873,11 @@ mod tests {
             canonical_id: "vendor/model-v1".to_owned(),
             name: "Model".to_owned(),
             description: None,
-            aliases: BTreeSet::from([id.to_owned(), "vendor/model".to_owned()]),
+            aliases: BTreeSet::from([
+                id.to_owned(),
+                "vendor/model".to_owned(),
+                "vendor/model-v1".to_owned(),
+            ]),
             created_unix: None,
             context_length: None,
             architecture: ModelArchitecture::default(),
@@ -699,6 +901,170 @@ mod tests {
                 entry("openrouter", "vendor/model:batch", ModelRouteClass::Batch),
             ],
         }
+    }
+
+    fn selected_candidate(
+        class: ModelRouteClass,
+        expected_cost_usd: f64,
+    ) -> ModelRouteSelectionCandidate {
+        let model = if class == ModelRouteClass::Batch {
+            "vendor/model:batch"
+        } else {
+            "vendor/model"
+        };
+        let endpoint = Endpoint {
+            source: "openrouter".to_owned(),
+            credential: None,
+            provider_key: "openrouter".to_owned(),
+            id: "openrouter".to_owned(),
+            provider: "openrouter".to_owned(),
+            model: model.to_owned(),
+            route_class: class,
+            display_name: model.to_owned(),
+            quantization: None,
+            status: 0,
+            context_length: None,
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: Pricing::default(),
+            stats: EndpointStats::default(),
+            capabilities: EndpointCapabilities::default(),
+        };
+        let route = QuotaRouteKey::from_endpoint(&endpoint);
+        ModelRouteSelectionCandidate {
+            canonical_id: "vendor/model-v1".to_owned(),
+            suitability: crate::ModelSuitabilityReport {
+                canonical_id: "vendor/model-v1".to_owned(),
+                metadata_source: "openrouter".to_owned(),
+                metadata_route_id: "vendor/model".to_owned(),
+                status: crate::SuitabilityStatus::Suitable,
+                checks: Vec::new(),
+            },
+            quota: QuotaAdmissionReport {
+                route,
+                admission: QuotaAdmission::Indeterminate,
+                checks: Vec::new(),
+            },
+            route: RouteCandidate {
+                endpoint,
+                expected_cost_usd,
+                expected_response_p75_seconds: None,
+                expected_response_p95_seconds: None,
+            },
+        }
+    }
+
+    fn selected_template() -> InferenceRequestTemplate {
+        InferenceRequestTemplate {
+            system_prompt: None,
+            prompt: "hi".to_owned(),
+            expected_output_tokens: 8,
+            prompt_tokens: Some(10),
+            max_output_tokens: Some(20),
+            temperature: None,
+            requirements: crate::RequestRequirements {
+                minimum_uptime_30m: None,
+                ..crate::RequestRequirements::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_route_revalidation_blocks_cost_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut pool = InferencePool::new();
+        pool.register(
+            "openrouter",
+            Arc::new(MockProvider {
+                source: "openrouter",
+                price: 1e-6,
+                fail_execute: false,
+                calls,
+            }),
+        );
+        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let error = pool
+            .revalidate_selected_with_quota(
+                &catalog(),
+                &selected_candidate(ModelRouteClass::Standard, 0.0),
+                &selected_template(),
+                &mut ledger,
+                SelectedRouteExecutionPolicy {
+                    quota_unknown_policy: QuotaUnknownPolicy::Allow,
+                    now_unix: 100,
+                    max_cost_usd: 20e-6,
+                },
+            )
+            .await
+            .err()
+            .ok_or("expected cost drift rejection")?;
+        assert!(matches!(
+            error,
+            SelectedRouteExecutionError::CostExceeded { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selected_sync_route_is_revalidated_then_executed_exactly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut pool = InferencePool::new();
+        pool.register(
+            "openrouter",
+            Arc::new(MockProvider {
+                source: "openrouter",
+                price: 1e-6,
+                fail_execute: false,
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let result = pool
+            .infer_selected_with_quota(
+                &catalog(),
+                &selected_candidate(ModelRouteClass::Standard, 1e-6),
+                &selected_template(),
+                RetryPolicy::default(),
+                &mut ledger,
+                SelectedRouteExecutionPolicy {
+                    quota_unknown_policy: QuotaUnknownPolicy::Allow,
+                    now_unix: 100,
+                    max_cost_usd: 1.0,
+                },
+            )
+            .await?;
+        assert_eq!(result.response.content, "ok");
+        assert_eq!(result.selected.endpoint.id, "openrouter");
+        let calls = calls.lock().map_err(|_| "poisoned test mutex")?;
+        assert!(calls.iter().any(|call| call == "execute:vendor/model"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selected_batch_route_never_enters_sync_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = InferencePool::new();
+        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let error = pool
+            .infer_selected_with_quota(
+                &catalog(),
+                &selected_candidate(ModelRouteClass::Batch, 0.0),
+                &selected_template(),
+                RetryPolicy::default(),
+                &mut ledger,
+                SelectedRouteExecutionPolicy {
+                    quota_unknown_policy: QuotaUnknownPolicy::Allow,
+                    now_unix: 100,
+                    max_cost_usd: 1.0,
+                },
+            )
+            .await
+            .err()
+            .ok_or("expected batch lifecycle rejection")?;
+        assert!(matches!(error, SelectedRouteExecutionError::BatchRoute));
+        Ok(())
     }
 
     #[tokio::test]

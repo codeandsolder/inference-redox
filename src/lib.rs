@@ -41,7 +41,8 @@ pub use model::{
 };
 pub use pool::{
     InferencePool, PooledInferenceResponse, QuotaExecutionContext, QuotaInferenceError,
-    QuotaPooledInferenceResponse, QuotaRoutingError,
+    QuotaPooledInferenceResponse, QuotaRoutingError, SelectedRouteExecutionError,
+    SelectedRouteExecutionPolicy, SelectedRouteValidation,
 };
 pub use provider::{ExecutionFailurePhase, InferenceProvider, ProviderError};
 pub use quota::{

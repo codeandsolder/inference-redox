@@ -11,10 +11,11 @@ use inference_redox::providers::{
 use inference_redox::{
     BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, ConformanceProbe,
     ConformanceProfile, InferencePool, InferenceProvider, InferenceRequest,
-    InferenceRequestTemplate, ModelCatalog, ModelLookup, ModelSelectionEvidence,
-    ModelSelectionPolicy, ModelSuitabilityReport, ModelSuitabilityRequirements, ProviderError,
-    QuotaExecutionContext, QuotaGraph, QuotaGraphSnapshot, QuotaLedger, QuotaObservationBinding,
-    QuotaUnknownPolicy, RetryPolicy, RoutingStrategy, SuitabilityUnknownPolicy,
+    InferenceRequestTemplate, ModelCatalog, ModelLookup, ModelRouteSelectionCandidate,
+    ModelSelectionEvidence, ModelSelectionPolicy, ModelSuitabilityReport,
+    ModelSuitabilityRequirements, ProviderError, QuotaExecutionContext, QuotaGraph,
+    QuotaGraphSnapshot, QuotaLedger, QuotaObservationBinding, QuotaUnknownPolicy, RetryPolicy,
+    RoutingStrategy, SelectedRouteExecutionPolicy, SuitabilityUnknownPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,6 +33,8 @@ enum Operation {
     InferPoolQuota,
     RoutePoolQuota,
     SelectPoolQuota,
+    ValidateSelectedQuota,
+    InferSelectedQuota,
     QuotaState,
     Models,
     ResolveModel,
@@ -85,6 +88,12 @@ struct WireModelSelectionPolicy {
     quota_unknown_policy: QuotaUnknownPolicy,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct WireSelectedRouteExecutionPolicy {
+    quota_unknown_policy: QuotaUnknownPolicy,
+    max_cost_usd: f64,
+}
+
 #[derive(Debug, Deserialize)]
 struct WireRequest {
     id: Value,
@@ -105,6 +114,10 @@ struct WireRequest {
     request_template: Option<InferenceRequestTemplate>,
     #[serde(default)]
     selection: Option<WireModelSelectionPolicy>,
+    #[serde(default)]
+    selected_candidate: Option<ModelRouteSelectionCandidate>,
+    #[serde(default)]
+    selected_execution: Option<WireSelectedRouteExecutionPolicy>,
     #[serde(default)]
     batch_model: Option<String>,
     #[serde(default)]
@@ -727,6 +740,100 @@ async fn handle_model_selection_operation(
     }
 }
 
+async fn handle_selected_route_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let WireRequest {
+        id,
+        op,
+        request_template,
+        selected_candidate,
+        selected_execution,
+        retry,
+        ..
+    } = wire;
+    let (Some(request_template), Some(selected), Some(execution)) =
+        (request_template, selected_candidate, selected_execution)
+    else {
+        write_error(
+            stdout,
+            id,
+            "selected-route operation requires request_template, selected_candidate, and selected_execution",
+        )
+        .await;
+        return;
+    };
+    let catalog = match providers.catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            write_error(stdout, id, error.to_string()).await;
+            return;
+        }
+    };
+    let policy = SelectedRouteExecutionPolicy {
+        quota_unknown_policy: execution.quota_unknown_policy,
+        now_unix: unix_time_seconds(),
+        max_cost_usd: execution.max_cost_usd,
+    };
+    let pool = providers.pool().await;
+    let mut ledger = providers.quota.lock().await;
+    match op {
+        Operation::ValidateSelectedQuota => match pool
+            .revalidate_selected_with_quota(
+                &catalog,
+                &selected,
+                &request_template,
+                &mut ledger,
+                policy,
+            )
+            .await
+        {
+            Ok(result) => {
+                write_json(
+                    stdout,
+                    &WireSuccess {
+                        id,
+                        ok: true,
+                        result,
+                    },
+                )
+                .await;
+            }
+            Err(error) => write_error(stdout, id, error.to_string()).await,
+        },
+        Operation::InferSelectedQuota => {
+            let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
+            match pool
+                .infer_selected_with_quota(
+                    &catalog,
+                    &selected,
+                    &request_template,
+                    retry,
+                    &mut ledger,
+                    policy,
+                )
+                .await
+            {
+                Ok(result) => {
+                    write_json(
+                        stdout,
+                        &WireSuccess {
+                            id,
+                            ok: true,
+                            result,
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => write_error(stdout, id, error.to_string()).await,
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn handle_quota_pool_operation(
     providers: &Providers,
     stdout: &Arc<Mutex<tokio::io::Stdout>>,
@@ -936,6 +1043,9 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
         }
         Operation::SelectPoolQuota => {
             handle_model_selection_operation(&providers, &stdout, request).await;
+        }
+        Operation::ValidateSelectedQuota | Operation::InferSelectedQuota => {
+            handle_selected_route_operation(&providers, &stdout, request).await;
         }
         Operation::QuotaState => {
             handle_quota_state_operation(&providers, &stdout, request.id).await;
@@ -1277,6 +1387,56 @@ mod tests {
         let loaded = load_conformance_profile(&path).map_err(|error| error.to_string())?;
         let _ = fs::remove_file(&path);
         assert_eq!(loaded, profile);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_route_wire_policy_requires_explicit_cost_ceiling() -> Result<(), serde_json::Error>
+    {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 8,
+            "op": "validate_selected_quota",
+            "request_template": {
+                "prompt": "hi",
+                "expected_output_tokens": 8
+            },
+            "selected_candidate": {
+                "canonical_id": "vendor/model",
+                "suitability": {
+                    "canonical_id": "vendor/model",
+                    "metadata_source": "test",
+                    "metadata_route_id": "vendor/model",
+                    "status": "suitable",
+                    "checks": []
+                },
+                "quota": {
+                    "route": {"source":"test","credential":null,"provider":"test","model":"vendor/model"},
+                    "admission": "indeterminate",
+                    "checks": []
+                },
+                "route": {
+                    "endpoint": {
+                        "source":"test","credential":null,"provider_key":"test","id":"test",
+                        "provider":"test","model":"vendor/model","route_class":"standard",
+                        "display_name":"test","quantization":null,"status":0,"context_length":null,
+                        "max_prompt_tokens":null,"max_completion_tokens":null,
+                        "pricing":{"prompt_per_token":0.0,"completion_per_token":0.0,"request":0.0,"discount":0.0,"cache_read_per_token":null,"cache_write_per_token":null,"overrides":[]},
+                        "stats":{"latency_seconds":{"p50":null,"p75":null,"p90":null,"p95":null,"p99":null},"throughput_tokens_per_second":{"p50":null,"p75":null,"p90":null,"p95":null,"p99":null},"uptime_5m":null,"uptime_30m":null,"uptime_1d":null},
+                        "capabilities":{"adapter_parameters":[],"supported_parameters":[],"verified_parameters":[],"rejected_parameters":[],"reasoning":"None","supports_implicit_caching":false}
+                    },
+                    "expected_cost_usd":0.0,"expected_response_p75_seconds":null,"expected_response_p95_seconds":null
+                }
+            },
+            "selected_execution": {
+                "quota_unknown_policy":"allow",
+                "max_cost_usd":0.01
+            }
+        }))?;
+        assert!(matches!(wire.op, Operation::ValidateSelectedQuota));
+        assert_eq!(
+            wire.selected_execution.map(|policy| policy.max_cost_usd),
+            Some(0.01)
+        );
         Ok(())
     }
 
