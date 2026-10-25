@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,6 +67,8 @@ struct WireConformanceRequest {
     route_id: Option<String>,
     #[serde(default)]
     provider_key: Option<String>,
+    #[serde(default)]
+    refresh: bool,
     probes: Vec<ConformanceProbe>,
 }
 
@@ -119,6 +122,8 @@ struct Providers {
     groq: Option<Arc<GroqCloud>>,
     kilo: Arc<KiloGateway>,
     conformance: Arc<Mutex<ConformanceProfile>>,
+    conformance_probe_lock: Arc<Mutex<()>>,
+    conformance_cache_path: Arc<PathBuf>,
 }
 
 impl Providers {
@@ -213,7 +218,7 @@ async fn write_error(stdout: &Arc<Mutex<tokio::io::Stdout>>, id: Value, error: i
 async fn run_conformance(
     providers: &Providers,
     spec: WireConformanceRequest,
-) -> Result<Vec<inference_redox::ConformanceObservation>, ProviderError> {
+) -> Result<(Vec<inference_redox::ConformanceObservation>, usize), ProviderError> {
     if spec.probes.is_empty() {
         return Err(ProviderError::InvalidRequest(
             "conformance requires at least one probe".to_owned(),
@@ -269,8 +274,17 @@ async fn run_conformance(
             matching_endpoints.len()
         )));
     };
+    let cached_profile = providers.conformance.lock().await.clone();
     let mut observations = Vec::with_capacity(spec.probes.len());
+    let mut executed = 0_usize;
     for probe in spec.probes {
+        if !spec.refresh
+            && let Some(cached) = cached_profile.cached_probe(endpoint, probe)
+        {
+            observations.push(cached.clone());
+            continue;
+        }
+        executed = executed.saturating_add(1);
         observations.push(
             probe
                 .run_provider_model(
@@ -281,7 +295,7 @@ async fn run_conformance(
                 .await,
         );
     }
-    Ok(observations)
+    Ok((observations, executed))
 }
 
 async fn handle_conformance_operation(
@@ -294,20 +308,36 @@ async fn handle_conformance_operation(
         write_error(stdout, id, "conformance requires conformance").await;
         return;
     };
+    let _probe_guard = providers.conformance_probe_lock.lock().await;
     match run_conformance(providers, spec).await {
-        Ok(observations) => {
-            providers
-                .conformance
-                .lock()
-                .await
-                .observations
-                .extend(observations.clone());
+        Ok((observations, executed)) => {
+            if executed > 0 {
+                let profile = {
+                    let mut profile = providers.conformance.lock().await;
+                    for observation in observations.iter().cloned() {
+                        profile.record(observation);
+                    }
+                    profile.clone()
+                };
+                if let Err(error) =
+                    save_conformance_profile(providers.conformance_cache_path.as_ref(), &profile)
+                {
+                    let detail = format!("failed to persist conformance cache: {error}");
+                    write_error(stdout, id, detail).await;
+                    return;
+                }
+            }
+            let cached = observations.len().saturating_sub(executed);
             write_json(
                 stdout,
                 &WireSuccess {
                     id,
                     ok: true,
-                    result: observations,
+                    result: serde_json::json!({
+                        "observations": observations,
+                        "executed": executed,
+                        "cached": cached,
+                    }),
                 },
             )
             .await;
@@ -714,6 +744,52 @@ fn env_file_argument() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     Ok(Some(path.into()))
 }
 
+fn default_conformance_cache_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = env::var_os("INFERENCE_REDOX_CONFORMANCE_CACHE") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(cache_home) = env::var_os("XDG_CACHE_HOME") {
+        return Ok(PathBuf::from(cache_home)
+            .join("inference-redox")
+            .join("conformance-v1.json"));
+    }
+    let home = env::var_os("HOME").ok_or(
+        "HOME is unset; set INFERENCE_REDOX_CONFORMANCE_CACHE for persistent probe caching",
+    )?;
+    Ok(PathBuf::from(home)
+        .join(".cache")
+        .join("inference-redox")
+        .join("conformance-v1.json"))
+}
+
+fn load_conformance_profile(path: &Path) -> Result<ConformanceProfile, Box<dyn std::error::Error>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ConformanceProfile::default())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_conformance_profile(
+    path: &Path,
+    profile: &ConformanceProfile,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parent = path
+        .parent()
+        .ok_or("conformance cache path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("conformance cache path has no UTF-8 filename")?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", process::id()));
+    fs::write(&temporary, serde_json::to_vec_pretty(profile)?)?;
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
 struct ApiKeys {
     openrouter: String,
     nvidia: Option<String>,
@@ -750,6 +826,8 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keys = load_api_keys()?;
+    let conformance_cache_path = default_conformance_cache_path()?;
+    let conformance = load_conformance_profile(&conformance_cache_path)?;
     let providers = Providers {
         openrouter: Arc::new(OpenRouter::new(keys.openrouter)),
         nvidia: keys.nvidia.map(|key| Arc::new(NvidiaNim::new(key))),
@@ -757,7 +835,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .groq
             .map(|key| Arc::new(GroqCloud::new(key).with_quota_pool("default"))),
         kilo: Arc::new(KiloGateway::new(keys.kilo).with_quota_pool("default-egress")),
-        conformance: Arc::new(Mutex::new(ConformanceProfile::default())),
+        conformance: Arc::new(Mutex::new(conformance)),
+        conformance_probe_lock: Arc::new(Mutex::new(())),
+        conformance_cache_path: Arc::new(conformance_cache_path),
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
@@ -792,8 +872,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkSource, BenchmarkTaskType, Operation, WireRequest, key_from_contents};
+    use super::{
+        BenchmarkSource, BenchmarkTaskType, Operation, WireRequest, key_from_contents,
+        load_conformance_profile, save_conformance_profile,
+    };
+    use inference_redox::{ConformanceObservation, ConformanceOutcome, ConformanceProfile};
     use serde_json::json;
+    use std::fs;
+    use std::process;
 
     #[test]
     fn env_file_parser_handles_export_quotes_and_crlf() {
@@ -884,6 +970,58 @@ mod tests {
             wire.conformance.as_ref().map(|spec| spec.probes.len()),
             Some(3)
         );
+        assert_eq!(
+            wire.conformance.as_ref().map(|spec| spec.refresh),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conformance_wire_refresh_is_explicit() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 5,
+            "op": "conformance",
+            "conformance": {
+                "model": "openai/gpt-oss-120b",
+                "source": "groq",
+                "refresh": true,
+                "probes": ["basic_chat"]
+            }
+        }))?;
+        assert_eq!(
+            wire.conformance.as_ref().map(|spec| spec.refresh),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conformance_profile_round_trips_disk_cache() -> Result<(), String> {
+        let path = std::env::temp_dir().join(format!(
+            "inference-redox-conformance-test-{}.json",
+            process::id()
+        ));
+        let profile = ConformanceProfile {
+            observations: vec![ConformanceObservation {
+                source: "groq".to_owned(),
+                credential: Some("account-a".to_owned()),
+                provider_key: "groq".to_owned(),
+                endpoint_id: Some("groq".to_owned()),
+                native_model_id: "openai/gpt-oss-120b".to_owned(),
+                canonical_id: Some("openai/gpt-oss-120b".to_owned()),
+                parameter: "chat_completions".to_owned(),
+                test_id: "basic-chat".to_owned(),
+                test_version: 1,
+                outcome: ConformanceOutcome::Passed,
+                observed_unix_ms: 123,
+                detail: None,
+            }],
+        };
+        save_conformance_profile(&path, &profile).map_err(|error| error.to_string())?;
+        let loaded = load_conformance_profile(&path).map_err(|error| error.to_string())?;
+        let _ = fs::remove_file(&path);
+        assert_eq!(loaded, profile);
         Ok(())
     }
 

@@ -129,7 +129,9 @@ impl ConformanceProbe {
         canonical_id: Option<String>,
     ) -> ConformanceObservation {
         let source = endpoint.source.clone();
+        let credential = endpoint.credential.clone();
         let provider_key = endpoint.provider_key.clone();
+        let endpoint_id = Some(endpoint.id.clone());
         let native_model_id = endpoint.model.clone();
         let request = self.request(native_model_id.clone());
         let prompt_tokens = request.prompt_tokens.unwrap_or_else(|| {
@@ -170,8 +172,9 @@ impl ConformanceProbe {
         };
         ConformanceObservation {
             source,
+            credential,
             provider_key,
-            endpoint_id: None,
+            endpoint_id,
             native_model_id,
             canonical_id,
             parameter: self.parameter().to_owned(),
@@ -255,6 +258,8 @@ fn unix_time_ms() -> u64 {
 pub struct ConformanceObservation {
     /// Execution surface, e.g. `openrouter` or direct `nvidia`.
     pub source: String,
+    /// Opaque logical credential/account label. Never contains the secret itself.
+    pub credential: Option<String>,
     /// Stable provider selector within the execution surface.
     pub provider_key: String,
     /// Optional exact endpoint refinement when that endpoint is independently addressable.
@@ -276,18 +281,79 @@ pub struct ConformanceProfile {
 }
 
 impl ConformanceProfile {
+    /// Return a current-version cached observation for one exact probe scope.
+    #[must_use]
+    pub fn cached_probe(
+        &self,
+        endpoint: &Endpoint,
+        probe: ConformanceProbe,
+    ) -> Option<&ConformanceObservation> {
+        self.observations
+            .iter()
+            .filter(|observation| observation.matches_endpoint(endpoint))
+            .filter(|observation| {
+                observation.parameter == probe.parameter()
+                    && observation.test_id == probe.test_id()
+                    && observation.test_version == probe.test_version()
+            })
+            .max_by_key(|observation| observation.observed_unix_ms)
+    }
+
+    /// Record one observation, replacing an older observation for the same exact probe/version.
+    pub fn record(&mut self, observation: ConformanceObservation) {
+        if let Some(existing) = self.observations.iter_mut().find(|existing| {
+            existing.same_probe_scope(&observation)
+                && existing.test_version == observation.test_version
+        }) {
+            if observation.observed_unix_ms >= existing.observed_unix_ms {
+                *existing = observation;
+            }
+            return;
+        }
+        self.observations.push(observation);
+    }
+
     /// Apply only observations scoped to this exact endpoint/model route.
     pub fn apply_to_endpoint(&self, endpoint: &mut Endpoint) {
+        let source = endpoint.source.clone();
+        let credential = endpoint.credential.clone();
+        let provider_key = endpoint.provider_key.clone();
+        let endpoint_id = endpoint.id.clone();
+        let native_model_id = endpoint.model.clone();
         let observations = self.observations.iter().filter(|observation| {
-            observation.source == endpoint.source
-                && observation.provider_key == endpoint.provider_key
-                && observation.native_model_id == endpoint.model
+            observation.source == source
+                && observation.credential == credential
+                && observation.provider_key == provider_key
+                && observation.native_model_id == native_model_id
                 && observation
                     .endpoint_id
                     .as_ref()
-                    .is_none_or(|endpoint_id| endpoint_id == &endpoint.id)
+                    .is_none_or(|id| id == &endpoint_id)
         });
         apply_observations(&mut endpoint.capabilities, observations);
+    }
+}
+
+impl ConformanceObservation {
+    fn matches_endpoint(&self, endpoint: &Endpoint) -> bool {
+        self.source == endpoint.source
+            && self.credential == endpoint.credential
+            && self.provider_key == endpoint.provider_key
+            && self.native_model_id == endpoint.model
+            && self
+                .endpoint_id
+                .as_ref()
+                .is_none_or(|endpoint_id| endpoint_id == &endpoint.id)
+    }
+
+    fn same_probe_scope(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.credential == other.credential
+            && self.provider_key == other.provider_key
+            && self.endpoint_id == other.endpoint_id
+            && self.native_model_id == other.native_model_id
+            && self.parameter == other.parameter
+            && self.test_id == other.test_id
     }
 }
 
@@ -385,6 +451,7 @@ mod tests {
     ) -> ConformanceObservation {
         ConformanceObservation {
             source: "openrouter".to_owned(),
+            credential: None,
             provider_key: endpoint_id
                 .split('/')
                 .next()
@@ -541,5 +608,56 @@ mod tests {
         .apply_to_endpoint(&mut route);
         assert!(route.capabilities.verified_parameters.contains("seed"));
         assert!(route.capabilities.rejected_parameters.is_empty());
+    }
+
+    #[test]
+    fn cached_probe_is_exactly_credential_and_endpoint_scoped() {
+        let mut route = endpoint("endpoint", "model");
+        route.credential = Some("account-a".to_owned());
+        let mut cached = observation(
+            "endpoint",
+            "model",
+            "chat_completions",
+            "basic-chat",
+            ConformanceProbe::BasicChat.test_version(),
+            10,
+            ConformanceOutcome::Passed,
+        );
+        cached.credential = Some("account-a".to_owned());
+        let profile = ConformanceProfile {
+            observations: vec![cached],
+        };
+        assert!(
+            profile
+                .cached_probe(&route, ConformanceProbe::BasicChat)
+                .is_some()
+        );
+        route.credential = Some("account-b".to_owned());
+        assert!(
+            profile
+                .cached_probe(&route, ConformanceProbe::BasicChat)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn record_replaces_same_probe_version_instead_of_growing_forever() {
+        let first = observation(
+            "endpoint",
+            "model",
+            "chat_completions",
+            "basic-chat",
+            1,
+            10,
+            ConformanceOutcome::Inconclusive,
+        );
+        let mut second = first.clone();
+        second.observed_unix_ms = 20;
+        second.outcome = ConformanceOutcome::Passed;
+        let mut profile = ConformanceProfile::default();
+        profile.record(first);
+        profile.record(second);
+        assert_eq!(profile.observations.len(), 1);
+        assert_eq!(profile.observations[0].outcome, ConformanceOutcome::Passed);
     }
 }

@@ -678,6 +678,7 @@ mod tests {
         let profile = ConformanceProfile {
             observations: vec![crate::ConformanceObservation {
                 source: "nvidia".to_owned(),
+                credential: None,
                 provider_key: "nvidia".to_owned(),
                 endpoint_id: None,
                 native_model_id: "vendor/native-model".to_owned(),
@@ -750,6 +751,42 @@ mod tests {
             .lock()
             .map_err(|_| ProviderError::Catalog("poisoned test mutex".to_owned()))?;
         assert_eq!(calls.as_slice(), ["vendor/native-model"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn standard_only_policy_executes_paid_openrouter_route() -> Result<(), ProviderError> {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut pool = InferencePool::new();
+        pool.register(
+            "openrouter",
+            Arc::new(MockProvider {
+                source: "openrouter",
+                price: 1e-6,
+                fail_execute: false,
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let mut request = InferenceRequest::new("vendor/model", "paid", 8);
+        request.requirements.allowed_route_classes = BTreeSet::from([ModelRouteClass::Standard]);
+        let result = pool
+            .infer(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                RetryPolicy::default(),
+            )
+            .await?;
+        assert_eq!(result.selected.endpoint.source, "openrouter");
+        assert_eq!(
+            result.selected.endpoint.route_class,
+            ModelRouteClass::Standard
+        );
+        assert!(result.selected.expected_cost_usd > 0.0);
+        let calls = calls
+            .lock()
+            .map_err(|_| ProviderError::Catalog("poisoned test mutex".to_owned()))?;
+        assert!(calls.iter().any(|call| call == "execute:vendor/model"));
         Ok(())
     }
 
