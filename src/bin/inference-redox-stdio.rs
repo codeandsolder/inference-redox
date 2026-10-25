@@ -161,6 +161,7 @@ struct Providers {
     groq: Option<Arc<GroqCloud>>,
     kilo: Arc<KiloGateway>,
     opencode: Option<Arc<OpenCodeConsole>>,
+    opencode_go: Option<Arc<OpenCodeConsole>>,
     conformance: Arc<Mutex<ConformanceProfile>>,
     conformance_probe_lock: Arc<Mutex<()>>,
     conformance_cache_path: Arc<PathBuf>,
@@ -189,6 +190,11 @@ impl Providers {
         {
             inventories.push(inventory);
         }
+        if let Some(opencode_go) = self.opencode_go.as_ref()
+            && let Ok(inventory) = opencode_go.inventory(&base_catalog).await
+        {
+            inventories.push(inventory);
+        }
         let mut catalog = base_catalog;
         for inventory in &inventories {
             catalog.ingest_provider_inventory(inventory);
@@ -210,6 +216,9 @@ impl Providers {
         if let Some(opencode) = self.opencode.as_ref() {
             pool.register("opencode", Arc::clone(opencode));
         }
+        if let Some(opencode_go) = self.opencode_go.as_ref() {
+            pool.register("opencode-go", Arc::clone(opencode_go));
+        }
         pool
     }
 
@@ -227,6 +236,10 @@ impl Providers {
             "kilo" => Some(self.kilo.clone()),
             "opencode" => self
                 .opencode
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
+            "opencode-go" => self
+                .opencode_go
                 .as_ref()
                 .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
             _ => None,
@@ -1206,6 +1219,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keys = load_api_keys()?;
     let conformance_cache_path = default_conformance_cache_path()?;
     let conformance = load_conformance_profile(&conformance_cache_path)?;
+    let (opencode, opencode_go) = keys.opencode.map_or((None, None), |key| {
+        (
+            Some(Arc::new(OpenCodeConsole::new(key.clone()))),
+            Some(Arc::new(OpenCodeConsole::new_go(key))),
+        )
+    });
     let providers = Providers {
         openrouter: Arc::new(OpenRouter::new(keys.openrouter)),
         nvidia: keys.nvidia.map(|key| Arc::new(NvidiaNim::new(key))),
@@ -1213,7 +1232,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .groq
             .map(|key| Arc::new(GroqCloud::new(key).with_quota_pool("default"))),
         kilo: Arc::new(KiloGateway::new(keys.kilo).with_quota_pool("default-egress")),
-        opencode: keys.opencode.map(|key| Arc::new(OpenCodeConsole::new(key))),
+        opencode,
+        opencode_go,
         conformance: Arc::new(Mutex::new(conformance)),
         conformance_probe_lock: Arc::new(Mutex::new(())),
         conformance_cache_path: Arc::new(conformance_cache_path),
@@ -1551,6 +1571,33 @@ mod tests {
             Some(BenchmarkSource::ArtificialAnalysis)
         );
         assert_eq!(wire.benchmark_task_type, Some(BenchmarkTaskType::Coding));
+        Ok(())
+    }
+
+    #[test]
+    fn model_selection_wire_preserves_agentic_session_semantics() -> Result<(), serde_json::Error> {
+        let request: WireRequest = serde_json::from_value(json!({
+            "id": 91,
+            "op": "select_pool_quota",
+            "suitability": {},
+            "request_template": {
+                "prompt": "fix the repository",
+                "expected_output_tokens": 128,
+                "agentic": true,
+                "session_id": "conversation-42"
+            },
+            "selection": {
+                "unknown_suitability": "allow",
+                "discovery_limit": 2,
+                "quota_unknown_policy": "allow"
+            },
+            "fastest_response_cheap": 1.5
+        }))?;
+        let template = request.request_template.ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::other("missing request template"))
+        })?;
+        assert!(template.agentic);
+        assert_eq!(template.session_id.as_deref(), Some("conversation-42"));
         Ok(())
     }
 }

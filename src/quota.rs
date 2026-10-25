@@ -935,6 +935,7 @@ mod tests {
             max_completion_tokens: None,
             pricing: crate::Pricing::default(),
             stats: crate::EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
             capabilities: crate::EndpointCapabilities::default(),
         };
         let key = QuotaRouteKey::from_endpoint(&endpoint);

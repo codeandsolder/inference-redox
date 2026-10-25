@@ -3,22 +3,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{
+    Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
 use super::openai_compatible::{
-    JsonResponse, base_chat_body, execute_json_with_retry, response_format,
+    JsonResponse, base_chat_body, execute_json_with_retry_headers, response_format,
 };
 use crate::{
-    Endpoint, EndpointCapabilities, EndpointStats, ExecutionFailurePhase, InferenceProvider,
-    InferenceRequest, InferenceResponse, ModelCatalog, ModelRouteClass, NativeModelRecord, Pricing,
-    PricingOverride, ProviderError, ProviderInventory, ReasoningEffort, ReasoningSupport,
-    ResponseSchema, RetryPolicy, RoutePlan, TokenUsage,
+    AgenticPolicy, Endpoint, EndpointCapabilities, EndpointStats, ExecutionFailurePhase,
+    InferenceProvider, InferenceRequest, InferenceResponse, ModelCatalog, ModelRouteClass,
+    NativeModelRecord, Pricing, PricingOverride, ProviderError, ProviderInventory, ReasoningEffort,
+    ReasoningSupport, ResponseSchema, RetryPolicy, RoutePlan, TokenUsage, WorkloadPolicy,
 };
 
 const DEFAULT_INFERENCE_BASE: &str = "https://opencode.ai/inference";
+const DEFAULT_GO_INFERENCE_BASE: &str = "https://opencode.ai/inference/go";
+const USER_AGENT_VALUE: &str = concat!("inference-redox/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -32,12 +37,56 @@ pub struct OpenCodeConsole {
     models_dev_url: String,
     model_cache: Arc<Mutex<Option<CachedModels>>>,
     catalog_ttl: Duration,
+    surface: OpenCodeSurface,
 }
 
 #[derive(Debug, Clone)]
 struct CachedModels {
     fetched_at: Instant,
     models: Vec<OpenCodeModel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeSurface {
+    PayAsYouGo,
+    Go,
+}
+
+impl OpenCodeSurface {
+    fn source(self) -> &'static str {
+        match self {
+            Self::PayAsYouGo => "opencode",
+            Self::Go => "opencode-go",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::PayAsYouGo => "OpenCode Console",
+            Self::Go => "OpenCode Go",
+        }
+    }
+
+    fn route_class(self) -> ModelRouteClass {
+        match self {
+            Self::PayAsYouGo => ModelRouteClass::Standard,
+            Self::Go => ModelRouteClass::Subscription,
+        }
+    }
+
+    fn accepts_cost(self, cost: &Cost) -> bool {
+        self == Self::Go || cost.is_paid()
+    }
+
+    fn workload_policy(self) -> WorkloadPolicy {
+        match self {
+            Self::PayAsYouGo => WorkloadPolicy::default(),
+            Self::Go => WorkloadPolicy {
+                agentic: AgenticPolicy::Required,
+                requires_stable_session: true,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,10 +121,11 @@ struct OpenCodeModel {
     temperature: bool,
     structured_output: bool,
     reasoning_efforts: BTreeSet<ReasoningEffort>,
+    api_base: String,
 }
 
 impl OpenCodeModel {
-    fn native_record(&self) -> NativeModelRecord {
+    fn native_record(&self, route_class: ModelRouteClass) -> NativeModelRecord {
         NativeModelRecord {
             id: self.id.clone(),
             display_name: Some(self.name.clone()),
@@ -85,7 +135,7 @@ impl OpenCodeModel {
             max_completion_tokens: self.max_completion_tokens,
             claimed_parameters: self.claimed_parameters(),
             pricing: Some(self.pricing.clone()),
-            route_class: Some(ModelRouteClass::Standard),
+            route_class: Some(route_class),
             canonical_hint: self.canonical_hint.clone(),
             virtual_route: false,
         }
@@ -151,13 +201,27 @@ impl OpenCodeModel {
 impl OpenCodeConsole {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_surface(api_key.into(), OpenCodeSurface::PayAsYouGo)
+    }
+
+    #[must_use]
+    pub fn new_go(api_key: impl Into<String>) -> Self {
+        Self::with_surface(api_key.into(), OpenCodeSurface::Go)
+    }
+
+    fn with_surface(api_key: String, surface: OpenCodeSurface) -> Self {
         Self {
             client: Client::new(),
-            api_key: api_key.into(),
-            inference_base: DEFAULT_INFERENCE_BASE.to_owned(),
+            api_key,
+            inference_base: match surface {
+                OpenCodeSurface::PayAsYouGo => DEFAULT_INFERENCE_BASE,
+                OpenCodeSurface::Go => DEFAULT_GO_INFERENCE_BASE,
+            }
+            .to_owned(),
             models_dev_url: DEFAULT_MODELS_DEV_URL.to_owned(),
             model_cache: Arc::new(Mutex::new(None)),
             catalog_ttl: Duration::from_secs(60),
+            surface,
         }
     }
 
@@ -181,8 +245,8 @@ impl OpenCodeConsole {
         self
     }
 
-    /// Fetch the account-visible `OpenCode` model list, intersect it with models.dev metadata, and
-    /// keep only paid models that arbitrary API clients are documented to be allowed to execute.
+    /// Fetch the account-visible `OpenCode` model list and intersect it with models.dev metadata.
+    /// Pay-as-you-go excludes client-only free promo rows; Go retains every priced subscription row.
     ///
     /// # Errors
     /// Returns a catalog error when either metadata source cannot be fetched or decoded.
@@ -190,12 +254,13 @@ impl OpenCodeConsole {
         &self,
         catalog: &ModelCatalog,
     ) -> Result<ProviderInventory, ProviderError> {
+        let route_class = self.surface.route_class();
         Ok(ProviderInventory::reconcile(
-            "opencode",
+            self.surface.source(),
             self.models()
                 .await?
                 .iter()
-                .map(OpenCodeModel::native_record)
+                .map(|model| model.native_record(route_class))
                 .collect(),
             catalog,
         ))
@@ -259,12 +324,18 @@ impl OpenCodeConsole {
             .into_iter()
             .map(|model| model.id)
             .collect::<BTreeSet<_>>();
-        let mut models = metadata
-            .opencode
-            .models
+        let metadata_models = match self.surface {
+            OpenCodeSurface::PayAsYouGo => metadata.opencode.models,
+            OpenCodeSurface::Go => metadata.opencode_go.models,
+        };
+        let mut models = metadata_models
             .into_iter()
             .filter(|(id, model)| {
-                live_ids.contains(id) && model.cost.as_ref().is_some_and(Cost::is_paid)
+                live_ids.contains(id)
+                    && model
+                        .cost
+                        .as_ref()
+                        .is_some_and(|cost| self.surface.accepts_cost(cost))
             })
             .filter_map(|(id, model)| model.normalize(id))
             .collect::<Vec<_>>();
@@ -412,19 +483,45 @@ impl OpenCodeConsole {
         Ok(Value::Object(body))
     }
 
-    fn url(&self, model: &OpenCodeModel) -> String {
+    fn url(model: &OpenCodeModel) -> String {
         match model.dialect {
-            Dialect::OpenAiChat => format!("{}/openai/v1/chat/completions", self.inference_base),
-            Dialect::OpenAiResponses => format!("{}/openai/v1/responses", self.inference_base),
-            Dialect::AnthropicMessages => format!("{}/anthropic/v1/messages", self.inference_base),
-            Dialect::Gemini => format!(
-                "{}/google/v1beta/models/{}:generateContent",
-                self.inference_base, model.id
-            ),
+            Dialect::OpenAiChat => format!("{}/chat/completions", model.api_base),
+            Dialect::OpenAiResponses => format!("{}/responses", model.api_base),
+            Dialect::AnthropicMessages => format!("{}/messages", model.api_base),
+            Dialect::Gemini => format!("{}/models/{}:generateContent", model.api_base, model.id),
         }
     }
 
+    fn request_headers(&self, request: &InferenceRequest) -> Result<HeaderMap, ProviderError> {
+        if self.surface == OpenCodeSurface::Go && !request.agentic {
+            return Err(ProviderError::InvalidRequest(
+                "OpenCode Go requires an agentic coding workload".to_owned(),
+            ));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
+        if let Some(session_id) = request.session_id.as_deref() {
+            if session_id.trim().is_empty() {
+                return Err(ProviderError::InvalidRequest(
+                    "OpenCode session_id must not be empty".to_owned(),
+                ));
+            }
+            let value = HeaderValue::from_str(session_id).map_err(|_| {
+                ProviderError::InvalidRequest(
+                    "OpenCode session_id contains invalid HTTP header characters".to_owned(),
+                )
+            })?;
+            headers.insert("x-opencode-session", value);
+        } else if self.surface == OpenCodeSurface::Go {
+            return Err(ProviderError::InvalidRequest(
+                "OpenCode Go requires a stable session_id".to_owned(),
+            ));
+        }
+        Ok(headers)
+    }
+
     fn normalize_response(
+        surface: OpenCodeSurface,
         model: &OpenCodeModel,
         response: JsonResponse,
     ) -> Result<InferenceResponse, ProviderError> {
@@ -471,7 +568,7 @@ impl OpenCodeConsole {
         Ok(InferenceResponse {
             content,
             model: response_model.or_else(|| Some(model.id.clone())),
-            provider: Some("opencode".to_owned()),
+            provider: Some(surface.source().to_owned()),
             usage_cost_usd,
             usage,
             quota_observations,
@@ -488,13 +585,17 @@ impl InferenceProvider for OpenCodeConsole {
             return Err(ProviderError::NoEligibleEndpoint(model.to_owned()));
         };
         Ok(vec![Endpoint {
-            source: "opencode".to_owned(),
+            source: self.surface.source().to_owned(),
             credential: None,
-            provider_key: "opencode".to_owned(),
-            id: format!("opencode/{}", model_metadata.dialect.endpoint_name()),
-            provider: "OpenCode Console".to_owned(),
+            provider_key: self.surface.source().to_owned(),
+            id: format!(
+                "{}/{}",
+                self.surface.source(),
+                model_metadata.dialect.endpoint_name()
+            ),
+            provider: self.surface.display_name().to_owned(),
             model: model.to_owned(),
-            route_class: ModelRouteClass::Standard,
+            route_class: self.surface.route_class(),
             display_name: model_metadata.name.clone(),
             quantization: None,
             status: 0,
@@ -503,6 +604,7 @@ impl InferenceProvider for OpenCodeConsole {
             max_completion_tokens: model_metadata.max_completion_tokens,
             pricing: model_metadata.pricing.clone(),
             stats: EndpointStats::default(),
+            workload_policy: self.surface.workload_policy(),
             capabilities: EndpointCapabilities {
                 adapter_parameters: model_metadata.adapter_parameters(),
                 supported_parameters: model_metadata.claimed_parameters(),
@@ -523,10 +625,11 @@ impl InferenceProvider for OpenCodeConsole {
         let Some(candidate) = plan.candidates.first() else {
             return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
         };
-        if candidate.endpoint.source != "opencode" || candidate.endpoint.provider_key != "opencode"
+        if candidate.endpoint.source != self.surface.source()
+            || candidate.endpoint.provider_key != self.surface.source()
         {
             return Err(ProviderError::InvalidRequest(
-                "OpenCode adapter received a non-OpenCode route".to_owned(),
+                "OpenCode adapter received a route for the wrong execution surface".to_owned(),
             ));
         }
         let models = self.models().await?;
@@ -534,15 +637,17 @@ impl InferenceProvider for OpenCodeConsole {
             return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
         };
         let body = Self::compile_body(model, request)?;
-        let response = execute_json_with_retry(
+        let headers = self.request_headers(request)?;
+        let response = execute_json_with_retry_headers(
             &self.client,
             Some(&self.api_key),
-            &self.url(model),
+            &Self::url(model),
             &body,
+            &headers,
             retry,
         )
         .await?;
-        Self::normalize_response(model, response)
+        Self::normalize_response(self.surface, model, response)
     }
 }
 
@@ -559,6 +664,8 @@ struct LiveModel {
 #[derive(Debug, Deserialize)]
 struct ModelsDevRoot {
     opencode: ModelsDevProvider,
+    #[serde(rename = "opencode-go")]
+    opencode_go: ModelsDevProvider,
 }
 
 #[derive(Debug, Deserialize)]
@@ -591,6 +698,7 @@ struct ModelsDevModel {
 impl ModelsDevModel {
     fn normalize(self, id: String) -> Option<OpenCodeModel> {
         let dialect = Dialect::from_provider(&self.provider)?;
+        let api_base = self.provider.api.clone()?;
         let pricing = self.cost.as_ref()?.pricing();
         let reasoning_efforts = if self.reasoning && matches!(dialect, Dialect::OpenAiResponses) {
             self.reasoning_options
@@ -613,6 +721,7 @@ impl ModelsDevModel {
             temperature: self.temperature,
             structured_output: self.structured_output,
             reasoning_efforts,
+            api_base,
         })
     }
 }
@@ -924,6 +1033,7 @@ mod tests {
             temperature: false,
             structured_output: true,
             reasoning_efforts: BTreeSet::from([ReasoningEffort::High]),
+            api_base: "https://example.test/openai/v1".to_owned(),
         };
         let mut request = InferenceRequest::new("gpt-6-sol", "hi", 8);
         request.requirements.reasoning = ReasoningEffort::High;
@@ -962,6 +1072,7 @@ mod tests {
             temperature: true,
             structured_output: true,
             reasoning_efforts: BTreeSet::new(),
+            api_base: "https://example.test/anthropic/v1".to_owned(),
         };
         let mut request = InferenceRequest::new("claude-sonnet-5-5", "hi", 8);
         request.requirements.reasoning = ReasoningEffort::High;
@@ -979,6 +1090,49 @@ mod tests {
     }
 
     #[test]
+    fn go_requires_agentic_workload_and_stable_session_headers() -> Result<(), ProviderError> {
+        let go = OpenCodeConsole::new_go("test-key");
+        assert_eq!(go.surface.route_class(), ModelRouteClass::Subscription);
+        assert_eq!(
+            go.surface.workload_policy().agentic,
+            AgenticPolicy::Required
+        );
+        assert!(go.surface.workload_policy().requires_stable_session);
+
+        let mut request = InferenceRequest::new("model", "work", 8);
+        assert!(go.request_headers(&request).is_err());
+        request.agentic = true;
+        assert!(go.request_headers(&request).is_err());
+        request.session_id = Some("conversation-42".to_owned());
+        let headers = go.request_headers(&request)?;
+        assert_eq!(
+            headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(USER_AGENT_VALUE)
+        );
+        assert_eq!(
+            headers
+                .get("x-opencode-session")
+                .and_then(|value| value.to_str().ok()),
+            Some("conversation-42")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn payg_and_go_apply_different_zero_cost_inventory_policy() -> Result<(), serde_json::Error> {
+        let zero: Cost = serde_json::from_value(json!({
+            "input": 0,
+            "output": 0,
+            "cache_read": 0
+        }))?;
+        assert!(!OpenCodeSurface::PayAsYouGo.accepts_cost(&zero));
+        assert!(OpenCodeSurface::Go.accepts_cost(&zero));
+        Ok(())
+    }
+
+    #[test]
     fn normalizes_gateway_cost_and_usage_across_response_families() -> Result<(), ProviderError> {
         let base = OpenCodeModel {
             id: "test".to_owned(),
@@ -992,8 +1146,10 @@ mod tests {
             temperature: false,
             structured_output: false,
             reasoning_efforts: BTreeSet::new(),
+            api_base: "https://example.test/openai/v1".to_owned(),
         };
         let response = OpenCodeConsole::normalize_response(
+            OpenCodeSurface::PayAsYouGo,
             &base,
             JsonResponse {
                 raw: json!({
@@ -1011,6 +1167,7 @@ mod tests {
         let mut gemini = base;
         gemini.dialect = Dialect::Gemini;
         let response = OpenCodeConsole::normalize_response(
+            OpenCodeSurface::PayAsYouGo,
             &gemini,
             JsonResponse {
                 raw: json!({

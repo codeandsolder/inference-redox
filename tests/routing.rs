@@ -43,6 +43,7 @@ fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f6
             uptime_30m: Some(99.9),
             ..EndpointStats::default()
         },
+        workload_policy: inference_redox::WorkloadPolicy::default(),
         capabilities: EndpointCapabilities {
             adapter_parameters: [
                 "max_tokens",
@@ -349,7 +350,85 @@ fn missing_route_class_policy_deserializes_to_interactive_default() -> Result<()
         BTreeSet::from([
             inference_redox::ModelRouteClass::Standard,
             inference_redox::ModelRouteClass::Free,
+            inference_redox::ModelRouteClass::Subscription,
         ])
     );
+    Ok(())
+}
+
+#[test]
+fn agentic_route_policy_is_enforced_before_ranking() -> Result<(), inference_redox::ProviderError> {
+    let mut agent_only = endpoint("agent-only", 1e-6, 1e-6, 0.1, 100.0);
+    agent_only.workload_policy = inference_redox::WorkloadPolicy {
+        agentic: inference_redox::AgenticPolicy::Required,
+        requires_stable_session: true,
+    };
+    let mut request = InferenceRequest::new("x/model", "work", 8);
+    request.prompt_tokens = Some(8);
+    assert!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![agent_only.clone()],
+        )
+        .is_err()
+    );
+
+    request.agentic = true;
+    assert!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![agent_only.clone()],
+        )
+        .is_err()
+    );
+
+    request.session_id = Some("conversation-42".to_owned());
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![agent_only],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn forbidden_agentic_route_rejects_agentic_workload() {
+    let mut non_agent = endpoint("non-agent", 1e-6, 1e-6, 0.1, 100.0);
+    non_agent.workload_policy.agentic = inference_redox::AgenticPolicy::Forbidden;
+    let mut request = InferenceRequest::new("x/model", "work", 8);
+    request.prompt_tokens = Some(8);
+    request.agentic = true;
+    assert!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![non_agent],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn subscription_route_has_zero_marginal_routing_cost_but_keeps_list_price()
+-> Result<(), inference_redox::ProviderError> {
+    let mut subscription = endpoint("subscription", 1e-3, 2e-3, 0.1, 100.0);
+    subscription.route_class = inference_redox::ModelRouteClass::Subscription;
+    let list_cost = subscription.pricing.expected_cost(10, 10);
+    assert!(list_cost > 0.0);
+
+    let mut request = InferenceRequest::new("x/model", "work", 10);
+    request.prompt_tokens = Some(10);
+    request.requirements.allowed_route_classes =
+        BTreeSet::from([inference_redox::ModelRouteClass::Subscription]);
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![subscription],
+    )?;
+    assert_eq!(plan.candidates[0].expected_cost_usd, 0.0);
+    assert!(plan.candidates[0].endpoint.pricing.expected_cost(10, 10) > 0.0);
     Ok(())
 }

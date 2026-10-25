@@ -242,6 +242,26 @@ pub struct EndpointStats {
     pub uptime_1d: Option<f64>,
 }
 
+/// Whether a route is valid for agentic workloads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticPolicy {
+    #[default]
+    Any,
+    Required,
+    Forbidden,
+}
+
+/// Semantic workload restrictions attached to one execution route.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadPolicy {
+    #[serde(default)]
+    pub agentic: AgenticPolicy,
+    /// The provider requires a stable conversation/session identifier on every request.
+    #[serde(default)]
+    pub requires_stable_session: bool,
+}
+
 /// A normalized endpoint from any inference provider/gateway.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Endpoint {
@@ -264,6 +284,8 @@ pub struct Endpoint {
     pub max_completion_tokens: Option<u64>,
     pub pricing: Pricing,
     pub stats: EndpointStats,
+    #[serde(default)]
+    pub workload_policy: WorkloadPolicy,
     pub capabilities: EndpointCapabilities,
 }
 
@@ -279,7 +301,11 @@ pub struct RequestRequirements {
 }
 
 fn default_allowed_route_classes() -> BTreeSet<ModelRouteClass> {
-    BTreeSet::from([ModelRouteClass::Standard, ModelRouteClass::Free])
+    BTreeSet::from([
+        ModelRouteClass::Standard,
+        ModelRouteClass::Free,
+        ModelRouteClass::Subscription,
+    ])
 }
 
 impl Default for RequestRequirements {
@@ -308,6 +334,12 @@ pub struct InferenceRequest {
     pub max_output_tokens: Option<u64>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// True only when the caller is actually running a coding/agent workflow.
+    #[serde(default)]
+    pub agentic: bool,
+    /// Stable opaque conversation identifier. Required by routes whose terms/session policy demand it.
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub requirements: RequestRequirements,
 }
 
@@ -326,6 +358,8 @@ impl InferenceRequest {
             prompt_tokens: None,
             max_output_tokens: None,
             temperature: None,
+            agentic: false,
+            session_id: None,
             requirements: RequestRequirements::default(),
         }
     }

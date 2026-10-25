@@ -334,7 +334,8 @@ impl ModelCatalog {
                 let route_rank = match entry.route_class {
                     ModelRouteClass::Standard => 0_u8,
                     ModelRouteClass::Free => 1,
-                    ModelRouteClass::Batch => 2,
+                    ModelRouteClass::Subscription => 2,
+                    ModelRouteClass::Batch => 3,
                 };
                 (source_rank, route_rank, entry.id.len(), entry.id.as_str())
             })

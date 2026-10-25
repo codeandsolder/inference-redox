@@ -55,6 +55,7 @@ pub struct ModelBenchmarks {
 pub enum ModelRouteClass {
     Standard,
     Free,
+    Subscription,
     Batch,
 }
 
@@ -282,7 +283,8 @@ impl ModelCatalog {
                 let rank = match route.route_class {
                     ModelRouteClass::Standard => 0_u8,
                     ModelRouteClass::Free => 1,
-                    ModelRouteClass::Batch => 2,
+                    ModelRouteClass::Subscription => 2,
+                    ModelRouteClass::Batch => 3,
                 };
                 (rank, route.id.len(), route.id.as_str())
             })?

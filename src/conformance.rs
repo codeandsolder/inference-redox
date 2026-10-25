@@ -421,6 +421,7 @@ mod tests {
             max_completion_tokens: None,
             pricing: Pricing::default(),
             stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
             capabilities: EndpointCapabilities {
                 adapter_parameters: [
                     "chat_completions",

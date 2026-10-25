@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 
 use crate::{
-    Endpoint, InferenceRequest, ProviderError, ReasoningEffort, ResponseSchema, RouteCandidate,
-    RoutePlan, RoutingStrategy,
+    AgenticPolicy, Endpoint, InferenceRequest, ModelRouteClass, ProviderError, ReasoningEffort,
+    ResponseSchema, RouteCandidate, RoutePlan, RoutingStrategy,
 };
 
 /// Cheap cross-model token estimate used only for routing/cost prediction.
@@ -35,6 +35,19 @@ pub(crate) fn supports_request(
             .requirements
             .allowed_route_classes
             .contains(&endpoint.route_class)
+    {
+        return false;
+    }
+    match endpoint.workload_policy.agentic {
+        AgenticPolicy::Required if !request.agentic => return false,
+        AgenticPolicy::Forbidden if request.agentic => return false,
+        AgenticPolicy::Any | AgenticPolicy::Required | AgenticPolicy::Forbidden => {}
+    }
+    if endpoint.workload_policy.requires_stable_session
+        && request
+            .session_id
+            .as_deref()
+            .is_none_or(|session| session.trim().is_empty())
     {
         return false;
     }
@@ -180,9 +193,13 @@ pub fn build_route_plan(
         .into_iter()
         .filter(|endpoint| supports_request(endpoint, request, prompt_tokens))
         .map(|endpoint| RouteCandidate {
-            expected_cost_usd: endpoint
-                .pricing
-                .expected_cost(prompt_tokens, request.expected_output_tokens),
+            expected_cost_usd: if endpoint.route_class == ModelRouteClass::Subscription {
+                0.0
+            } else {
+                endpoint
+                    .pricing
+                    .expected_cost(prompt_tokens, request.expected_output_tokens)
+            },
             expected_response_p75_seconds: expected_time(
                 &endpoint,
                 request.expected_output_tokens,

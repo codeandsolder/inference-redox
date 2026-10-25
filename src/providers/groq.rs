@@ -269,6 +269,7 @@ impl InferenceProvider for GroqCloud {
             max_completion_tokens: native.max_completion_tokens,
             pricing: Pricing::default(),
             stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
             capabilities: EndpointCapabilities {
                 adapter_parameters: [
                     "chat_completions",

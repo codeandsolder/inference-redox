@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use reqwest::{Client, StatusCode, header::RETRY_AFTER};
+use reqwest::{
+    Client, StatusCode,
+    header::{HeaderMap, RETRY_AFTER},
+};
 use serde_json::{Map, Value, json};
 use tokio::time::sleep;
 
@@ -135,8 +138,9 @@ async fn execute_once(
     api_key: Option<&str>,
     url: &str,
     body: &Value,
+    headers: &HeaderMap,
 ) -> Result<JsonResponse, AttemptFailure> {
-    let mut request = client.post(url).json(body);
+    let mut request = client.post(url).headers(headers.clone()).json(body);
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     }
@@ -174,11 +178,12 @@ async fn execute_once(
     })
 }
 
-pub(crate) async fn execute_json_with_retry(
+pub(crate) async fn execute_json_with_retry_headers(
     client: &Client,
     api_key: Option<&str>,
     url: &str,
     body: &Value,
+    headers: &HeaderMap,
     retry: RetryPolicy,
 ) -> Result<JsonResponse, ProviderError> {
     if retry.max_attempts == 0 {
@@ -192,7 +197,7 @@ pub(crate) async fn execute_json_with_retry(
     let mut last_quota_observations = Vec::new();
 
     for attempt in 1..=retry.max_attempts {
-        match execute_once(client, api_key, url, body).await {
+        match execute_once(client, api_key, url, body, headers).await {
             Ok(response) => return Ok(response),
             Err(failure) if !failure.retryable => return Err(failure.into_provider_error()),
             Err(failure) => {
@@ -220,6 +225,16 @@ pub(crate) async fn execute_json_with_retry(
         detail: last_error.unwrap_or_else(|| "request failed without an error body".to_owned()),
         quota_observations: last_quota_observations,
     })
+}
+
+pub(crate) async fn execute_json_with_retry(
+    client: &Client,
+    api_key: Option<&str>,
+    url: &str,
+    body: &Value,
+    retry: RetryPolicy,
+) -> Result<JsonResponse, ProviderError> {
+    execute_json_with_retry_headers(client, api_key, url, body, &HeaderMap::new(), retry).await
 }
 
 pub(crate) async fn execute_chat_with_retry(

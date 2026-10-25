@@ -754,6 +754,7 @@ mod tests {
                     ..Pricing::default()
                 },
                 stats: EndpointStats::default(),
+                workload_policy: crate::WorkloadPolicy::default(),
                 capabilities: EndpointCapabilities {
                     adapter_parameters: BTreeSet::from(["max_tokens".to_owned()]),
                     supported_parameters: BTreeSet::from(["max_tokens".to_owned()]),
@@ -831,6 +832,7 @@ mod tests {
                     ..Pricing::default()
                 },
                 stats: EndpointStats::default(),
+                workload_policy: crate::WorkloadPolicy::default(),
                 capabilities: EndpointCapabilities {
                     adapter_parameters: BTreeSet::from(["max_tokens".to_owned()]),
                     supported_parameters: BTreeSet::from(["max_tokens".to_owned()]),
@@ -928,6 +930,7 @@ mod tests {
             max_completion_tokens: None,
             pricing: Pricing::default(),
             stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
             capabilities: EndpointCapabilities::default(),
         };
         let route = QuotaRouteKey::from_endpoint(&endpoint);
@@ -962,6 +965,8 @@ mod tests {
             prompt_tokens: Some(10),
             max_output_tokens: Some(20),
             temperature: None,
+            agentic: false,
+            session_id: None,
             requirements: crate::RequestRequirements {
                 minimum_uptime_30m: None,
                 ..crate::RequestRequirements::default()
@@ -1113,7 +1118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_policy_queries_standard_and_free_but_not_batch() -> Result<(), ProviderError> {
+    async fn default_policy_queries_non_batch_fixture_routes() -> Result<(), ProviderError> {
         let openrouter_calls = Arc::new(StdMutex::new(Vec::new()));
         let nvidia_calls = Arc::new(StdMutex::new(Vec::new()));
         let mut pool = InferencePool::new();

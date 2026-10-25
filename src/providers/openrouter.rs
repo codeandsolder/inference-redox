@@ -1371,6 +1371,19 @@ impl OpenRouterModel {
     }
 }
 
+fn openrouter_workload_policy(model_id: &str) -> crate::WorkloadPolicy {
+    let route_class = catalog_route_class(model_id);
+    let base = model_id.strip_suffix(":free").unwrap_or(model_id);
+    if route_class == Some(ModelRouteClass::Free) && base.starts_with("thinkingmachines/inkling") {
+        crate::WorkloadPolicy {
+            agentic: crate::AgenticPolicy::Required,
+            requires_stable_session: false,
+        }
+    } else {
+        crate::WorkloadPolicy::default()
+    }
+}
+
 impl OpenRouterEndpoint {
     fn normalize(self, requested_model: &str) -> Endpoint {
         let parameters: BTreeSet<String> = self
@@ -1410,6 +1423,7 @@ impl OpenRouterEndpoint {
                 uptime_30m: self.uptime_last_30m,
                 uptime_1d: self.uptime_last_1d,
             },
+            workload_policy: openrouter_workload_policy(requested_model),
             capabilities: EndpointCapabilities {
                 adapter_parameters: [
                     "max_tokens",
@@ -1575,6 +1589,8 @@ mod tests {
             prompt_tokens: Some(5),
             max_output_tokens: None,
             temperature: Some(0.0),
+            agentic: false,
+            session_id: None,
             requirements: crate::RequestRequirements {
                 response_schema: Some(ResponseSchema::JsonSchema {
                     name: "answer".to_owned(),
@@ -1601,6 +1617,7 @@ mod tests {
             max_completion_tokens: None,
             pricing: Pricing::default(),
             stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
             capabilities: EndpointCapabilities::default(),
         };
         let plan = RoutePlan {
@@ -1733,6 +1750,28 @@ mod tests {
         assert!(batch.is_success());
         assert_eq!(batch.results.as_ref().map(Vec::len), Some(1));
         Ok(())
+    }
+
+    #[test]
+    fn free_inkling_routes_require_agentic_harnesses() {
+        for model in [
+            "thinkingmachines/inkling:free",
+            "thinkingmachines/inkling-20260715:free",
+            "thinkingmachines/inkling-small:free",
+        ] {
+            assert_eq!(
+                openrouter_workload_policy(model).agentic,
+                crate::AgenticPolicy::Required
+            );
+        }
+        assert_eq!(
+            openrouter_workload_policy("thinkingmachines/inkling").agentic,
+            crate::AgenticPolicy::Any
+        );
+        assert_eq!(
+            openrouter_workload_policy("nvidia/nemotron-3-ultra-550b-a55b:free").agentic,
+            crate::AgenticPolicy::Any
+        );
     }
 
     #[test]
@@ -1885,6 +1924,7 @@ mod tests {
             max_completion_tokens: None,
             pricing: Pricing::default(),
             stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
             capabilities: EndpointCapabilities::default(),
         };
         endpoint
@@ -1933,6 +1973,7 @@ mod tests {
             max_completion_tokens: None,
             pricing: Pricing::default(),
             stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
             capabilities: EndpointCapabilities::default(),
         };
         fast.stats.latency_seconds.p75 = Some(0.2);
