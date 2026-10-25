@@ -246,6 +246,7 @@ impl NvidiaModel {
             claimed_parameters: BTreeSet::new(),
             pricing: Some(Pricing::default()),
             route_class: Some(ModelRouteClass::Free),
+            canonical_hint: None,
             virtual_route: false,
         }
     }

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use inference_redox::providers::{
-    groq::GroqCloud, kilo::KiloGateway, nvidia::NvidiaNim, openrouter::OpenRouter,
+    groq::GroqCloud, kilo::KiloGateway, nvidia::NvidiaNim, opencode::OpenCodeConsole,
+    openrouter::OpenRouter,
 };
 use inference_redox::{
     BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, ConformanceProbe,
@@ -159,6 +160,7 @@ struct Providers {
     nvidia: Option<Arc<NvidiaNim>>,
     groq: Option<Arc<GroqCloud>>,
     kilo: Arc<KiloGateway>,
+    opencode: Option<Arc<OpenCodeConsole>>,
     conformance: Arc<Mutex<ConformanceProfile>>,
     conformance_probe_lock: Arc<Mutex<()>>,
     conformance_cache_path: Arc<PathBuf>,
@@ -182,6 +184,11 @@ impl Providers {
         if let Ok(inventory) = self.kilo.inventory(&base_catalog).await {
             inventories.push(inventory);
         }
+        if let Some(opencode) = self.opencode.as_ref()
+            && let Ok(inventory) = opencode.inventory(&base_catalog).await
+        {
+            inventories.push(inventory);
+        }
         let mut catalog = base_catalog;
         for inventory in &inventories {
             catalog.ingest_provider_inventory(inventory);
@@ -200,6 +207,9 @@ impl Providers {
             pool.register("groq", Arc::clone(groq));
         }
         pool.register("kilo", Arc::clone(&self.kilo));
+        if let Some(opencode) = self.opencode.as_ref() {
+            pool.register("opencode", Arc::clone(opencode));
+        }
         pool
     }
 
@@ -215,6 +225,10 @@ impl Providers {
                 .as_ref()
                 .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
             "kilo" => Some(self.kilo.clone()),
+            "opencode" => self
+                .opencode
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
             _ => None,
         }
     }
@@ -1156,6 +1170,7 @@ struct ApiKeys {
     nvidia: Option<String>,
     groq: Option<String>,
     kilo: Option<String>,
+    opencode: Option<String>,
 }
 
 fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
@@ -1176,11 +1191,13 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         .or(from_file("NVIDIA_API_key")?);
     let groq = environment_key("GROQ_API_KEY").or(from_file("GROQ_API_KEY")?);
     let kilo = environment_key("KILO_API_KEY").or(from_file("KILO_API_KEY")?);
+    let opencode = environment_key("OPENCODE_API_KEY").or(from_file("OPENCODE_API_KEY")?);
     Ok(ApiKeys {
         openrouter,
         nvidia,
         groq,
         kilo,
+        opencode,
     })
 }
 
@@ -1196,6 +1213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .groq
             .map(|key| Arc::new(GroqCloud::new(key).with_quota_pool("default"))),
         kilo: Arc::new(KiloGateway::new(keys.kilo).with_quota_pool("default-egress")),
+        opencode: keys.opencode.map(|key| Arc::new(OpenCodeConsole::new(key))),
         conformance: Arc::new(Mutex::new(conformance)),
         conformance_probe_lock: Arc::new(Mutex::new(())),
         conformance_cache_path: Arc::new(conformance_cache_path),
@@ -1252,6 +1270,7 @@ mod tests {
             "export OPENROUTER_API_KEY='or-key'\r\n",
             "NVIDIA_API_KEY=\"nv-key\"\r\n",
             "GROQ_API_KEY=groq-key\r\n",
+            "OPENCODE_API_KEY=oc-key\r\n",
         );
         assert_eq!(
             key_from_contents(contents, "OPENROUTER_API_KEY").as_deref(),
@@ -1268,6 +1287,10 @@ mod tests {
         assert_eq!(
             key_from_contents(contents, "GROQ_API_KEY").as_deref(),
             Some("groq-key")
+        );
+        assert_eq!(
+            key_from_contents(contents, "OPENCODE_API_KEY").as_deref(),
+            Some("oc-key")
         );
     }
 

@@ -124,14 +124,18 @@ fn response_shape_detail(provider: &str, raw: &Value) -> String {
     )
 }
 
+#[derive(Debug)]
+pub(crate) struct JsonResponse {
+    pub raw: Value,
+    pub quota_observations: Vec<crate::QuotaObservation>,
+}
+
 async fn execute_once(
     client: &Client,
     api_key: Option<&str>,
     url: &str,
     body: &Value,
-    provider: &str,
-    usage_cost_usd: Option<f64>,
-) -> Result<InferenceResponse, AttemptFailure> {
+) -> Result<JsonResponse, AttemptFailure> {
     let mut request = client.post(url).json(body);
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
@@ -164,37 +168,19 @@ async fn execute_once(
         retry_after,
         quota_observations: quota_observations.clone(),
     })?;
-    let content = raw
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .filter(|content| !content.is_empty())
-        .ok_or_else(|| AttemptFailure {
-            phase: ExecutionFailurePhase::ResponseReceived,
-            detail: response_shape_detail(provider, &raw),
-            retryable: false,
-            retry_after,
-            quota_observations: quota_observations.clone(),
-        })?;
-    Ok(InferenceResponse {
-        content: content.to_owned(),
-        model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
-        provider: Some(provider.to_owned()),
-        usage_cost_usd,
-        usage: TokenUsage::from_openai_compatible(&raw),
-        quota_observations,
+    Ok(JsonResponse {
         raw,
+        quota_observations,
     })
 }
 
-pub(crate) async fn execute_chat_with_retry(
+pub(crate) async fn execute_json_with_retry(
     client: &Client,
     api_key: Option<&str>,
     url: &str,
     body: &Value,
-    provider: &str,
-    usage_cost_usd: Option<f64>,
     retry: RetryPolicy,
-) -> Result<InferenceResponse, ProviderError> {
+) -> Result<JsonResponse, ProviderError> {
     if retry.max_attempts == 0 {
         return Err(ProviderError::InvalidRequest(
             "retry.max_attempts must be at least 1".to_owned(),
@@ -206,7 +192,7 @@ pub(crate) async fn execute_chat_with_retry(
     let mut last_quota_observations = Vec::new();
 
     for attempt in 1..=retry.max_attempts {
-        match execute_once(client, api_key, url, body, provider, usage_cost_usd).await {
+        match execute_once(client, api_key, url, body).await {
             Ok(response) => return Ok(response),
             Err(failure) if !failure.retryable => return Err(failure.into_provider_error()),
             Err(failure) => {
@@ -233,6 +219,39 @@ pub(crate) async fn execute_chat_with_retry(
         phase: last_phase.unwrap_or(ExecutionFailurePhase::TransportUnknown),
         detail: last_error.unwrap_or_else(|| "request failed without an error body".to_owned()),
         quota_observations: last_quota_observations,
+    })
+}
+
+pub(crate) async fn execute_chat_with_retry(
+    client: &Client,
+    api_key: Option<&str>,
+    url: &str,
+    body: &Value,
+    provider: &str,
+    usage_cost_usd: Option<f64>,
+    retry: RetryPolicy,
+) -> Result<InferenceResponse, ProviderError> {
+    let JsonResponse {
+        raw,
+        quota_observations,
+    } = execute_json_with_retry(client, api_key, url, body, retry).await?;
+    let content = raw
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| ProviderError::Execution {
+            phase: ExecutionFailurePhase::ResponseReceived,
+            detail: response_shape_detail(provider, &raw),
+            quota_observations: quota_observations.clone(),
+        })?;
+    Ok(InferenceResponse {
+        content: content.to_owned(),
+        model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
+        provider: Some(provider.to_owned()),
+        usage_cost_usd,
+        usage: TokenUsage::from_openai_compatible(&raw),
+        quota_observations,
+        raw,
     })
 }
 

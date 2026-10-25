@@ -16,6 +16,9 @@ pub struct NativeModelRecord {
     pub claimed_parameters: BTreeSet<String>,
     pub pricing: Option<Pricing>,
     pub route_class: Option<ModelRouteClass>,
+    /// Provider metadata authority canonical identity hint, resolved conservatively against the base catalog.
+    #[serde(default)]
+    pub canonical_hint: Option<String>,
     /// True for virtual/dynamic router IDs that must not be mistaken for an underlying model.
     #[serde(default)]
     pub virtual_route: bool,
@@ -70,7 +73,14 @@ impl ProviderInventory {
                 let resolution = if native.virtual_route {
                     InventoryResolution::Unmatched
                 } else {
-                    match catalog.resolve(&native.id) {
+                    let lookup = native.canonical_hint.as_deref().map_or_else(
+                        || catalog.resolve(&native.id),
+                        |hint| match catalog.resolve(hint) {
+                            ModelLookup::NotFound => catalog.resolve(&native.id),
+                            resolved => resolved,
+                        },
+                    );
+                    match lookup {
                         ModelLookup::Resolved { model } => InventoryResolution::Resolved {
                             canonical_id: model.canonical_id,
                             match_kind: model.match_kind,
@@ -196,6 +206,31 @@ mod tests {
         assert!(matches!(
             inventory.models[0].resolution,
             InventoryResolution::Unmatched
+        ));
+    }
+
+    #[test]
+    fn canonical_hint_beats_unrelated_native_slug_matching() {
+        let catalog = ModelCatalog {
+            models: vec![catalog_entry(
+                "openai/gpt-6-sol",
+                "openai/gpt-6-sol",
+                &["openai/gpt-6-sol"],
+            )],
+        };
+        let inventory = ProviderInventory::reconcile(
+            "opencode",
+            vec![NativeModelRecord {
+                id: "gpt-6-sol".to_owned(),
+                canonical_hint: Some("openai/gpt-6-sol".to_owned()),
+                ..NativeModelRecord::default()
+            }],
+            &catalog,
+        );
+        assert!(matches!(
+            &inventory.models[0].resolution,
+            InventoryResolution::Resolved { canonical_id, .. }
+                if canonical_id == "openai/gpt-6-sol"
         ));
     }
 
