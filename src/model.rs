@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,39 @@ impl ReasoningSupport {
     }
 }
 
+/// Empirically observed strength of a schema-like control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintEnforcement {
+    /// The control was accepted on the wire but lost even an easy adversarial constraint.
+    Ineffective,
+    /// Easy constraints hold, but a stronger adversarial stress constraint can still be violated.
+    HintOnly,
+    /// The route survived the stress probe; behavior is consistent with constrained decoding.
+    Constrained,
+}
+
+/// Provider-independent function tool definition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionTool {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub parameters: Value,
+    #[serde(default)]
+    pub strict: bool,
+}
+
+/// Provider-independent tool selection policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto,
+    Required,
+    None,
+    Function { name: String },
+}
+
 /// Requested output schema mode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ResponseSchema {
@@ -197,6 +230,9 @@ pub struct EndpointCapabilities {
     /// Reasoning effort levels observed to fail on this exact provider/model route.
     #[serde(default)]
     pub rejected_reasoning_efforts: BTreeSet<ReasoningEffort>,
+    /// Empirical strength of schema-like controls such as strict structured output and tools.
+    #[serde(default)]
+    pub constraint_enforcement: BTreeMap<String, ConstraintEnforcement>,
     pub reasoning: ReasoningSupport,
     pub supports_implicit_caching: bool,
 }
@@ -222,6 +258,37 @@ impl EndpointCapabilities {
             .all(|parameter| self.supports_parameter(parameter))
     }
 
+    /// Positive route-local conformance evidence for a wire parameter. Provider/catalog claims
+    /// deliberately do not satisfy this check.
+    #[must_use]
+    pub fn verified_parameter(&self, parameter: &str) -> bool {
+        self.adapter_parameters.contains(parameter)
+            && self.verified_parameters.contains(parameter)
+            && !self.rejected_parameters.contains(parameter)
+    }
+
+    #[must_use]
+    pub fn constraint_enforcement(&self, parameter: &str) -> Option<ConstraintEnforcement> {
+        self.constraint_enforcement.get(parameter).copied()
+    }
+
+    #[must_use]
+    pub fn strict_output_transport(&self) -> Option<StrictOutputTransport> {
+        if self.supports_parameter("structured_outputs")
+            && self.constraint_enforcement("structured_outputs")
+                == Some(ConstraintEnforcement::Constrained)
+        {
+            return Some(StrictOutputTransport::Native);
+        }
+        if self.supports_parameter("tools")
+            && self.supports_parameter("tool_choice")
+            && self.constraint_enforcement("tools") == Some(ConstraintEnforcement::Constrained)
+        {
+            return Some(StrictOutputTransport::ForcedTool);
+        }
+        None
+    }
+
     /// Effective support for one normalized reasoning effort. Exact conformance evidence
     /// overrides nominal provider metadata. When `require_verified` is true, nominal metadata
     /// alone is insufficient.
@@ -241,6 +308,12 @@ impl EndpointCapabilities {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictOutputTransport {
+    Native,
+    ForcedTool,
+}
+
 impl Default for EndpointCapabilities {
     fn default() -> Self {
         Self {
@@ -250,6 +323,7 @@ impl Default for EndpointCapabilities {
             rejected_parameters: BTreeSet::new(),
             verified_reasoning_efforts: BTreeSet::new(),
             rejected_reasoning_efforts: BTreeSet::new(),
+            constraint_enforcement: BTreeMap::new(),
             reasoning: ReasoningSupport::None,
             supports_implicit_caching: false,
         }
@@ -371,6 +445,10 @@ pub struct InferenceRequest {
     /// Ask the provider to return its reasoning trace when that surface supports it.
     #[serde(default)]
     pub include_reasoning: bool,
+    #[serde(default)]
+    pub tools: Vec<FunctionTool>,
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
     /// True only when the caller is actually running a coding/agent workflow.
     #[serde(default)]
     pub agentic: bool,
@@ -396,6 +474,8 @@ impl InferenceRequest {
             max_output_tokens: None,
             temperature: None,
             include_reasoning: false,
+            tools: Vec::new(),
+            tool_choice: None,
             agentic: false,
             session_id: None,
             requirements: RequestRequirements::default(),

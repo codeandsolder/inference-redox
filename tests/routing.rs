@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use inference_redox::{
-    Endpoint, EndpointCapabilities, EndpointStats, InferenceRequest, Percentiles, Pricing,
-    ReasoningEffort, ReasoningSupport, RequestRequirements, ResponseSchema, RoutingStrategy,
-    build_route_plan,
+    ConstraintEnforcement, Endpoint, EndpointCapabilities, EndpointStats, InferenceRequest,
+    Percentiles, Pricing, ReasoningEffort, ReasoningSupport, RequestRequirements, ResponseSchema,
+    RoutingStrategy, build_route_plan,
 };
 use serde_json::json;
 
@@ -53,6 +53,8 @@ fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f6
                 "structured_outputs",
                 "reasoning",
                 "reasoning_effort",
+                "tools",
+                "tool_choice",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -72,6 +74,7 @@ fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f6
             rejected_parameters: BTreeSet::new(),
             verified_reasoning_efforts: BTreeSet::new(),
             rejected_reasoning_efforts: BTreeSet::new(),
+            constraint_enforcement: BTreeMap::new(),
             reasoning: ReasoningSupport::GatewayNormalized,
             supports_implicit_caching: true,
         },
@@ -131,6 +134,10 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
     let mut capable = endpoint("capable", 2e-6, 2e-6, 0.2, 100.0);
     capable.capabilities.reasoning =
         ReasoningSupport::Exact([ReasoningEffort::High].into_iter().collect());
+    capable.capabilities.constraint_enforcement.insert(
+        "structured_outputs".to_owned(),
+        ConstraintEnforcement::Constrained,
+    );
     let mut cheap_but_missing_schema = endpoint("cheap", 0.1e-6, 0.1e-6, 0.1, 100.0);
     cheap_but_missing_schema
         .capabilities
@@ -139,6 +146,13 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
     let mut cheap_but_wrong_reasoning = endpoint("wrong-reasoning", 0.1e-6, 0.1e-6, 0.1, 100.0);
     cheap_but_wrong_reasoning.capabilities.reasoning =
         ReasoningSupport::Exact([ReasoningEffort::Low].into_iter().collect());
+    cheap_but_wrong_reasoning
+        .capabilities
+        .constraint_enforcement
+        .insert(
+            "structured_outputs".to_owned(),
+            ConstraintEnforcement::Constrained,
+        );
 
     let mut request = InferenceRequest::new("x/model", "x", 100);
     request.prompt_tokens = Some(100);
@@ -378,6 +392,10 @@ fn verified_parameter_can_fill_missing_provider_claim() -> Result<(), inference_
         .capabilities
         .verified_parameters
         .insert("structured_outputs".to_owned());
+    understated.capabilities.constraint_enforcement.insert(
+        "structured_outputs".to_owned(),
+        ConstraintEnforcement::Constrained,
+    );
 
     let mut request = InferenceRequest::new("x/model", "x", 100);
     request.prompt_tokens = Some(100);
@@ -394,6 +412,186 @@ fn verified_parameter_can_fill_missing_provider_claim() -> Result<(), inference_
         RoutingStrategy::FastestResponseCheap(1.5),
         &request,
         vec![understated],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn strict_schema_can_use_verified_constrained_tool_fallback()
+-> Result<(), inference_redox::ProviderError> {
+    let mut route = endpoint("tool-fallback", 1e-6, 1e-6, 0.1, 100.0);
+    route
+        .capabilities
+        .supported_parameters
+        .remove("structured_outputs");
+    route
+        .capabilities
+        .supported_parameters
+        .insert("tools".to_owned());
+    route
+        .capabilities
+        .supported_parameters
+        .insert("tool_choice".to_owned());
+    route
+        .capabilities
+        .constraint_enforcement
+        .insert("tools".to_owned(), ConstraintEnforcement::Constrained);
+
+    let mut request = InferenceRequest::new("x/model", "x", 10);
+    request.prompt_tokens = Some(10);
+    request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
+        name: "answer".to_owned(),
+        schema: json!({"type": "object"}),
+        strict: true,
+    });
+
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route],
+    )?;
+    assert_eq!(plan.candidates[0].endpoint.id, "tool-fallback");
+    Ok(())
+}
+
+#[test]
+fn strict_schema_rejects_unverified_or_hint_only_tool_fallback() {
+    for enforcement in [
+        None,
+        Some(ConstraintEnforcement::Ineffective),
+        Some(ConstraintEnforcement::HintOnly),
+    ] {
+        let mut route = endpoint("tool-fallback", 1e-6, 1e-6, 0.1, 100.0);
+        route
+            .capabilities
+            .supported_parameters
+            .remove("structured_outputs");
+        route
+            .capabilities
+            .supported_parameters
+            .insert("tools".to_owned());
+        route
+            .capabilities
+            .supported_parameters
+            .insert("tool_choice".to_owned());
+        if let Some(enforcement) = enforcement {
+            route
+                .capabilities
+                .constraint_enforcement
+                .insert("tools".to_owned(), enforcement);
+        }
+        let mut request = InferenceRequest::new("x/model", "x", 10);
+        request.prompt_tokens = Some(10);
+        request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
+            name: "answer".to_owned(),
+            schema: json!({"type": "object"}),
+            strict: true,
+        });
+        assert!(matches!(
+            build_route_plan(
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                vec![route],
+            ),
+            Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+        ));
+    }
+}
+
+#[test]
+fn strict_schema_does_not_repurpose_tools_when_request_already_has_tools() {
+    let mut route = endpoint("tool-fallback", 1e-6, 1e-6, 0.1, 100.0);
+    route
+        .capabilities
+        .supported_parameters
+        .remove("structured_outputs");
+    route
+        .capabilities
+        .supported_parameters
+        .extend(["tools".to_owned(), "tool_choice".to_owned()]);
+    route
+        .capabilities
+        .constraint_enforcement
+        .insert("tools".to_owned(), ConstraintEnforcement::Constrained);
+    let mut request = InferenceRequest::new("x/model", "x", 10);
+    request.prompt_tokens = Some(10);
+    request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
+        name: "answer".to_owned(),
+        schema: json!({"type": "object"}),
+        strict: true,
+    });
+    request.tools.push(inference_redox::FunctionTool {
+        name: "real_tool".to_owned(),
+        description: None,
+        parameters: json!({"type": "object"}),
+        strict: true,
+    });
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+}
+
+#[test]
+fn nominal_structured_output_claim_is_not_enough_for_strict_routing() {
+    let route = endpoint("nominal-structured", 1e-6, 1e-6, 0.1, 100.0);
+    let mut request = InferenceRequest::new("x/model", "x", 10);
+    request.prompt_tokens = Some(10);
+    request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
+        name: "answer".to_owned(),
+        schema: json!({"type": "object"}),
+        strict: true,
+    });
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+}
+
+#[test]
+fn ordinary_tools_require_observed_tool_surface_not_catalog_claim()
+-> Result<(), inference_redox::ProviderError> {
+    let mut route = endpoint("nominal-tools", 1e-6, 1e-6, 0.1, 100.0);
+    route
+        .capabilities
+        .supported_parameters
+        .extend(["tools".to_owned(), "tool_choice".to_owned()]);
+    let mut request = InferenceRequest::new("x/model", "x", 10);
+    request.prompt_tokens = Some(10);
+    request.tools.push(inference_redox::FunctionTool {
+        name: "lookup".to_owned(),
+        description: None,
+        parameters: json!({"type": "object"}),
+        strict: false,
+    });
+    request.tool_choice = Some(inference_redox::ToolChoice::Function {
+        name: "lookup".to_owned(),
+    });
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route.clone()],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+    route
+        .capabilities
+        .verified_parameters
+        .extend(["tools".to_owned(), "tool_choice".to_owned()]);
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route],
     )?;
     assert_eq!(plan.candidates.len(), 1);
     Ok(())

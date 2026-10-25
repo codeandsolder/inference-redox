@@ -34,10 +34,11 @@ pub use inventory::{
     InventoryResolution, NativeModelRecord, ProviderInventory, ProviderModelObservation,
 };
 pub use model::{
-    AgenticPolicy, EffectivePricing, Endpoint, EndpointCapabilities, EndpointStats,
-    InferenceRequest, InferenceResponse, Percentiles, Pricing, PricingOverride, ReasoningEffort,
-    ReasoningSupport, RequestRequirements, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan,
-    RoutingStrategy, TokenUsage, WorkloadPolicy,
+    AgenticPolicy, ConstraintEnforcement, EffectivePricing, Endpoint, EndpointCapabilities,
+    EndpointStats, FunctionTool, InferenceRequest, InferenceResponse, Percentiles, Pricing,
+    PricingOverride, ReasoningEffort, ReasoningSupport, RequestRequirements, ResponseSchema,
+    RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy, StrictOutputTransport, TokenUsage,
+    ToolChoice, WorkloadPolicy,
 };
 pub use pool::{
     InferencePool, PooledInferenceResponse, QuotaExecutionContext, QuotaInferenceError,

@@ -101,6 +101,9 @@ pub trait InferenceProvider: Send + Sync {
         crate::build_route_plan(strategy, &request, endpoints)
     }
 
+    /// Route and execute one endpoint at a time in ranked order. Provider adapters never own
+    /// failover policy: every dispatch receives a one-candidate plan, matching `InferencePool`
+    /// semantics and preventing gateways from silently choosing a different upstream.
     async fn infer(
         &self,
         strategy: RoutingStrategy,
@@ -109,7 +112,24 @@ pub trait InferenceProvider: Send + Sync {
     ) -> Result<(RoutePlan, InferenceResponse), ProviderError> {
         let endpoints = self.endpoints(&request.model).await?;
         let plan = crate::build_route_plan(strategy, request, endpoints)?;
-        let response = self.execute_plan(request, &plan, retry).await?;
-        Ok((plan, response))
+        let mut attempted = 0_usize;
+        let mut last_error = None;
+        for candidate in plan.candidates.clone() {
+            attempted += 1;
+            let candidate_plan = RoutePlan {
+                prompt_tokens: plan.prompt_tokens,
+                expected_output_tokens: plan.expected_output_tokens,
+                cheapest_cost_usd: candidate.expected_cost_usd,
+                cost_ceiling_usd: candidate.expected_cost_usd,
+                candidates: vec![candidate],
+            };
+            match self.execute_plan(request, &candidate_plan, retry).await {
+                Ok(response) => return Ok((plan, response)),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            ProviderError::Request(format!("all {attempted} ranked provider candidates failed"))
+        }))
     }
 }

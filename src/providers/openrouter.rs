@@ -16,7 +16,8 @@ use crate::{
     InferenceProvider, InferenceRequest, InferenceResponse, ModelArchitecture, ModelBenchmarks,
     ModelCatalog, ModelCatalogEntry, ModelLookup, ModelReasoning, ModelRouteClass,
     ModelTopProvider, Percentiles, Pricing, PricingOverride, ProviderError, ReasoningEffort,
-    ReasoningSupport, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan, TokenUsage,
+    ReasoningSupport, ResponseSchema, RetryPolicy, RouteCandidate, RoutePlan,
+    StrictOutputTransport, TokenUsage, ToolChoice,
 };
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -169,37 +170,22 @@ impl OpenRouter {
     }
 
     fn provider_selector(candidate: &RouteCandidate) -> String {
-        candidate.endpoint.provider_key.clone()
+        // OpenRouter base provider slugs may match multiple endpoint variants. The catalog tag in
+        // endpoint.id is the exact selector (for example `near-ai/fp4`). Always pin that full tag.
+        candidate.endpoint.id.clone()
     }
 
-    fn route_batches(plan: &RoutePlan) -> Vec<Vec<&RouteCandidate>> {
-        let mut batches: Vec<Vec<&RouteCandidate>> = Vec::new();
-        for candidate in &plan.candidates {
-            let tier = Self::service_tier(&candidate.endpoint.id);
-            let append = batches.last().is_some_and(|batch| {
-                batch
-                    .first()
-                    .is_some_and(|first| Self::service_tier(&first.endpoint.id) == tier)
-            });
-            if append {
-                let index = batches.len() - 1;
-                batches[index].push(candidate);
-            } else {
-                batches.push(vec![candidate]);
-            }
+    fn only_candidate<'a>(
+        plan: &'a RoutePlan,
+        model: &str,
+    ) -> Result<&'a RouteCandidate, ProviderError> {
+        match plan.candidates.as_slice() {
+            [candidate] => Ok(candidate),
+            [] => Err(ProviderError::NoEligibleEndpoint(model.to_owned())),
+            _ => Err(ProviderError::InvalidRequest(
+                "OpenRouter execution requires exactly one pinned route; failover belongs to the generic router".to_owned(),
+            )),
         }
-        batches
-    }
-
-    fn selectors(candidates: &[&RouteCandidate]) -> Vec<String> {
-        let mut selectors = Vec::new();
-        for candidate in candidates {
-            let selector = Self::provider_selector(candidate);
-            if !selectors.contains(&selector) {
-                selectors.push(selector);
-            }
-        }
-        selectors
     }
 
     fn response_format(schema: &ResponseSchema) -> Value {
@@ -258,10 +244,64 @@ impl OpenRouter {
         Some(Value::Object(reasoning))
     }
 
+    fn structured_transport(
+        request: &InferenceRequest,
+        endpoint: &Endpoint,
+    ) -> Option<StrictOutputTransport> {
+        match request.requirements.response_schema.as_ref() {
+            Some(ResponseSchema::JsonSchema { strict: true, .. }) => {
+                endpoint.capabilities.strict_output_transport()
+            }
+            _ => None,
+        }
+    }
+
+    fn forced_output_tool(schema: &ResponseSchema) -> Option<Value> {
+        let ResponseSchema::JsonSchema {
+            name,
+            schema,
+            strict: true,
+        } = schema
+        else {
+            return None;
+        };
+        Some(json!({
+            "type": "function",
+            "function": {
+                "name": "__inference_redox_output",
+                "description": format!("Return the structured {name} result."),
+                "strict": true,
+                "parameters": schema,
+            }
+        }))
+    }
+
+    fn tool_choice(choice: &ToolChoice) -> Value {
+        match choice {
+            ToolChoice::Auto => json!("auto"),
+            ToolChoice::Required => json!("required"),
+            ToolChoice::None => json!("none"),
+            ToolChoice::Function { name } => {
+                json!({"type": "function", "function": {"name": name}})
+            }
+        }
+    }
+
+    fn function_tool(tool: &crate::FunctionTool) -> Value {
+        let mut function = serde_json::Map::new();
+        function.insert("name".to_owned(), json!(tool.name));
+        if let Some(description) = tool.description.as_ref() {
+            function.insert("description".to_owned(), json!(description));
+        }
+        function.insert("strict".to_owned(), json!(tool.strict));
+        function.insert("parameters".to_owned(), tool.parameters.clone());
+        json!({"type": "function", "function": function})
+    }
+
     fn compile_body(
         request: &InferenceRequest,
         plan: &RoutePlan,
-        candidates: &[&RouteCandidate],
+        candidate: &RouteCandidate,
     ) -> Value {
         let mut object = serde_json::Map::new();
         object.insert("model".to_owned(), json!(request.model));
@@ -272,12 +312,10 @@ impl OpenRouter {
         messages.push(json!({"role": "user", "content": request.prompt}));
         object.insert("messages".to_owned(), Value::Array(messages));
         if let Some(maximum) = request.max_output_tokens {
-            let use_completion_name = candidates.first().is_some_and(|candidate| {
-                candidate
-                    .endpoint
-                    .capabilities
-                    .supports_parameter("max_completion_tokens")
-            });
+            let use_completion_name = candidate
+                .endpoint
+                .capabilities
+                .supports_parameter("max_completion_tokens");
             let key = if use_completion_name {
                 "max_completion_tokens"
             } else {
@@ -286,35 +324,18 @@ impl OpenRouter {
             object.insert(key.to_owned(), json!(maximum));
         }
 
-        let selectors = Self::selectors(candidates);
-        let max_prompt_price = candidates
-            .iter()
-            .map(|candidate| {
-                candidate
-                    .endpoint
-                    .pricing
-                    .effective(plan.prompt_tokens)
-                    .prompt_per_token
-            })
-            .fold(0.0_f64, f64::max)
-            * 1_000_000.0;
-        let max_completion_price = candidates
-            .iter()
-            .map(|candidate| {
-                candidate
-                    .endpoint
-                    .pricing
-                    .effective(plan.prompt_tokens)
-                    .completion_per_token
-            })
-            .fold(0.0_f64, f64::max)
-            * 1_000_000.0;
-        let has_local_latency = candidates
-            .iter()
-            .any(|candidate| candidate.expected_response_p75_seconds.is_some());
+        let effective_pricing = candidate.endpoint.pricing.effective(plan.prompt_tokens);
+        let max_prompt_price = effective_pricing.prompt_per_token * 1_000_000.0;
+        let max_completion_price = effective_pricing.completion_per_token * 1_000_000.0;
         let mut provider = serde_json::Map::new();
-        provider.insert("only".to_owned(), json!(selectors));
-        provider.insert("allow_fallbacks".to_owned(), json!(true));
+        provider.insert(
+            "only".to_owned(),
+            json!([Self::provider_selector(candidate)]),
+        );
+        provider.insert("allow_fallbacks".to_owned(), json!(false));
+        // Endpoint eligibility comes from inference-redox conformance evidence, not OpenRouter's
+        // supported_parameters declarations. With an exact endpoint pin, metadata filtering can
+        // only hide under-declared capabilities or turn stale catalog data into false negatives.
         provider.insert("require_parameters".to_owned(), json!(false));
         provider.insert(
             "max_price".to_owned(),
@@ -323,39 +344,40 @@ impl OpenRouter {
                 "completion": max_completion_price,
             }),
         );
-        if has_local_latency {
-            provider.insert("order".to_owned(), json!(Self::selectors(candidates)));
-        } else {
-            let sort = if request.expected_output_tokens <= 512 {
-                "latency"
-            } else {
-                "throughput"
-            };
-            provider.insert("sort".to_owned(), json!(sort));
-        }
         object.insert("provider".to_owned(), Value::Object(provider));
 
-        if let Some(tier) = candidates
-            .first()
-            .and_then(|candidate| Self::service_tier(&candidate.endpoint.id))
-        {
+        if let Some(tier) = Self::service_tier(&candidate.endpoint.id) {
             object.insert("service_tier".to_owned(), json!(tier.as_str()));
         }
+        let forced_output = Self::structured_transport(request, &candidate.endpoint)
+            == Some(StrictOutputTransport::ForcedTool);
         if let Some(schema) = request.requirements.response_schema.as_ref() {
-            object.insert("response_format".to_owned(), Self::response_format(schema));
+            if forced_output {
+                if let Some(tool) = Self::forced_output_tool(schema) {
+                    object.insert("tools".to_owned(), Value::Array(vec![tool]));
+                    object.insert(
+                        "tool_choice".to_owned(),
+                        json!({"type": "function", "function": {"name": "__inference_redox_output"}}),
+                    );
+                }
+            } else {
+                object.insert("response_format".to_owned(), Self::response_format(schema));
+            }
+        }
+        if !forced_output && !request.tools.is_empty() {
+            object.insert(
+                "tools".to_owned(),
+                Value::Array(request.tools.iter().map(Self::function_tool).collect()),
+            );
+        }
+        if !forced_output && let Some(choice) = request.tool_choice.as_ref() {
+            object.insert("tool_choice".to_owned(), Self::tool_choice(choice));
         }
         if let Some(temperature) = request.temperature {
             object.insert("temperature".to_owned(), json!(temperature));
         }
         if let Some(reasoning) = Self::reasoning_control(request) {
             object.insert("reasoning".to_owned(), reasoning);
-        } else if candidates.iter().all(|candidate| {
-            candidate
-                .endpoint
-                .capabilities
-                .supports_parameter("reasoning")
-        }) {
-            object.insert("reasoning".to_owned(), json!({"enabled": false}));
         }
         if request.include_reasoning {
             object.insert("include_reasoning".to_owned(), json!(true));
@@ -386,6 +408,15 @@ impl OpenRouter {
         if let Some(schema) = request.requirements.response_schema.as_ref() {
             object.insert("response_format".to_owned(), Self::response_format(schema));
         }
+        if !request.tools.is_empty() {
+            object.insert(
+                "tools".to_owned(),
+                Value::Array(request.tools.iter().map(Self::function_tool).collect()),
+            );
+        }
+        if let Some(choice) = request.tool_choice.as_ref() {
+            object.insert("tool_choice".to_owned(), Self::tool_choice(choice));
+        }
         if let Some(temperature) = request.temperature {
             object.insert("temperature".to_owned(), json!(temperature));
         }
@@ -401,7 +432,7 @@ impl OpenRouter {
     fn compile_batch_submission(
         batch_model: &str,
         items: &[BatchInferenceItem],
-        provider_only: Option<&str>,
+        provider: &str,
     ) -> Result<Value, ProviderError> {
         if items.is_empty() {
             return Err(ProviderError::InvalidRequest(
@@ -434,17 +465,15 @@ impl OpenRouter {
         let mut body = serde_json::Map::new();
         body.insert("endpoint".to_owned(), json!("/v1/chat/completions"));
         body.insert("model".to_owned(), json!(model));
-        if let Some(provider) = provider_only {
-            if provider.trim().is_empty() {
-                return Err(ProviderError::InvalidRequest(
-                    "batch provider must not be empty".to_owned(),
-                ));
-            }
-            body.insert(
-                "provider".to_owned(),
-                json!({"only": [provider], "allow_fallbacks": false}),
-            );
+        if provider.trim().is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "batch provider endpoint must not be empty".to_owned(),
+            ));
         }
+        body.insert(
+            "provider".to_owned(),
+            json!({"only": [provider], "allow_fallbacks": false, "require_parameters": false}),
+        );
         body.insert("requests".to_owned(), Value::Array(requests));
         Ok(Value::Object(body))
     }
@@ -469,34 +498,6 @@ impl OpenRouter {
         })
     }
 
-    /// Submit asynchronous `OpenRouter` batch work. `batch_model` must be a catalog `:batch` route.
-    ///
-    /// # Errors
-    /// Returns an error for invalid batch input or an unsuccessful API response.
-    pub async fn submit_batch(
-        &self,
-        batch_model: &str,
-        items: &[BatchInferenceItem],
-    ) -> Result<BatchJob, ProviderError> {
-        let body = Self::compile_batch_submission(batch_model, items, None)?;
-        let response = self
-            .request(reqwest::Method::POST, format!("{}/batches", self.base_url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| ProviderError::Request(error.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Request(format!("HTTP {status}: {body}")));
-        }
-        let raw: Value = response
-            .json()
-            .await
-            .map_err(|error| ProviderError::Response(error.to_string()))?;
-        Self::normalize_batch(raw)
-    }
-
     /// Submit a batch pinned to one `OpenRouter` provider slug.
     ///
     /// # Errors
@@ -507,7 +508,7 @@ impl OpenRouter {
         provider: &str,
         items: &[BatchInferenceItem],
     ) -> Result<BatchJob, ProviderError> {
-        let body = Self::compile_batch_submission(batch_model, items, Some(provider))?;
+        let body = Self::compile_batch_submission(batch_model, items, provider)?;
         let response = self
             .request(reqwest::Method::POST, format!("{}/batches", self.base_url))
             .json(&body)
@@ -588,9 +589,9 @@ impl OpenRouter {
         url: &str,
         request: &InferenceRequest,
         plan: &RoutePlan,
-        batch: &[&RouteCandidate],
+        candidate: &RouteCandidate,
     ) -> Result<InferenceResponse, OpenRouterAttemptFailure> {
-        let body = Self::compile_body(request, plan, batch);
+        let body = Self::compile_body(request, plan, candidate);
         let response = self
             .request(reqwest::Method::POST, url.to_owned())
             .json(&body)
@@ -637,10 +638,16 @@ impl OpenRouter {
                 quota_observations,
             });
         }
-        let Some(content) = Self::response_content(&raw) else {
+        let forced_output = Self::structured_transport(request, &candidate.endpoint)
+            == Some(StrictOutputTransport::ForcedTool);
+        let Some(content) = Self::response_content(&raw, forced_output) else {
             return Err(OpenRouterAttemptFailure {
                 phase: ExecutionFailurePhase::ResponseReceived,
-                detail: "OpenRouter success response omitted choices[0].message".to_owned(),
+                detail: if forced_output {
+                    "OpenRouter constrained-output fallback omitted the forced tool call".to_owned()
+                } else {
+                    "OpenRouter success response omitted choices[0].message".to_owned()
+                },
                 retryable: false,
                 retry_after,
                 quota_observations,
@@ -660,13 +667,25 @@ impl OpenRouter {
         })
     }
 
-    fn response_content(raw: &Value) -> Option<String> {
-        raw.pointer("/choices/0/message").map(|_| {
-            raw.pointer("/choices/0/message/content")
+    fn response_content(raw: &Value, forced_output: bool) -> Option<String> {
+        let message = raw.pointer("/choices/0/message")?;
+        if forced_output {
+            return message
+                .pointer("/tool_calls/0/function")
+                .filter(|function| {
+                    function.get("name").and_then(Value::as_str) == Some("__inference_redox_output")
+                })
+                .and_then(|function| function.get("arguments"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+        Some(
+            message
+                .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_owned()
-        })
+                .to_owned(),
+        )
     }
 
     fn retryable_status(status: StatusCode) -> bool {
@@ -1472,6 +1491,8 @@ impl OpenRouterEndpoint {
                     "reasoning_max_tokens",
                     "include_reasoning",
                     "system_role",
+                    "tools",
+                    "tool_choice",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -1481,6 +1502,7 @@ impl OpenRouterEndpoint {
                 rejected_parameters: BTreeSet::new(),
                 verified_reasoning_efforts: BTreeSet::new(),
                 rejected_reasoning_efforts: BTreeSet::new(),
+                constraint_enforcement: BTreeMap::new(),
                 reasoning,
                 supports_implicit_caching: self.supports_implicit_caching.unwrap_or(false),
             },
@@ -1551,10 +1573,7 @@ impl InferenceProvider for OpenRouter {
                 "retry.max_attempts must be at least 1".to_owned(),
             ));
         }
-        let batches = Self::route_batches(plan);
-        if batches.is_empty() {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        }
+        let candidate = Self::only_candidate(plan, &request.model)?;
         let url = format!("{}/chat/completions", self.base_url);
         let mut backoff = retry.initial_backoff;
         let mut last_error = None;
@@ -1562,33 +1581,32 @@ impl InferenceProvider for OpenRouter {
         let mut last_quota_observations = Vec::new();
 
         for attempt in 1..=retry.max_attempts {
-            let mut retry_after = None;
-            for batch in &batches {
-                match self.execute_batch_once(&url, request, plan, batch).await {
-                    Ok(response) => return Ok(response),
-                    Err(failure) if !failure.retryable => {
-                        return Err(failure.into_provider_error());
+            match self
+                .execute_batch_once(&url, request, plan, candidate)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(failure) if !failure.retryable => {
+                    return Err(failure.into_provider_error());
+                }
+                Err(failure) => {
+                    let retry_after = failure.retry_after;
+                    if last_phase.is_none()
+                        || failure.phase == ExecutionFailurePhase::ResponseReceived
+                    {
+                        last_phase = Some(failure.phase);
                     }
-                    Err(failure) => {
-                        retry_after = failure.retry_after.or(retry_after);
-                        if last_phase.is_none()
-                            || failure.phase == ExecutionFailurePhase::ResponseReceived
-                        {
-                            last_phase = Some(failure.phase);
-                        }
-                        if !failure.quota_observations.is_empty() {
-                            last_quota_observations = failure.quota_observations;
-                        }
-                        last_error = Some(failure.detail);
+                    if !failure.quota_observations.is_empty() {
+                        last_quota_observations = failure.quota_observations;
+                    }
+                    last_error = Some(failure.detail);
+                    if attempt < retry.max_attempts {
+                        let delay = retry_after.unwrap_or(backoff).min(retry.max_backoff);
+                        sleep(delay).await;
+                        backoff = Self::next_backoff(backoff, retry.max_backoff);
                     }
                 }
             }
-            if attempt == retry.max_attempts {
-                break;
-            }
-            let delay = retry_after.unwrap_or(backoff).min(retry.max_backoff);
-            sleep(delay).await;
-            backoff = Self::next_backoff(backoff, retry.max_backoff);
         }
 
         Err(ProviderError::Execution {
@@ -1604,6 +1622,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn execution_rejects_multi_candidate_gateway_plans() {
+        let request = InferenceRequest::new("vendor/model", "hello", 8);
+        let endpoint = |id: &str| Endpoint {
+            source: "openrouter".to_owned(),
+            credential: None,
+            provider_key: id.split('/').next().unwrap_or(id).to_owned(),
+            id: id.to_owned(),
+            provider: id.to_owned(),
+            model: request.model.clone(),
+            route_class: ModelRouteClass::Standard,
+            display_name: id.to_owned(),
+            quantization: None,
+            status: 0,
+            context_length: Some(1_000),
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: Pricing::default(),
+            stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
+            capabilities: EndpointCapabilities::default(),
+        };
+        let plan = RoutePlan {
+            prompt_tokens: 1,
+            expected_output_tokens: 8,
+            cheapest_cost_usd: 0.0,
+            cost_ceiling_usd: 0.0,
+            candidates: ["first/fp8", "second/fp8"]
+                .into_iter()
+                .map(|id| RouteCandidate {
+                    endpoint: endpoint(id),
+                    expected_cost_usd: 0.0,
+                    expected_response_p75_seconds: None,
+                    expected_response_p95_seconds: None,
+                })
+                .collect(),
+        };
+        assert!(matches!(
+            OpenRouter::only_candidate(&plan, &request.model),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
     fn reasoning_only_success_can_have_empty_visible_content() {
         let raw = json!({
             "choices": [{
@@ -1611,8 +1672,11 @@ mod tests {
                 "finish_reason": "length"
             }]
         });
-        assert_eq!(OpenRouter::response_content(&raw).as_deref(), Some(""));
-        assert!(OpenRouter::response_content(&json!({"choices": [{}]})).is_none());
+        assert_eq!(
+            OpenRouter::response_content(&raw, false).as_deref(),
+            Some("")
+        );
+        assert!(OpenRouter::response_content(&json!({"choices": [{}]}), false).is_none());
     }
 
     #[test]
@@ -1643,6 +1707,8 @@ mod tests {
             max_output_tokens: None,
             temperature: Some(0.0),
             include_reasoning: false,
+            tools: Vec::new(),
+            tool_choice: None,
             agentic: false,
             session_id: None,
             requirements: crate::RequestRequirements {
@@ -1686,14 +1752,17 @@ mod tests {
                 expected_response_p95_seconds: None,
             }],
         };
-        let body = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
+        let body = OpenRouter::compile_body(&request, &plan, &plan.candidates[0]);
         assert_eq!(
             body.pointer("/provider/only/0").and_then(Value::as_str),
-            Some("fast-provider")
+            Some("fast-provider/fp8")
         );
+        assert!(body.pointer("/provider/sort").is_none());
+        assert!(body.pointer("/provider/order").is_none());
         assert_eq!(
-            body.pointer("/provider/sort").and_then(Value::as_str),
-            Some("latency")
+            body.pointer("/provider/allow_fallbacks")
+                .and_then(Value::as_bool),
+            Some(false)
         );
         assert!(body.get("max_completion_tokens").is_none());
         assert!(body.get("max_tokens").is_none());
@@ -1714,6 +1783,181 @@ mod tests {
             body.pointer("/response_format/type")
                 .and_then(Value::as_str),
             Some("json_schema")
+        );
+        assert_eq!(
+            body.pointer("/provider/require_parameters")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn compiles_verified_strict_output_as_forced_tool_when_native_schema_is_missing() {
+        let mut request = InferenceRequest::new("openai/example", "hello", 16);
+        request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
+            name: "answer".to_owned(),
+            schema: json!({
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"],
+                "additionalProperties": false
+            }),
+            strict: true,
+        });
+        let mut endpoint = Endpoint {
+            source: "openrouter".to_owned(),
+            credential: None,
+            provider_key: "tools-only".to_owned(),
+            id: "tools-only/int4".to_owned(),
+            provider: "Tools Only".to_owned(),
+            model: request.model.clone(),
+            route_class: ModelRouteClass::Standard,
+            display_name: "Tools Only".to_owned(),
+            quantization: None,
+            status: 0,
+            context_length: Some(1000),
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: Pricing::default(),
+            stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
+            capabilities: EndpointCapabilities::default(),
+        };
+        endpoint
+            .capabilities
+            .adapter_parameters
+            .extend(["tools".to_owned(), "tool_choice".to_owned()]);
+        endpoint
+            .capabilities
+            .supported_parameters
+            .extend(["tools".to_owned(), "tool_choice".to_owned()]);
+        endpoint.capabilities.constraint_enforcement.insert(
+            "tools".to_owned(),
+            crate::ConstraintEnforcement::Constrained,
+        );
+        let plan = RoutePlan {
+            prompt_tokens: 5,
+            expected_output_tokens: 16,
+            cheapest_cost_usd: 0.0,
+            cost_ceiling_usd: 0.0,
+            candidates: vec![RouteCandidate {
+                endpoint,
+                expected_cost_usd: 0.0,
+                expected_response_p75_seconds: None,
+                expected_response_p95_seconds: None,
+            }],
+        };
+        let body = OpenRouter::compile_body(&request, &plan, &plan.candidates[0]);
+        assert!(body.get("response_format").is_none());
+        assert_eq!(
+            body.pointer("/tools/0/function/name")
+                .and_then(Value::as_str),
+            Some("__inference_redox_output")
+        );
+        assert_eq!(
+            body.pointer("/tools/0/function/strict")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/tool_choice/function/name")
+                .and_then(Value::as_str),
+            Some("__inference_redox_output")
+        );
+        assert_eq!(
+            body.pointer("/provider/require_parameters")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn forced_output_response_extracts_only_expected_tool_arguments() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "function": {
+                            "name": "__inference_redox_output",
+                            "arguments": r#"{"value":7}"#
+                        }
+                    }]
+                }
+            }]
+        });
+        assert_eq!(
+            OpenRouter::response_content(&raw, true).as_deref(),
+            Some(r#"{"value":7}"#)
+        );
+        let wrong = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{"function": {"name": "other", "arguments": "{}"}}]
+                }
+            }]
+        });
+        assert!(OpenRouter::response_content(&wrong, true).is_none());
+    }
+
+    #[test]
+    fn compiles_explicit_function_tools_and_exact_choice() {
+        let mut request = InferenceRequest::new("openai/example", "hello", 16);
+        request.tools.push(crate::FunctionTool {
+            name: "lookup".to_owned(),
+            description: Some("Look up a value".to_owned()),
+            parameters: json!({"type": "object", "properties": {}}),
+            strict: true,
+        });
+        request.tool_choice = Some(ToolChoice::Function {
+            name: "lookup".to_owned(),
+        });
+        let endpoint = Endpoint {
+            source: "openrouter".to_owned(),
+            credential: None,
+            provider_key: "provider".to_owned(),
+            id: "provider/fp8".to_owned(),
+            provider: "Provider".to_owned(),
+            model: request.model.clone(),
+            route_class: ModelRouteClass::Standard,
+            display_name: "Provider".to_owned(),
+            quantization: None,
+            status: 0,
+            context_length: Some(1000),
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: Pricing::default(),
+            stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
+            capabilities: EndpointCapabilities::default(),
+        };
+        let plan = RoutePlan {
+            prompt_tokens: 5,
+            expected_output_tokens: 16,
+            cheapest_cost_usd: 0.0,
+            cost_ceiling_usd: 0.0,
+            candidates: vec![RouteCandidate {
+                endpoint,
+                expected_cost_usd: 0.0,
+                expected_response_p75_seconds: None,
+                expected_response_p95_seconds: None,
+            }],
+        };
+        let body = OpenRouter::compile_body(&request, &plan, &plan.candidates[0]);
+        assert_eq!(
+            body.pointer("/tools/0/function/name")
+                .and_then(Value::as_str),
+            Some("lookup")
+        );
+        assert_eq!(
+            body.pointer("/tools/0/function/strict")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/tool_choice/function/name")
+                .and_then(Value::as_str),
+            Some("lookup")
         );
     }
 
@@ -1757,7 +2001,7 @@ mod tests {
             }],
         };
 
-        let off = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
+        let off = OpenRouter::compile_body(&request, &plan, &plan.candidates[0]);
         assert_eq!(
             off.pointer("/reasoning/enabled").and_then(Value::as_bool),
             Some(false)
@@ -1774,7 +2018,7 @@ mod tests {
 
         request.requirements.reasoning = ReasoningEffort::None;
         request.requirements.reasoning_max_tokens = Some(256);
-        let bounded = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
+        let bounded = OpenRouter::compile_body(&request, &plan, &plan.candidates[0]);
         assert!(bounded.pointer("/reasoning/effort").is_none());
         assert_eq!(
             bounded
@@ -1796,7 +2040,7 @@ mod tests {
                 custom_id: "sheet-1".to_owned(),
                 request,
             }],
-            None,
+            "azure/global",
         )?;
         assert_eq!(
             body.get("endpoint").and_then(Value::as_str),
@@ -1816,13 +2060,22 @@ mod tests {
                 .and_then(Value::as_str),
             Some("json_object")
         );
+        assert_eq!(
+            body.pointer("/provider/only/0").and_then(Value::as_str),
+            Some("azure/global")
+        );
+        assert_eq!(
+            body.pointer("/provider/allow_fallbacks")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
         let pinned = OpenRouter::compile_batch_submission(
             "openai/gpt-6-luna:batch",
             &[BatchInferenceItem {
                 custom_id: "sheet-2".to_owned(),
                 request: InferenceRequest::new("ignored", "summarize", 64),
             }],
-            Some("azure"),
+            "azure",
         )?;
         assert_eq!(
             pinned.pointer("/provider/only/0").and_then(Value::as_str),
@@ -1851,11 +2104,11 @@ mod tests {
             },
         ];
         assert!(matches!(
-            OpenRouter::compile_batch_submission("openai/gpt-6-luna:batch", &duplicate, None),
+            OpenRouter::compile_batch_submission("openai/gpt-6-luna:batch", &duplicate, "azure"),
             Err(ProviderError::InvalidRequest(_))
         ));
         assert!(matches!(
-            OpenRouter::compile_batch_submission("openai/gpt-6-luna", &duplicate[..1], None),
+            OpenRouter::compile_batch_submission("openai/gpt-6-luna", &duplicate[..1], "azure"),
             Err(ProviderError::InvalidRequest(_))
         ));
     }
@@ -2064,19 +2317,19 @@ mod tests {
                 expected_response_p95_seconds: None,
             }],
         };
-        let body = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
+        let body = OpenRouter::compile_body(&request, &plan, &plan.candidates[0]);
         assert_eq!(
             body.get("service_tier").and_then(Value::as_str),
             Some("flex")
         );
         assert_eq!(
             body.pointer("/provider/only/0").and_then(Value::as_str),
-            Some("openai")
+            Some("openai/flex")
         );
     }
 
     #[test]
-    fn local_telemetry_uses_explicit_ranked_order() {
+    fn local_telemetry_never_delegates_ordering_to_openrouter() {
         let request = InferenceRequest::new("vendor/model", "hello", 64);
         let mut fast = Endpoint {
             source: "openrouter".to_owned(),
@@ -2111,12 +2364,18 @@ mod tests {
                 expected_response_p95_seconds: None,
             }],
         };
-        let body = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
+        let body = OpenRouter::compile_body(&request, &plan, &plan.candidates[0]);
         assert_eq!(
-            body.pointer("/provider/order/0").and_then(Value::as_str),
-            Some("fast")
+            body.pointer("/provider/only/0").and_then(Value::as_str),
+            Some("fast/fp8")
         );
+        assert!(body.pointer("/provider/order").is_none());
         assert!(body.pointer("/provider/sort").is_none());
+        assert_eq!(
+            body.pointer("/provider/allow_fallbacks")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

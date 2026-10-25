@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -189,6 +189,7 @@ impl InferenceProvider for NvidiaNim {
                 rejected_parameters: BTreeSet::new(),
                 verified_reasoning_efforts: BTreeSet::new(),
                 rejected_reasoning_efforts: BTreeSet::new(),
+                constraint_enforcement: BTreeMap::new(),
                 reasoning: ReasoningSupport::None,
                 supports_implicit_caching: false,
             },

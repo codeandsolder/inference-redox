@@ -26,6 +26,10 @@ pub struct InferenceRequestTemplate {
     #[serde(default)]
     pub include_reasoning: bool,
     #[serde(default)]
+    pub tools: Vec<crate::FunctionTool>,
+    #[serde(default)]
+    pub tool_choice: Option<crate::ToolChoice>,
+    #[serde(default)]
     pub agentic: bool,
     #[serde(default)]
     pub session_id: Option<String>,
@@ -45,6 +49,8 @@ impl InferenceRequestTemplate {
             max_output_tokens: self.max_output_tokens,
             temperature: self.temperature,
             include_reasoning: self.include_reasoning,
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
             agentic: self.agentic,
             session_id: self.session_id.clone(),
             requirements: self.requirements.clone(),
@@ -584,6 +590,8 @@ mod tests {
             max_output_tokens: Some(20),
             temperature: None,
             include_reasoning: false,
+            tools: Vec::new(),
+            tool_choice: None,
             agentic: false,
             session_id: None,
             requirements: RequestRequirements {

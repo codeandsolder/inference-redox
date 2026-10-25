@@ -708,7 +708,7 @@ impl InferencePool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
@@ -762,6 +762,7 @@ mod tests {
                     rejected_parameters: BTreeSet::new(),
                     verified_reasoning_efforts: BTreeSet::new(),
                     rejected_reasoning_efforts: BTreeSet::new(),
+                    constraint_enforcement: BTreeMap::new(),
                     reasoning: ReasoningSupport::None,
                     supports_implicit_caching: false,
                 },
@@ -842,6 +843,7 @@ mod tests {
                     rejected_parameters: BTreeSet::new(),
                     verified_reasoning_efforts: BTreeSet::new(),
                     rejected_reasoning_efforts: BTreeSet::new(),
+                    constraint_enforcement: BTreeMap::new(),
                     reasoning: ReasoningSupport::None,
                     supports_implicit_caching: false,
                 },
@@ -970,6 +972,8 @@ mod tests {
             max_output_tokens: Some(20),
             temperature: None,
             include_reasoning: false,
+            tools: Vec::new(),
+            tool_choice: None,
             agentic: false,
             session_id: None,
             requirements: crate::RequestRequirements {
@@ -1095,6 +1099,7 @@ mod tests {
                 reasoning_chars: None,
                 puzzle_correct: None,
                 finish_reason: None,
+                constraint_satisfied: None,
                 test_id: "max-tokens-test".to_owned(),
                 test_version: 1,
                 outcome: crate::ConformanceOutcome::Failed,

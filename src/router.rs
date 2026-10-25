@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::{
     AgenticPolicy, Endpoint, InferenceRequest, ProviderError, ReasoningEffort, ResponseSchema,
-    RouteCandidate, RoutePlan, RoutingStrategy,
+    RouteCandidate, RoutePlan, RoutingStrategy, StrictOutputTransport,
 };
 
 /// Cheap cross-model token estimate used only for routing/cost prediction.
@@ -73,9 +73,27 @@ pub(crate) fn supports_request(
     {
         return false;
     }
-    if !endpoint
-        .capabilities
-        .supports_parameters(&request.requirements.required_parameters)
+    if !supports_behavioral_request(endpoint, request) {
+        return false;
+    }
+    supports_reasoning_request(endpoint, request)
+}
+
+fn supports_behavioral_request(endpoint: &Endpoint, request: &InferenceRequest) -> bool {
+    if !request
+        .requirements
+        .required_parameters
+        .iter()
+        .all(|parameter| {
+            if matches!(
+                parameter.as_str(),
+                "response_format" | "structured_outputs" | "tools" | "tool_choice"
+            ) {
+                endpoint.capabilities.verified_parameter(parameter)
+            } else {
+                endpoint.capabilities.supports_parameter(parameter)
+            }
+        })
     {
         return false;
     }
@@ -90,25 +108,42 @@ pub(crate) fn supports_request(
     {
         return false;
     }
+    if !request.tools.is_empty() {
+        if !endpoint.capabilities.verified_parameter("tools") {
+            return false;
+        }
+        if request.tools.iter().any(|tool| tool.strict)
+            && endpoint.capabilities.constraint_enforcement("tools")
+                != Some(crate::ConstraintEnforcement::Constrained)
+        {
+            return false;
+        }
+    }
+    if request.tool_choice.is_some() && !endpoint.capabilities.verified_parameter("tool_choice") {
+        return false;
+    }
     match request.requirements.response_schema.as_ref() {
         None => {}
         Some(ResponseSchema::JsonObject) => {
-            if !endpoint.capabilities.supports_parameter("response_format") {
+            if !endpoint.capabilities.verified_parameter("response_format") {
                 return false;
             }
         }
         Some(ResponseSchema::JsonSchema { strict, .. }) => {
-            let parameter = if *strict {
-                "structured_outputs"
-            } else {
-                "response_format"
-            };
-            if !endpoint.capabilities.supports_parameter(parameter) {
+            if *strict {
+                let transport = endpoint.capabilities.strict_output_transport();
+                if transport.is_none()
+                    || (!request.tools.is_empty()
+                        && transport == Some(StrictOutputTransport::ForcedTool))
+                {
+                    return false;
+                }
+            } else if !endpoint.capabilities.verified_parameter("response_format") {
                 return false;
             }
         }
     }
-    supports_reasoning_request(endpoint, request)
+    true
 }
 
 fn supports_reasoning_request(endpoint: &Endpoint, request: &InferenceRequest) -> bool {

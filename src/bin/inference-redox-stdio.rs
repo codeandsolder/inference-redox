@@ -78,6 +78,8 @@ struct WireConformanceRequest {
     #[serde(default)]
     provider_key: Option<String>,
     #[serde(default)]
+    endpoint_id: Option<String>,
+    #[serde(default)]
     refresh: bool,
     probes: Vec<ConformanceProbe>,
 }
@@ -347,10 +349,15 @@ async fn run_conformance(
                 .as_ref()
                 .is_none_or(|provider_key| &endpoint.provider_key == provider_key)
         })
+        .filter(|endpoint| {
+            spec.endpoint_id
+                .as_ref()
+                .is_none_or(|endpoint_id| &endpoint.id == endpoint_id)
+        })
         .collect::<Vec<_>>();
     let [endpoint] = matching_endpoints.as_slice() else {
         return Err(ProviderError::InvalidRequest(format!(
-            "conformance endpoint selection matched {} endpoints; specify provider_key",
+            "conformance endpoint selection matched {} endpoints; specify endpoint_id (provider_key alone may match multiple variants)",
             matching_endpoints.len()
         )));
     };
@@ -547,17 +554,19 @@ async fn handle_batch_operation(
                 write_error(stdout, id, "submit_batch requires batch_items").await;
                 return;
             };
-            let result = if let Some(provider) = batch_provider.as_deref() {
-                providers
-                    .openrouter
-                    .submit_batch_to_provider(&batch_model, provider, &batch_items)
-                    .await
-            } else {
-                providers
-                    .openrouter
-                    .submit_batch(&batch_model, &batch_items)
-                    .await
+            let Some(provider) = batch_provider.as_deref() else {
+                write_error(
+                    stdout,
+                    id,
+                    "submit_batch requires batch_provider; OpenRouter batch routing is never delegated to the gateway",
+                )
+                .await;
+                return;
             };
+            let result = providers
+                .openrouter
+                .submit_batch_to_provider(&batch_model, provider, &batch_items)
+                .await;
             match result {
                 Ok(batch) => {
                     write_json(
@@ -1370,6 +1379,7 @@ mod tests {
             "conformance": {
                 "model": "openai/gpt-oss-120b",
                 "source": "groq",
+                "endpoint_id": "groq",
                 "probes": ["basic_chat", "strict_json_schema", "reasoning_low"]
             }
         }))?;
@@ -1381,6 +1391,12 @@ mod tests {
         assert_eq!(
             wire.conformance.as_ref().map(|spec| spec.refresh),
             Some(false)
+        );
+        assert_eq!(
+            wire.conformance
+                .as_ref()
+                .and_then(|spec| spec.endpoint_id.as_deref()),
+            Some("groq")
         );
         Ok(())
     }
@@ -1425,6 +1441,7 @@ mod tests {
                 reasoning_chars: None,
                 puzzle_correct: None,
                 finish_reason: None,
+                constraint_satisfied: None,
                 test_id: "basic-chat".to_owned(),
                 test_version: 1,
                 outcome: ConformanceOutcome::Passed,

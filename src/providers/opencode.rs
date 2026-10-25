@@ -623,6 +623,7 @@ impl InferenceProvider for OpenCodeConsole {
                 rejected_parameters: BTreeSet::new(),
                 verified_reasoning_efforts: BTreeSet::new(),
                 rejected_reasoning_efforts: BTreeSet::new(),
+                constraint_enforcement: BTreeMap::new(),
                 reasoning: model_metadata.reasoning_support(),
                 supports_implicit_caching: false,
             },
