@@ -24,12 +24,14 @@ pub enum ConformanceProbe {
     SystemRole,
     JsonObject,
     StrictJsonSchema,
+    ReasoningOff,
     ReasoningMinimal,
     ReasoningLow,
     ReasoningMedium,
     ReasoningHigh,
     ReasoningXhigh,
     ReasoningMax,
+    ReasoningBudget256,
 }
 
 impl ConformanceProbe {
@@ -40,20 +42,32 @@ impl ConformanceProbe {
             Self::SystemRole => "system-role",
             Self::JsonObject => "json-object",
             Self::StrictJsonSchema => "strict-json-schema",
+            Self::ReasoningOff => "reasoning-off",
             Self::ReasoningMinimal => "reasoning-minimal",
             Self::ReasoningLow => "reasoning-low",
             Self::ReasoningMedium => "reasoning-medium",
             Self::ReasoningHigh => "reasoning-high",
             Self::ReasoningXhigh => "reasoning-xhigh",
             Self::ReasoningMax => "reasoning-max",
+            Self::ReasoningBudget256 => "reasoning-budget-256",
         }
     }
 
     #[must_use]
     pub const fn test_version(self) -> u32 {
-        match self.reasoning_effort() {
-            Some(_) => 3,
-            None => 1,
+        match self {
+            Self::ReasoningOff
+            | Self::ReasoningMinimal
+            | Self::ReasoningLow
+            | Self::ReasoningMedium
+            | Self::ReasoningHigh
+            | Self::ReasoningXhigh
+            | Self::ReasoningMax => 6,
+            Self::ReasoningBudget256
+            | Self::BasicChat
+            | Self::SystemRole
+            | Self::JsonObject
+            | Self::StrictJsonSchema => 1,
         }
     }
 
@@ -64,26 +78,48 @@ impl ConformanceProbe {
             Self::SystemRole => "system_role",
             Self::JsonObject => "response_format",
             Self::StrictJsonSchema => "structured_outputs",
-            Self::ReasoningMinimal
+            Self::ReasoningOff
+            | Self::ReasoningMinimal
             | Self::ReasoningLow
             | Self::ReasoningMedium
             | Self::ReasoningHigh
             | Self::ReasoningXhigh
             | Self::ReasoningMax => "reasoning",
+            Self::ReasoningBudget256 => "reasoning_max_tokens",
         }
     }
 
     #[must_use]
     pub const fn reasoning_effort(self) -> Option<ReasoningEffort> {
         match self {
+            Self::ReasoningOff => Some(ReasoningEffort::None),
             Self::ReasoningMinimal => Some(ReasoningEffort::Minimal),
             Self::ReasoningLow => Some(ReasoningEffort::Low),
             Self::ReasoningMedium => Some(ReasoningEffort::Medium),
             Self::ReasoningHigh => Some(ReasoningEffort::High),
             Self::ReasoningXhigh => Some(ReasoningEffort::Xhigh),
             Self::ReasoningMax => Some(ReasoningEffort::Max),
-            Self::BasicChat | Self::SystemRole | Self::JsonObject | Self::StrictJsonSchema => None,
+            Self::BasicChat
+            | Self::SystemRole
+            | Self::JsonObject
+            | Self::StrictJsonSchema
+            | Self::ReasoningBudget256 => None,
         }
+    }
+
+    #[must_use]
+    pub const fn is_reasoning_probe(self) -> bool {
+        matches!(
+            self,
+            Self::ReasoningOff
+                | Self::ReasoningMinimal
+                | Self::ReasoningLow
+                | Self::ReasoningMedium
+                | Self::ReasoningHigh
+                | Self::ReasoningXhigh
+                | Self::ReasoningMax
+                | Self::ReasoningBudget256
+        )
     }
 
     #[must_use]
@@ -140,7 +176,8 @@ impl ConformanceProbe {
                 };
                 request
             }
-            Self::ReasoningMinimal
+            Self::ReasoningOff
+            | Self::ReasoningMinimal
             | Self::ReasoningLow
             | Self::ReasoningMedium
             | Self::ReasoningHigh
@@ -148,12 +185,28 @@ impl ConformanceProbe {
             | Self::ReasoningMax => {
                 let mut request = InferenceRequest::new(
                     model,
-                    "What is 17 * 19? Reply with the number only.",
+                    "A,B,C,D,E,F are a permutation of 1..6. A+B=7; B+C=8; C+D=9; D+E=7; E+F=5; |A-F|=2. Find ABCDEF. Reply with the 6 digits only.",
                     16,
                 );
-                request.max_output_tokens = Some(512);
+                request.max_output_tokens = Some(2048);
+                request.include_reasoning = true;
                 request.requirements.reasoning =
                     self.reasoning_effort().unwrap_or(ReasoningEffort::None);
+                request
+                    .requirements
+                    .required_parameters
+                    .insert("reasoning".to_owned());
+                request
+            }
+            Self::ReasoningBudget256 => {
+                let mut request = InferenceRequest::new(
+                    model,
+                    "A,B,C,D,E,F are a permutation of 1..6. A+B=7; B+C=8; C+D=9; D+E=7; E+F=5; |A-F|=2. Find ABCDEF. Reply with the 6 digits only.",
+                    16,
+                );
+                request.max_output_tokens = Some(2048);
+                request.include_reasoning = true;
+                request.requirements.reasoning_max_tokens = Some(256);
                 request
             }
         }
@@ -174,6 +227,13 @@ impl ConformanceProbe {
         let endpoint_id = Some(endpoint.id.clone());
         let native_model_id = endpoint.model.clone();
         let mut request = self.request(native_model_id.clone());
+        if !endpoint
+            .capabilities
+            .adapter_parameters
+            .contains("include_reasoning")
+        {
+            request.include_reasoning = false;
+        }
         if endpoint.workload_policy.agentic == AgenticPolicy::Required {
             request.agentic = true;
         }
@@ -206,11 +266,33 @@ impl ConformanceProbe {
             max_attempts: 1,
             ..RetryPolicy::default()
         };
+        let mut reasoning_tokens = None;
+        let mut completion_tokens = None;
+        let mut reasoning_chars = None;
+        let mut puzzle_correct = None;
+        let mut finish_reason = None;
         let (outcome, detail) = match provider.execute_plan(&request, &plan, retry).await {
-            Ok(response) => match self.validate_response(&response) {
-                Ok(()) => (ConformanceOutcome::Passed, None),
-                Err(detail) => (ConformanceOutcome::Failed, Some(detail)),
-            },
+            Ok(response) => {
+                reasoning_tokens = response.usage.reasoning_tokens;
+                completion_tokens = response.usage.output_tokens;
+                reasoning_chars = response
+                    .raw
+                    .pointer("/choices/0/message/reasoning")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| u64::try_from(value.chars().count()).ok());
+                finish_reason = response
+                    .raw
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                if self.is_reasoning_probe() {
+                    puzzle_correct = Some(response.content.trim() == "253614");
+                }
+                match self.validate_response(&response) {
+                    Ok(()) => (ConformanceOutcome::Passed, None),
+                    Err(detail) => (ConformanceOutcome::Failed, Some(detail)),
+                }
+            }
             Err(error) => (
                 classify_probe_error(&error),
                 Some(probe_error_detail(&error)),
@@ -225,6 +307,11 @@ impl ConformanceProbe {
             canonical_id,
             parameter: self.parameter().to_owned(),
             reasoning_effort: self.reasoning_effort(),
+            reasoning_tokens,
+            completion_tokens,
+            reasoning_chars,
+            puzzle_correct,
+            finish_reason,
             test_id: self.test_id().to_owned(),
             test_version: self.test_version(),
             outcome,
@@ -244,20 +331,21 @@ impl ConformanceProbe {
                     Err("response JSON did not contain boolean ok=true".to_owned())
                 }
             }
-            Self::BasicChat
-            | Self::SystemRole
-            | Self::ReasoningMinimal
-            | Self::ReasoningLow
-            | Self::ReasoningMedium
-            | Self::ReasoningHigh
-            | Self::ReasoningXhigh
-            | Self::ReasoningMax => {
+            Self::BasicChat | Self::SystemRole => {
                 if response.content.trim().is_empty() {
                     Err("response content was empty".to_owned())
                 } else {
                     Ok(())
                 }
             }
+            Self::ReasoningOff
+            | Self::ReasoningMinimal
+            | Self::ReasoningLow
+            | Self::ReasoningMedium
+            | Self::ReasoningHigh
+            | Self::ReasoningXhigh
+            | Self::ReasoningMax
+            | Self::ReasoningBudget256 => Ok(()),
         }
     }
 }
@@ -324,6 +412,16 @@ pub struct ConformanceObservation {
     pub parameter: String,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default)]
+    pub completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub reasoning_chars: Option<u64>,
+    #[serde(default)]
+    pub puzzle_correct: Option<bool>,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
     pub test_id: String,
     pub test_version: u32,
     pub outcome: ConformanceOutcome,
@@ -393,6 +491,7 @@ impl ConformanceProfile {
 impl ConformanceObservation {
     fn effective_reasoning_effort(&self) -> Option<ReasoningEffort> {
         self.reasoning_effort.or(match self.test_id.as_str() {
+            "reasoning-off" => Some(ReasoningEffort::None),
             "reasoning-minimal" => Some(ReasoningEffort::Minimal),
             "reasoning-low" => Some(ReasoningEffort::Low),
             "reasoning-medium" => Some(ReasoningEffort::Medium),
@@ -555,6 +654,11 @@ mod tests {
             canonical_id: None,
             parameter: parameter.to_owned(),
             reasoning_effort: None,
+            reasoning_tokens: None,
+            completion_tokens: None,
+            reasoning_chars: None,
+            puzzle_correct: None,
+            finish_reason: None,
             test_id: test_id.to_owned(),
             test_version: version,
             outcome,
@@ -702,6 +806,31 @@ mod tests {
         .apply_to_endpoint(&mut route);
         assert!(route.capabilities.verified_parameters.contains("seed"));
         assert!(route.capabilities.rejected_parameters.is_empty());
+    }
+
+    #[test]
+    fn reasoning_off_probe_is_explicit_and_requests_trace() {
+        let request = ConformanceProbe::ReasoningOff.request("model");
+        assert_eq!(request.requirements.reasoning, ReasoningEffort::None);
+        assert!(
+            request
+                .requirements
+                .required_parameters
+                .contains("reasoning")
+        );
+        assert!(request.include_reasoning);
+    }
+
+    #[test]
+    fn reasoning_budget_probe_is_independent_from_effort() {
+        let request = ConformanceProbe::ReasoningBudget256.request("model");
+        assert_eq!(request.requirements.reasoning, ReasoningEffort::None);
+        assert_eq!(request.requirements.reasoning_max_tokens, Some(256));
+        assert!(request.include_reasoning);
+        assert_eq!(
+            ConformanceProbe::ReasoningBudget256.parameter(),
+            "reasoning_max_tokens"
+        );
     }
 
     #[test]

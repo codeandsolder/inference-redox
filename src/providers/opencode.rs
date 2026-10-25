@@ -160,7 +160,7 @@ impl OpenCodeModel {
         if self.temperature {
             parameters.insert("temperature".to_owned());
         }
-        if matches!(self.dialect, Dialect::OpenAiResponses) && !self.reasoning_efforts.is_empty() {
+        if matches!(self.dialect, Dialect::OpenAiResponses) {
             parameters.insert("reasoning".to_owned());
             parameters.insert("reasoning_effort".to_owned());
         }
@@ -353,16 +353,22 @@ impl OpenCodeConsole {
                 request.model
             )));
         }
-        if request.requirements.reasoning != ReasoningEffort::None
-            && !model
-                .reasoning_support()
-                .supports(request.requirements.reasoning)
-        {
+        let explicit_reasoning = request.requirements.reasoning != ReasoningEffort::None
+            || request.requirements.reasoning_max_tokens.is_some()
+            || request
+                .requirements
+                .required_parameters
+                .contains("reasoning");
+        if explicit_reasoning && !matches!(model.dialect, Dialect::OpenAiResponses) {
             return Err(ProviderError::InvalidRequest(format!(
-                "OpenCode model {} does not support normalized reasoning effort {}",
-                request.model,
-                request.requirements.reasoning.as_str()
+                "OpenCode model {} has no normalized reasoning-control dialect",
+                request.model
             )));
+        }
+        if request.requirements.reasoning_max_tokens.is_some() {
+            return Err(ProviderError::InvalidRequest(
+                "OpenCode reasoning token budgets are not normalized yet".to_owned(),
+            ));
         }
         if request.requirements.response_schema.is_some()
             && (!model.structured_output || matches!(model.dialect, Dialect::AnthropicMessages))
@@ -417,7 +423,12 @@ impl OpenCodeConsole {
             };
             body.insert("text".to_owned(), json!({"format": format}));
         }
-        if request.requirements.reasoning != ReasoningEffort::None {
+        if request.requirements.reasoning != ReasoningEffort::None
+            || request
+                .requirements
+                .required_parameters
+                .contains("reasoning")
+        {
             body.insert(
                 "reasoning".to_owned(),
                 json!({"effort": request.requirements.reasoning.as_str()}),
@@ -1019,6 +1030,35 @@ mod tests {
             Dialect::from_provider(&provider(None, "https://x/openai/v1")),
             Some(Dialect::OpenAiChat)
         );
+    }
+
+    #[test]
+    fn responses_adapter_can_probe_unadvertised_reasoning_efforts() -> Result<(), ProviderError> {
+        let model = OpenCodeModel {
+            id: "probe-model".to_owned(),
+            name: "Probe Model".to_owned(),
+            canonical_hint: None,
+            context_length: None,
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: Pricing::default(),
+            dialect: Dialect::OpenAiResponses,
+            temperature: false,
+            structured_output: false,
+            reasoning_efforts: BTreeSet::new(),
+            api_base: "https://example.test/openai/v1".to_owned(),
+        };
+        assert!(model.adapter_parameters().contains("reasoning"));
+        assert!(!model.claimed_parameters().contains("reasoning"));
+
+        let mut request = InferenceRequest::new("probe-model", "hi", 8);
+        request.requirements.reasoning = ReasoningEffort::Max;
+        let body = OpenCodeConsole::compile_body(&model, &request)?;
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("max")
+        );
+        Ok(())
     }
 
     #[test]

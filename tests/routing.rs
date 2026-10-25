@@ -162,6 +162,66 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
 }
 
 #[test]
+fn reasoning_budget_requires_verified_route_support() -> Result<(), inference_redox::ProviderError>
+{
+    let mut route = endpoint("budget", 1e-6, 1e-6, 0.1, 100.0);
+    route
+        .capabilities
+        .adapter_parameters
+        .insert("reasoning_max_tokens".to_owned());
+
+    let mut request = InferenceRequest::new("x/model", "x", 10);
+    request.prompt_tokens = Some(10);
+    request.requirements.reasoning_max_tokens = Some(256);
+
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route.clone()],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+
+    route
+        .capabilities
+        .verified_parameters
+        .insert("reasoning_max_tokens".to_owned());
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn verified_reasoning_off_can_be_required_explicitly() -> Result<(), inference_redox::ProviderError>
+{
+    let mut endpoint = endpoint("verified-off", 1e-6, 1e-6, 0.1, 100.0);
+    endpoint
+        .capabilities
+        .verified_reasoning_efforts
+        .insert(ReasoningEffort::None);
+    let mut request = InferenceRequest::new("x/model", "x", 10);
+    request.prompt_tokens = Some(10);
+    request
+        .requirements
+        .required_parameters
+        .insert("reasoning".to_owned());
+    request.requirements.require_verified_reasoning = true;
+
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![endpoint],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn verified_reasoning_requirement_rejects_nominal_only_support()
 -> Result<(), inference_redox::ProviderError> {
     let mut route = endpoint("reasoning", 1e-6, 1e-6, 0.1, 100.0);
@@ -482,23 +542,29 @@ fn forbidden_agentic_route_rejects_agentic_workload() {
 }
 
 #[test]
-fn subscription_route_has_zero_marginal_routing_cost_but_keeps_list_price()
+fn subscription_route_uses_discounted_price_and_true_free_route_wins()
 -> Result<(), inference_redox::ProviderError> {
     let mut subscription = endpoint("subscription", 1e-3, 2e-3, 0.1, 100.0);
     subscription.route_class = inference_redox::ModelRouteClass::Subscription;
-    let list_cost = subscription.pricing.expected_cost(10, 10);
-    assert!(list_cost > 0.0);
+    let subscription_cost = subscription.pricing.expected_cost(10, 10);
+    assert!(subscription_cost > 0.0);
+
+    let mut free = endpoint("free", 0.0, 0.0, 0.1, 100.0);
+    free.route_class = inference_redox::ModelRouteClass::Free;
 
     let mut request = InferenceRequest::new("x/model", "work", 10);
     request.prompt_tokens = Some(10);
-    request.requirements.allowed_route_classes =
-        BTreeSet::from([inference_redox::ModelRouteClass::Subscription]);
+    request.requirements.allowed_route_classes = BTreeSet::from([
+        inference_redox::ModelRouteClass::Free,
+        inference_redox::ModelRouteClass::Subscription,
+    ]);
     let plan = build_route_plan(
         RoutingStrategy::FastestResponseCheap(1.5),
         &request,
-        vec![subscription],
+        vec![subscription, free],
     )?;
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].endpoint.id, "free");
     assert_eq!(plan.candidates[0].expected_cost_usd, 0.0);
-    assert!(plan.candidates[0].endpoint.pricing.expected_cost(10, 10) > 0.0);
     Ok(())
 }

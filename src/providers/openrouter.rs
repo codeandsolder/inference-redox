@@ -220,6 +220,44 @@ impl OpenRouter {
         }
     }
 
+    fn validate_reasoning_control(request: &InferenceRequest) -> Result<(), ProviderError> {
+        if request.requirements.reasoning != ReasoningEffort::None
+            && request.requirements.reasoning_max_tokens.is_some()
+        {
+            return Err(ProviderError::InvalidRequest(
+                "OpenRouter reasoning effort and max_tokens are mutually exclusive".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reasoning_control(request: &InferenceRequest) -> Option<Value> {
+        let explicit = request.requirements.reasoning != ReasoningEffort::None
+            || request.requirements.reasoning_max_tokens.is_some()
+            || request
+                .requirements
+                .required_parameters
+                .contains("reasoning");
+        if !explicit {
+            return None;
+        }
+        let mut reasoning = serde_json::Map::new();
+        if request.requirements.reasoning == ReasoningEffort::None
+            && request.requirements.reasoning_max_tokens.is_none()
+        {
+            reasoning.insert("enabled".to_owned(), json!(false));
+        } else if request.requirements.reasoning != ReasoningEffort::None {
+            reasoning.insert(
+                "effort".to_owned(),
+                json!(request.requirements.reasoning.as_str()),
+            );
+        }
+        if let Some(maximum) = request.requirements.reasoning_max_tokens {
+            reasoning.insert("max_tokens".to_owned(), json!(maximum));
+        }
+        Some(Value::Object(reasoning))
+    }
+
     fn compile_body(
         request: &InferenceRequest,
         plan: &RoutePlan,
@@ -277,7 +315,7 @@ impl OpenRouter {
         let mut provider = serde_json::Map::new();
         provider.insert("only".to_owned(), json!(selectors));
         provider.insert("allow_fallbacks".to_owned(), json!(true));
-        provider.insert("require_parameters".to_owned(), json!(true));
+        provider.insert("require_parameters".to_owned(), json!(false));
         provider.insert(
             "max_price".to_owned(),
             json!({
@@ -309,11 +347,8 @@ impl OpenRouter {
         if let Some(temperature) = request.temperature {
             object.insert("temperature".to_owned(), json!(temperature));
         }
-        if request.requirements.reasoning != ReasoningEffort::None {
-            object.insert(
-                "reasoning".to_owned(),
-                json!({"effort": request.requirements.reasoning.as_str()}),
-            );
+        if let Some(reasoning) = Self::reasoning_control(request) {
+            object.insert("reasoning".to_owned(), reasoning);
         } else if candidates.iter().all(|candidate| {
             candidate
                 .endpoint
@@ -321,6 +356,9 @@ impl OpenRouter {
                 .supports_parameter("reasoning")
         }) {
             object.insert("reasoning".to_owned(), json!({"enabled": false}));
+        }
+        if request.include_reasoning {
+            object.insert("include_reasoning".to_owned(), json!(true));
         }
         Value::Object(object)
     }
@@ -351,11 +389,11 @@ impl OpenRouter {
         if let Some(temperature) = request.temperature {
             object.insert("temperature".to_owned(), json!(temperature));
         }
-        if request.requirements.reasoning != ReasoningEffort::None {
-            object.insert(
-                "reasoning".to_owned(),
-                json!({"effort": request.requirements.reasoning.as_str()}),
-            );
+        if let Some(reasoning) = Self::reasoning_control(request) {
+            object.insert("reasoning".to_owned(), reasoning);
+        }
+        if request.include_reasoning {
+            object.insert("include_reasoning".to_owned(), json!(true));
         }
         Value::Object(object)
     }
@@ -375,6 +413,7 @@ impl OpenRouter {
         let requests = items
             .iter()
             .map(|item| {
+                Self::validate_reasoning_control(&item.request)?;
                 if item.custom_id.trim().is_empty() {
                     return Err(ProviderError::InvalidRequest(
                         "batch custom_id must not be empty".to_owned(),
@@ -598,29 +637,17 @@ impl OpenRouter {
                 quota_observations,
             });
         }
-        let Some(content) = raw
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-        else {
+        let Some(content) = Self::response_content(&raw) else {
             return Err(OpenRouterAttemptFailure {
                 phase: ExecutionFailurePhase::ResponseReceived,
-                detail: "OpenRouter success response omitted choices[0].message.content".to_owned(),
-                retryable: true,
+                detail: "OpenRouter success response omitted choices[0].message".to_owned(),
+                retryable: false,
                 retry_after,
                 quota_observations,
             });
         };
-        if content.is_empty() {
-            return Err(OpenRouterAttemptFailure {
-                phase: ExecutionFailurePhase::ResponseReceived,
-                detail: "OpenRouter success response returned empty message content".to_owned(),
-                retryable: true,
-                retry_after,
-                quota_observations,
-            });
-        }
         Ok(InferenceResponse {
-            content: content.to_owned(),
+            content,
             model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
             provider: raw
                 .get("provider")
@@ -630,6 +657,15 @@ impl OpenRouter {
             usage: TokenUsage::from_openai_compatible(&raw),
             quota_observations,
             raw,
+        })
+    }
+
+    fn response_content(raw: &Value) -> Option<String> {
+        raw.pointer("/choices/0/message").map(|_| {
+            raw.pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
         })
     }
 
@@ -1433,6 +1469,8 @@ impl OpenRouterEndpoint {
                     "temperature",
                     "reasoning",
                     "reasoning_effort",
+                    "reasoning_max_tokens",
+                    "include_reasoning",
                     "system_role",
                 ]
                 .into_iter()
@@ -1507,6 +1545,7 @@ impl InferenceProvider for OpenRouter {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
+        Self::validate_reasoning_control(request)?;
         if retry.max_attempts == 0 {
             return Err(ProviderError::InvalidRequest(
                 "retry.max_attempts must be at least 1".to_owned(),
@@ -1565,6 +1604,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reasoning_only_success_can_have_empty_visible_content() {
+        let raw = json!({
+            "choices": [{
+                "message": {"content": null, "reasoning": "still thinking"},
+                "finish_reason": "length"
+            }]
+        });
+        assert_eq!(OpenRouter::response_content(&raw).as_deref(), Some(""));
+        assert!(OpenRouter::response_content(&json!({"choices": [{}]})).is_none());
+    }
+
+    #[test]
     fn classifies_embedded_openrouter_errors() {
         assert!(OpenRouter::embedded_error_retryable(&json!({
             "code": 502,
@@ -1591,6 +1642,7 @@ mod tests {
             prompt_tokens: Some(5),
             max_output_tokens: None,
             temperature: Some(0.0),
+            include_reasoning: false,
             agentic: false,
             session_id: None,
             requirements: crate::RequestRequirements {
@@ -1662,6 +1714,73 @@ mod tests {
             body.pointer("/response_format/type")
                 .and_then(Value::as_str),
             Some("json_schema")
+        );
+    }
+
+    #[test]
+    fn compiles_explicit_reasoning_off_budget_and_trace_controls() {
+        let mut request = InferenceRequest::new("vendor/model", "puzzle", 32);
+        request.include_reasoning = true;
+        request
+            .requirements
+            .required_parameters
+            .insert("reasoning".to_owned());
+        let endpoint = Endpoint {
+            source: "openrouter".to_owned(),
+            credential: None,
+            provider_key: "provider".to_owned(),
+            id: "provider/fp8".to_owned(),
+            provider: "Provider".to_owned(),
+            model: request.model.clone(),
+            route_class: ModelRouteClass::Free,
+            display_name: "Provider".to_owned(),
+            quantization: None,
+            status: 0,
+            context_length: Some(1000),
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: Pricing::default(),
+            stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
+            capabilities: EndpointCapabilities::default(),
+        };
+        let plan = RoutePlan {
+            prompt_tokens: 5,
+            expected_output_tokens: 32,
+            cheapest_cost_usd: 0.0,
+            cost_ceiling_usd: 0.0,
+            candidates: vec![crate::RouteCandidate {
+                endpoint,
+                expected_cost_usd: 0.0,
+                expected_response_p75_seconds: None,
+                expected_response_p95_seconds: None,
+            }],
+        };
+
+        let off = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
+        assert_eq!(
+            off.pointer("/reasoning/enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            off.get("include_reasoning").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            off.pointer("/provider/require_parameters")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        request.requirements.reasoning = ReasoningEffort::None;
+        request.requirements.reasoning_max_tokens = Some(256);
+        let bounded = OpenRouter::compile_body(&request, &plan, &[&plan.candidates[0]]);
+        assert!(bounded.pointer("/reasoning/effort").is_none());
+        assert_eq!(
+            bounded
+                .pointer("/reasoning/max_tokens")
+                .and_then(Value::as_u64),
+            Some(256)
         );
     }
 

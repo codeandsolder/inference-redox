@@ -231,9 +231,6 @@ impl EndpointCapabilities {
         effort: ReasoningEffort,
         require_verified: bool,
     ) -> bool {
-        if effort == ReasoningEffort::None {
-            return true;
-        }
         if self.rejected_reasoning_efforts.contains(&effort) {
             return false;
         }
@@ -325,6 +322,9 @@ pub struct RequestRequirements {
     pub allowed_route_classes: BTreeSet<ModelRouteClass>,
     pub response_schema: Option<ResponseSchema>,
     pub reasoning: ReasoningEffort,
+    /// Optional hard cap on reasoning tokens when the provider exposes one.
+    #[serde(default)]
+    pub reasoning_max_tokens: Option<u64>,
     /// Require positive conformance evidence for the requested reasoning effort.
     #[serde(default)]
     pub require_verified_reasoning: bool,
@@ -346,6 +346,7 @@ impl Default for RequestRequirements {
             allowed_route_classes: default_allowed_route_classes(),
             response_schema: None,
             reasoning: ReasoningEffort::None,
+            reasoning_max_tokens: None,
             require_verified_reasoning: false,
             required_parameters: BTreeSet::new(),
             minimum_uptime_30m: Some(95.0),
@@ -367,6 +368,9 @@ pub struct InferenceRequest {
     pub max_output_tokens: Option<u64>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// Ask the provider to return its reasoning trace when that surface supports it.
+    #[serde(default)]
+    pub include_reasoning: bool,
     /// True only when the caller is actually running a coding/agent workflow.
     #[serde(default)]
     pub agentic: bool,
@@ -391,6 +395,7 @@ impl InferenceRequest {
             prompt_tokens: None,
             max_output_tokens: None,
             temperature: None,
+            include_reasoning: false,
             agentic: false,
             session_id: None,
             requirements: RequestRequirements::default(),

@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 
 use crate::{
-    AgenticPolicy, Endpoint, InferenceRequest, ModelRouteClass, ProviderError, ReasoningEffort,
-    ResponseSchema, RouteCandidate, RoutePlan, RoutingStrategy,
+    AgenticPolicy, Endpoint, InferenceRequest, ProviderError, ReasoningEffort, ResponseSchema,
+    RouteCandidate, RoutePlan, RoutingStrategy,
 };
 
 /// Cheap cross-model token estimate used only for routing/cost prediction.
@@ -108,19 +108,46 @@ pub(crate) fn supports_request(
             }
         }
     }
-    if request.requirements.reasoning != ReasoningEffort::None {
-        let parameter_supported = endpoint.capabilities.supports_parameter("reasoning")
-            || endpoint.capabilities.supports_parameter("reasoning_effort");
-        if !parameter_supported
-            || !endpoint.capabilities.supports_reasoning_effort(
-                request.requirements.reasoning,
-                request.requirements.require_verified_reasoning,
-            )
+    supports_reasoning_request(endpoint, request)
+}
+
+fn supports_reasoning_request(endpoint: &Endpoint, request: &InferenceRequest) -> bool {
+    if request.include_reasoning
+        && !endpoint
+            .capabilities
+            .supports_parameter("include_reasoning")
+    {
+        return false;
+    }
+    let explicit_reasoning = request.requirements.reasoning != ReasoningEffort::None
+        || request.requirements.reasoning_max_tokens.is_some()
+        || request
+            .requirements
+            .required_parameters
+            .contains("reasoning");
+    if !explicit_reasoning {
+        return true;
+    }
+    let parameter_supported = endpoint.capabilities.supports_parameter("reasoning")
+        || endpoint.capabilities.supports_parameter("reasoning_effort");
+    if !parameter_supported {
+        return false;
+    }
+    if request.requirements.reasoning_max_tokens.is_some() {
+        if !endpoint
+            .capabilities
+            .supports_parameter("reasoning_max_tokens")
         {
             return false;
         }
+        if request.requirements.reasoning == ReasoningEffort::None {
+            return true;
+        }
     }
-    true
+    endpoint.capabilities.supports_reasoning_effort(
+        request.requirements.reasoning,
+        request.requirements.require_verified_reasoning,
+    )
 }
 
 fn expected_time(endpoint: &Endpoint, output_tokens: u64, tail: bool) -> Option<f64> {
@@ -193,13 +220,9 @@ pub fn build_route_plan(
         .into_iter()
         .filter(|endpoint| supports_request(endpoint, request, prompt_tokens))
         .map(|endpoint| RouteCandidate {
-            expected_cost_usd: if endpoint.route_class == ModelRouteClass::Subscription {
-                0.0
-            } else {
-                endpoint
-                    .pricing
-                    .expected_cost(prompt_tokens, request.expected_output_tokens)
-            },
+            expected_cost_usd: endpoint
+                .pricing
+                .expected_cost(prompt_tokens, request.expected_output_tokens),
             expected_response_p75_seconds: expected_time(
                 &endpoint,
                 request.expected_output_tokens,

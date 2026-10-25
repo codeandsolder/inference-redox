@@ -24,6 +24,8 @@ pub struct InferenceRequestTemplate {
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
+    pub include_reasoning: bool,
+    #[serde(default)]
     pub agentic: bool,
     #[serde(default)]
     pub session_id: Option<String>,
@@ -42,6 +44,7 @@ impl InferenceRequestTemplate {
             prompt_tokens: self.prompt_tokens,
             max_output_tokens: self.max_output_tokens,
             temperature: self.temperature,
+            include_reasoning: self.include_reasoning,
             agentic: self.agentic,
             session_id: self.session_id.clone(),
             requirements: self.requirements.clone(),
@@ -175,13 +178,9 @@ fn catalog_cost_floor(
         })
         .filter(|entry| entry.pricing_known)
         .map(|entry| {
-            if entry.route_class == crate::ModelRouteClass::Subscription {
-                0.0
-            } else {
-                entry
-                    .pricing
-                    .expected_cost(prompt_tokens, request.expected_output_tokens)
-            }
+            entry
+                .pricing
+                .expected_cost(prompt_tokens, request.expected_output_tokens)
         })
         .filter(|cost| cost.is_finite() && *cost >= 0.0)
         .min_by(f64::total_cmp)
@@ -584,6 +583,7 @@ mod tests {
             prompt_tokens: Some(10),
             max_output_tokens: Some(20),
             temperature: None,
+            include_reasoning: false,
             agentic: false,
             session_id: None,
             requirements: RequestRequirements {
