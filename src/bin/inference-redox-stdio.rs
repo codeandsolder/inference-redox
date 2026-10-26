@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use inference_redox::providers::{
-    groq::GroqCloud, kilo::KiloGateway, nvidia::NvidiaNim, opencode::OpenCodeConsole,
-    openrouter::OpenRouter,
+    groq::GroqCloud, kilo::KiloGateway, nvidia::NvidiaNim, ollama::OllamaCloud,
+    opencode::OpenCodeConsole, openrouter::OpenRouter,
 };
 use inference_redox::{
     BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, ConformanceProbe,
@@ -165,6 +165,7 @@ struct Providers {
     openrouter: Arc<OpenRouter>,
     nvidia: Option<Arc<NvidiaNim>>,
     groq: Option<Arc<GroqCloud>>,
+    ollama: Option<Arc<OllamaCloud>>,
     kilo: Arc<KiloGateway>,
     opencode: Option<Arc<OpenCodeConsole>>,
     opencode_go: Option<Arc<OpenCodeConsole>>,
@@ -185,6 +186,11 @@ impl Providers {
         }
         if let Some(groq) = self.groq.as_ref()
             && let Ok(inventory) = groq.inventory(&base_catalog).await
+        {
+            inventories.push(inventory);
+        }
+        if let Some(ollama) = self.ollama.as_ref()
+            && let Ok(inventory) = ollama.inventory(&base_catalog).await
         {
             inventories.push(inventory);
         }
@@ -218,6 +224,9 @@ impl Providers {
         if let Some(groq) = self.groq.as_ref() {
             pool.register("groq", Arc::clone(groq));
         }
+        if let Some(ollama) = self.ollama.as_ref() {
+            pool.register("ollama-cloud", Arc::clone(ollama));
+        }
         pool.register("kilo", Arc::clone(&self.kilo));
         if let Some(opencode) = self.opencode.as_ref() {
             pool.register("opencode", Arc::clone(opencode));
@@ -242,6 +251,10 @@ impl Providers {
                 .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
             "groq" => self
                 .groq
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
+            "ollama-cloud" => self
+                .ollama
                 .as_ref()
                 .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
             "kilo" => Some(self.kilo.clone()),
@@ -1247,6 +1260,7 @@ struct ApiKeys {
     openrouter: String,
     nvidia: Option<String>,
     groq: Option<String>,
+    ollama: Option<String>,
     kilo: Option<String>,
     opencode: Option<String>,
 }
@@ -1268,12 +1282,14 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         .or(from_file("NVIDIA_API_KEY")?)
         .or(from_file("NVIDIA_API_key")?);
     let groq = environment_key("GROQ_API_KEY").or(from_file("GROQ_API_KEY")?);
+    let ollama = environment_key("OLLAMA_API_KEY").or(from_file("OLLAMA_API_KEY")?);
     let kilo = environment_key("KILO_API_KEY").or(from_file("KILO_API_KEY")?);
     let opencode = environment_key("OPENCODE_API_KEY").or(from_file("OPENCODE_API_KEY")?);
     Ok(ApiKeys {
         openrouter,
         nvidia,
         groq,
+        ollama,
         kilo,
         opencode,
     })
@@ -1296,6 +1312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         groq: keys
             .groq
             .map(|key| Arc::new(GroqCloud::new(key).with_quota_pool("default"))),
+        ollama: keys.ollama.map(|key| Arc::new(OllamaCloud::new(key))),
         kilo: Arc::new(KiloGateway::new(keys.kilo).with_quota_pool("default-egress")),
         opencode,
         opencode_go,
