@@ -5,7 +5,7 @@ use reqwest::{
     header::{HeaderMap, RETRY_AFTER},
 };
 use serde_json::{Map, Value, json};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::{
     ExecutionFailurePhase, InferenceRequest, InferenceResponse, ProviderError, ResponseSchema,
@@ -191,13 +191,35 @@ pub(crate) async fn execute_json_with_retry_headers(
             "retry.max_attempts must be at least 1".to_owned(),
         ));
     }
+    if retry.attempt_timeout.is_zero() {
+        return Err(ProviderError::InvalidRequest(
+            "retry.attempt_timeout must be greater than zero".to_owned(),
+        ));
+    }
     let mut backoff = retry.initial_backoff;
     let mut last_error = None;
     let mut last_phase = None;
     let mut last_quota_observations = Vec::new();
 
     for attempt in 1..=retry.max_attempts {
-        match execute_once(client, api_key, url, body, headers).await {
+        let result = timeout(
+            retry.attempt_timeout,
+            execute_once(client, api_key, url, body, headers),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(AttemptFailure {
+                phase: ExecutionFailurePhase::TransportUnknown,
+                detail: format!(
+                    "request attempt timed out after {} ms",
+                    retry.attempt_timeout.as_millis()
+                ),
+                retryable: true,
+                retry_after: None,
+                quota_observations: Vec::new(),
+            })
+        });
+        match result {
             Ok(response) => return Ok(response),
             Err(failure) if !failure.retryable => return Err(failure.into_provider_error()),
             Err(failure) => {

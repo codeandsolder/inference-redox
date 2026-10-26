@@ -181,6 +181,165 @@ pub enum ConstraintEnforcement {
     Enforced,
 }
 
+/// JSON-Schema features whose support is probed independently after base enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaFeature {
+    OneOf,
+    AnyOf,
+    AllOf,
+    Enum,
+    NestedObject,
+    ArrayItems,
+    ArrayBounds,
+    TuplePrefixItems,
+    NumericBounds,
+    MultipleOf,
+    StringPattern,
+    StringBounds,
+    NullableType,
+    DefsRef,
+    RecursiveRef,
+    Contains,
+    UniqueItems,
+    Not,
+    Conditional,
+    DependentRequired,
+    PropertyNames,
+    ObjectBounds,
+    AdditionalPropertiesSchema,
+    PatternProperties,
+    DependentSchemas,
+    UnevaluatedProperties,
+    Format,
+    BooleanType,
+    NumberType,
+    NullType,
+    ArrayType,
+    TypeUnion,
+    OptionalProperties,
+    OpenObject,
+    RootArray,
+    RootPrimitive,
+    RootComposition,
+    RootRef,
+    UnevaluatedItems,
+    LegacyTupleItems,
+    /// Synthetic combined schema used to emulate a complete assistant tool turn.
+    ToolTurnEnvelope,
+    /// Synthetic behavior probe for multiple calls in one schema-emulated assistant turn.
+    ToolTurnMultiple,
+    UnknownKeyword,
+}
+
+impl SchemaFeature {
+    pub const ALL: [Self; 40] = [
+        Self::OneOf,
+        Self::AnyOf,
+        Self::AllOf,
+        Self::Enum,
+        Self::NestedObject,
+        Self::ArrayItems,
+        Self::ArrayBounds,
+        Self::TuplePrefixItems,
+        Self::NumericBounds,
+        Self::MultipleOf,
+        Self::StringPattern,
+        Self::StringBounds,
+        Self::NullableType,
+        Self::DefsRef,
+        Self::RecursiveRef,
+        Self::Contains,
+        Self::UniqueItems,
+        Self::Not,
+        Self::Conditional,
+        Self::DependentRequired,
+        Self::PropertyNames,
+        Self::ObjectBounds,
+        Self::AdditionalPropertiesSchema,
+        Self::PatternProperties,
+        Self::DependentSchemas,
+        Self::UnevaluatedProperties,
+        Self::Format,
+        Self::BooleanType,
+        Self::NumberType,
+        Self::NullType,
+        Self::ArrayType,
+        Self::TypeUnion,
+        Self::OptionalProperties,
+        Self::OpenObject,
+        Self::RootArray,
+        Self::RootPrimitive,
+        Self::RootComposition,
+        Self::RootRef,
+        Self::UnevaluatedItems,
+        Self::LegacyTupleItems,
+    ];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OneOf => "one_of",
+            Self::AnyOf => "any_of",
+            Self::AllOf => "all_of",
+            Self::Enum => "enum",
+            Self::NestedObject => "nested_object",
+            Self::ArrayItems => "array_items",
+            Self::ArrayBounds => "array_bounds",
+            Self::TuplePrefixItems => "tuple_prefix_items",
+            Self::NumericBounds => "numeric_bounds",
+            Self::MultipleOf => "multiple_of",
+            Self::StringPattern => "string_pattern",
+            Self::StringBounds => "string_bounds",
+            Self::NullableType => "nullable_type",
+            Self::DefsRef => "defs_ref",
+            Self::RecursiveRef => "recursive_ref",
+            Self::Contains => "contains",
+            Self::UniqueItems => "unique_items",
+            Self::Not => "not",
+            Self::Conditional => "conditional",
+            Self::DependentRequired => "dependent_required",
+            Self::PropertyNames => "property_names",
+            Self::ObjectBounds => "object_bounds",
+            Self::AdditionalPropertiesSchema => "additional_properties_schema",
+            Self::PatternProperties => "pattern_properties",
+            Self::DependentSchemas => "dependent_schemas",
+            Self::UnevaluatedProperties => "unevaluated_properties",
+            Self::Format => "format",
+            Self::BooleanType => "boolean_type",
+            Self::NumberType => "number_type",
+            Self::NullType => "null_type",
+            Self::ArrayType => "array_type",
+            Self::TypeUnion => "type_union",
+            Self::OptionalProperties => "optional_properties",
+            Self::OpenObject => "open_object",
+            Self::RootArray => "root_array",
+            Self::RootPrimitive => "root_primitive",
+            Self::RootComposition => "root_composition",
+            Self::RootRef => "root_ref",
+            Self::UnevaluatedItems => "unevaluated_items",
+            Self::LegacyTupleItems => "legacy_tuple_items",
+            Self::ToolTurnEnvelope => "tool_turn_envelope",
+            Self::ToolTurnMultiple => "tool_turn_multiple",
+            Self::UnknownKeyword => "unknown_keyword",
+        }
+    }
+
+    #[must_use]
+    pub fn from_str_name(value: &str) -> Option<Self> {
+        if value == Self::ToolTurnEnvelope.as_str() {
+            return Some(Self::ToolTurnEnvelope);
+        }
+        if value == Self::ToolTurnMultiple.as_str() {
+            return Some(Self::ToolTurnMultiple);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|feature| feature.as_str() == value)
+    }
+}
+
+pub(crate) const STRUCTURED_TOOL_TRANSPORT_INSTRUCTION: &str = "Represent all tool calls only through the structured response contract using text_response and tool_calls; do not use any native tool-calling channel.";
+
 /// Provider-independent function tool definition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionTool {
@@ -244,6 +403,12 @@ pub struct EndpointCapabilities {
     /// Empirical strength of schema-like controls such as strict structured output and tools.
     #[serde(default)]
     pub constraint_enforcement: BTreeMap<String, ConstraintEnforcement>,
+    /// JSON-Schema keywords/compositions observed to work for each schema-bearing transport.
+    #[serde(default)]
+    pub verified_schema_features: BTreeMap<String, BTreeSet<SchemaFeature>>,
+    /// JSON-Schema keywords/compositions observed to fail for each schema-bearing transport.
+    #[serde(default)]
+    pub rejected_schema_features: BTreeMap<String, BTreeSet<SchemaFeature>>,
     pub reasoning: ReasoningSupport,
     pub supports_implicit_caching: bool,
 }
@@ -283,26 +448,52 @@ impl EndpointCapabilities {
         self.constraint_enforcement.get(parameter).copied()
     }
 
+    /// Whether every non-baseline schema feature needed by a generated/application schema has
+    /// positive evidence on this exact transport. Unknown and explicitly rejected features fail
+    /// closed. Basic object/type/required/const/additionalProperties behavior is established by
+    /// the base enforcement probe and therefore is not represented here.
     #[must_use]
-    pub fn strict_output_transport(&self) -> Option<StrictOutputTransport> {
+    pub fn verified_schema_feature_set(
+        &self,
+        parameter: &str,
+        features: &BTreeSet<SchemaFeature>,
+    ) -> bool {
+        let verified = self.verified_schema_features.get(parameter);
+        let rejected = self.rejected_schema_features.get(parameter);
+        features.iter().all(|feature| {
+            verified.is_some_and(|set| set.contains(feature))
+                && !rejected.is_some_and(|set| set.contains(feature))
+        })
+    }
+
+    #[must_use]
+    pub fn strict_output_transport_for_schema(
+        &self,
+        schema: &Value,
+    ) -> Option<StrictOutputTransport> {
+        let native_features = schema_feature_requirements(schema);
         if self.supports_parameter("structured_outputs")
             && self.constraint_enforcement("structured_outputs")
                 == Some(ConstraintEnforcement::Enforced)
+            && self.verified_schema_feature_set("structured_outputs", &native_features)
         {
             return Some(StrictOutputTransport::Native);
         }
+        let (tool_schema, _) = forced_tool_parameter_schema(schema);
+        let tool_features = schema_feature_requirements(&tool_schema);
         if self.supports_parameter("tools")
             && self.supports_parameter("tool_choice")
             && self.constraint_enforcement("tools") == Some(ConstraintEnforcement::Enforced)
+            && self.verified_schema_feature_set("tools", &tool_features)
         {
             return Some(StrictOutputTransport::ForcedTool);
         }
         None
     }
 
-    /// Select a semantics-preserving transport for a tool request. An enforced structured
-    /// response can emulate only requests that force one known function; `auto` and multi-tool
-    /// `required` retain native-tool-only semantics.
+    /// Select a semantics-preserving transport for a tool request. Native tools are preferred.
+    /// Structured output may emulate exact, required, and auto choices only when the endpoint has
+    /// positive evidence for every JSON-Schema feature needed by that exact generated envelope.
     #[must_use]
     pub fn tool_transport(&self, request: &InferenceRequest) -> Option<ToolTransport> {
         if request.tools.is_empty() || matches!(request.tool_choice, Some(ToolChoice::None)) {
@@ -317,20 +508,43 @@ impl EndpointCapabilities {
             Some(ToolChoice::Auto) | None => true,
             Some(ToolChoice::None) => return None,
         };
+        let native_parallel_ok = request.parallel_tool_calls.is_none()
+            || self.verified_parameter("parallel_tool_calls")
+            || (probe_native && self.adapter_parameters.contains("parallel_tool_calls"));
+        let strict_tools = request
+            .tools
+            .iter()
+            .filter(|tool| tool.strict)
+            .collect::<Vec<_>>();
+        let native_schema_ok = strict_tools.is_empty()
+            || probe_native
+            || (self.constraint_enforcement("tools") == Some(ConstraintEnforcement::Enforced)
+                && self.verified_schema_feature_set(
+                    "tools",
+                    &strict_tools
+                        .iter()
+                        .fold(BTreeSet::new(), |mut features, tool| {
+                            features.extend(schema_feature_requirements(&tool.parameters));
+                            features
+                        }),
+                ));
         if (self.verified_parameter("tools")
             || (probe_native && self.adapter_parameters.contains("tools")))
             && native_choice_ok
-            && (!request.tools.iter().any(|tool| tool.strict)
-                || probe_native
-                || self.constraint_enforcement("tools") == Some(ConstraintEnforcement::Enforced))
+            && native_parallel_ok
+            && native_schema_ok
         {
             return Some(ToolTransport::Native);
         }
         if request.requirements.response_schema.is_none()
-            && request.exact_required_tool().is_some()
             && self.verified_parameter("structured_outputs")
             && self.constraint_enforcement("structured_outputs")
                 == Some(ConstraintEnforcement::Enforced)
+            && request
+                .structured_tool_response_schema()
+                .is_some_and(|(_, features)| {
+                    self.verified_schema_feature_set("structured_outputs", &features)
+                })
         {
             return Some(ToolTransport::StructuredOutput);
         }
@@ -378,6 +592,8 @@ impl Default for EndpointCapabilities {
             verified_reasoning_efforts: BTreeSet::new(),
             rejected_reasoning_efforts: BTreeSet::new(),
             constraint_enforcement: BTreeMap::new(),
+            verified_schema_features: BTreeMap::new(),
+            rejected_schema_features: BTreeMap::new(),
             reasoning: ReasoningSupport::None,
             supports_implicit_caching: false,
         }
@@ -503,6 +719,9 @@ pub struct InferenceRequest {
     pub tools: Vec<FunctionTool>,
     #[serde(default)]
     pub tool_choice: Option<ToolChoice>,
+    /// Explicit parallel-call policy. `None` preserves the provider/default tool semantics.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
     /// True only when the caller is actually running a coding/agent workflow.
     #[serde(default)]
     pub agentic: bool,
@@ -530,14 +749,14 @@ impl InferenceRequest {
             include_reasoning: false,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             agentic: false,
             session_id: None,
             requirements: RequestRequirements::default(),
         }
     }
 
-    /// Return the single function that the request requires unconditionally, when that can be
-    /// represented without changing tool-choice semantics.
+    /// Return the single function that the request requires unconditionally.
     #[must_use]
     pub fn exact_required_tool(&self) -> Option<&FunctionTool> {
         match self.tool_choice.as_ref() {
@@ -548,6 +767,376 @@ impl InferenceRequest {
             _ => None,
         }
     }
+
+    /// Build the schema used to emulate native tool turns through structured output. The envelope
+    /// keeps text and calls independent, so `auto` can return text, calls, or both; an array keeps
+    /// parallel/multiple calls representable.
+    #[must_use]
+    pub fn structured_tool_response_schema(&self) -> Option<(Value, BTreeSet<SchemaFeature>)> {
+        if self.tools.is_empty() || matches!(self.tool_choice, Some(ToolChoice::None)) {
+            return None;
+        }
+        let selected: Vec<&FunctionTool> = match self.tool_choice.as_ref() {
+            Some(ToolChoice::Function { name }) => {
+                vec![self.tools.iter().find(|tool| tool.name == *name)?]
+            }
+            Some(ToolChoice::Auto | ToolChoice::Required) | None => self.tools.iter().collect(),
+            Some(ToolChoice::None) => return None,
+        };
+        if selected.is_empty() {
+            return None;
+        }
+        let branches: Vec<Value> = selected
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"const": tool.name},
+                        "arguments": tool.parameters
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": false
+                })
+            })
+            .collect();
+        let items = if branches.len() == 1 {
+            branches.into_iter().next()?
+        } else {
+            serde_json::json!({"oneOf": branches})
+        };
+        let mut calls = serde_json::json!({"type": "array", "items": items});
+        let calls_object = calls.as_object_mut()?;
+        if matches!(
+            self.tool_choice,
+            Some(ToolChoice::Required | ToolChoice::Function { .. })
+        ) {
+            calls_object.insert("minItems".to_owned(), Value::from(1_u64));
+        }
+        if self.parallel_tool_calls == Some(false) {
+            calls_object.insert("maxItems".to_owned(), Value::from(1_u64));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text_response": {"type": "string"},
+                "tool_calls": calls
+            },
+            "required": ["text_response", "tool_calls"],
+            "additionalProperties": false
+        });
+        let mut features = schema_feature_requirements(&schema);
+        features.insert(SchemaFeature::NestedObject);
+        features.insert(SchemaFeature::ToolTurnEnvelope);
+        if self.parallel_tool_calls == Some(true) {
+            features.insert(SchemaFeature::ToolTurnMultiple);
+        }
+        Some((schema, features))
+    }
+}
+
+/// Conservatively collect non-baseline JSON-Schema features used by an application/generated
+/// schema. Basic object/type/required/const/additionalProperties(bool) behavior is established by
+/// the base enforcement probe. Any unrecognized validation keyword inserts `UnknownKeyword`, which
+/// can never be verified and therefore makes cross-transport translation fail closed.
+#[must_use]
+pub fn schema_feature_requirements(schema: &Value) -> BTreeSet<SchemaFeature> {
+    let mut features = BTreeSet::new();
+    collect_root_schema_features(schema, &mut features);
+    collect_schema_features(schema, &mut features);
+    if schema_contains_recursive_ref(schema) {
+        features.insert(SchemaFeature::RecursiveRef);
+    }
+    features
+}
+
+fn collect_root_schema_features(schema: &Value, features: &mut BTreeSet<SchemaFeature>) {
+    let Some(map) = schema.as_object() else {
+        features.insert(SchemaFeature::RootPrimitive);
+        return;
+    };
+    if map.contains_key("$ref") {
+        features.insert(SchemaFeature::RootRef);
+    }
+    if ["oneOf", "anyOf", "allOf"]
+        .iter()
+        .any(|keyword| map.contains_key(*keyword))
+    {
+        features.insert(SchemaFeature::RootComposition);
+    }
+    match map.get("type").and_then(Value::as_str) {
+        Some("array") => {
+            features.insert(SchemaFeature::RootArray);
+        }
+        Some("object") | None => {}
+        Some(_) => {
+            features.insert(SchemaFeature::RootPrimitive);
+        }
+    }
+}
+
+fn collect_object_shape_features(
+    map: &serde_json::Map<String, Value>,
+    features: &mut BTreeSet<SchemaFeature>,
+) {
+    let is_object = map.get("type").and_then(Value::as_str) == Some("object")
+        || map.contains_key("properties")
+        || map.contains_key("patternProperties")
+        || map.contains_key("dependentSchemas");
+    if !is_object {
+        return;
+    }
+    if map
+        .get("additionalProperties")
+        .is_none_or(|value| value == &Value::Bool(true))
+    {
+        features.insert(SchemaFeature::OpenObject);
+    }
+    let Some(properties) = map.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let required: BTreeSet<&str> = map
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if properties
+        .keys()
+        .any(|property| !required.contains(property.as_str()))
+    {
+        features.insert(SchemaFeature::OptionalProperties);
+    }
+}
+
+fn collect_schema_features(schema: &Value, features: &mut BTreeSet<SchemaFeature>) {
+    let Some(map) = schema.as_object() else {
+        // Boolean schemas are a normal JSON-Schema construct. Their enclosing keyword determines
+        // whether additional feature evidence is needed.
+        return;
+    };
+    collect_object_shape_features(map, features);
+    for (keyword, value) in map {
+        collect_schema_keyword(keyword, value, features);
+    }
+}
+
+fn collect_schema_keyword(keyword: &str, value: &Value, features: &mut BTreeSet<SchemaFeature>) {
+    match keyword {
+        // Baseline validation vocabulary proved by the base strict probe.
+        "type" => collect_type_features(value, features),
+        "required" | "const" | "additionalProperties" if !value.is_object() => {}
+        // Non-validating annotations/meta keywords do not need behavioral evidence.
+        "$schema" | "$id" | "$comment" | "title" | "description" | "default" | "examples"
+        | "deprecated" | "readOnly" | "writeOnly" => {}
+        "properties" => collect_schema_map(value, features, true),
+        "$defs" => {
+            features.insert(SchemaFeature::DefsRef);
+            collect_schema_map(value, features, false);
+        }
+        "$ref" => {
+            features.insert(SchemaFeature::DefsRef);
+        }
+        "oneOf" => collect_schema_array(value, features, SchemaFeature::OneOf),
+        "anyOf" => collect_schema_array(value, features, SchemaFeature::AnyOf),
+        "allOf" => collect_schema_array(value, features, SchemaFeature::AllOf),
+        "enum" => {
+            features.insert(SchemaFeature::Enum);
+        }
+        "items" if value.is_array() => {
+            features.insert(SchemaFeature::LegacyTupleItems);
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    collect_schema_features(item, features);
+                }
+            }
+        }
+        "items" => collect_schema_child(value, features, SchemaFeature::ArrayItems),
+        "additionalItems" => {
+            features.insert(SchemaFeature::LegacyTupleItems);
+            collect_schema_features(value, features);
+        }
+        "prefixItems" => {
+            collect_schema_array(value, features, SchemaFeature::TuplePrefixItems);
+        }
+        "minItems" | "maxItems" => {
+            features.insert(SchemaFeature::ArrayBounds);
+        }
+        "contains" => collect_schema_child(value, features, SchemaFeature::Contains),
+        "minContains" | "maxContains" => {
+            features.insert(SchemaFeature::Contains);
+        }
+        "uniqueItems" => {
+            features.insert(SchemaFeature::UniqueItems);
+        }
+        "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" => {
+            features.insert(SchemaFeature::NumericBounds);
+        }
+        "multipleOf" => {
+            features.insert(SchemaFeature::MultipleOf);
+        }
+        "pattern" => {
+            features.insert(SchemaFeature::StringPattern);
+        }
+        "minLength" | "maxLength" => {
+            features.insert(SchemaFeature::StringBounds);
+        }
+        "format" => {
+            features.insert(SchemaFeature::Format);
+        }
+        "not" => collect_schema_child(value, features, SchemaFeature::Not),
+        "if" | "then" | "else" => {
+            collect_schema_child(value, features, SchemaFeature::Conditional);
+        }
+        "dependentRequired" => {
+            features.insert(SchemaFeature::DependentRequired);
+        }
+        "dependentSchemas" => {
+            features.insert(SchemaFeature::DependentSchemas);
+            collect_schema_map(value, features, false);
+        }
+        "propertyNames" => collect_schema_child(value, features, SchemaFeature::PropertyNames),
+        "minProperties" | "maxProperties" => {
+            features.insert(SchemaFeature::ObjectBounds);
+        }
+        "patternProperties" => {
+            features.insert(SchemaFeature::PatternProperties);
+            collect_schema_map(value, features, false);
+        }
+        "unevaluatedProperties" => {
+            features.insert(SchemaFeature::UnevaluatedProperties);
+            collect_schema_features(value, features);
+        }
+        "unevaluatedItems" => {
+            features.insert(SchemaFeature::UnevaluatedItems);
+            collect_schema_features(value, features);
+        }
+        "additionalProperties" => {
+            features.insert(SchemaFeature::AdditionalPropertiesSchema);
+            collect_schema_features(value, features);
+        }
+        _ => {
+            features.insert(SchemaFeature::UnknownKeyword);
+        }
+    }
+}
+
+fn collect_type_features(value: &Value, features: &mut BTreeSet<SchemaFeature>) {
+    if let Some(kind) = value.as_str() {
+        match kind {
+            "object" | "string" | "integer" => {}
+            "boolean" => {
+                features.insert(SchemaFeature::BooleanType);
+            }
+            "number" => {
+                features.insert(SchemaFeature::NumberType);
+            }
+            "null" => {
+                features.insert(SchemaFeature::NullType);
+            }
+            "array" => {
+                features.insert(SchemaFeature::ArrayType);
+            }
+            _ => {
+                features.insert(SchemaFeature::UnknownKeyword);
+            }
+        }
+        return;
+    }
+    let Some(types) = value.as_array() else {
+        features.insert(SchemaFeature::UnknownKeyword);
+        return;
+    };
+    let names: BTreeSet<&str> = types.iter().filter_map(Value::as_str).collect();
+    if names.len() == 2 && names.contains("null") {
+        features.insert(SchemaFeature::NullableType);
+    } else {
+        features.insert(SchemaFeature::TypeUnion);
+    }
+    for kind in names {
+        collect_type_features(&Value::String(kind.to_owned()), features);
+    }
+}
+
+fn collect_schema_child(
+    value: &Value,
+    features: &mut BTreeSet<SchemaFeature>,
+    feature: SchemaFeature,
+) {
+    features.insert(feature);
+    collect_schema_features(value, features);
+}
+
+fn collect_schema_array(
+    value: &Value,
+    features: &mut BTreeSet<SchemaFeature>,
+    feature: SchemaFeature,
+) {
+    features.insert(feature);
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_schema_features(item, features);
+        }
+    }
+}
+
+fn collect_schema_map(value: &Value, features: &mut BTreeSet<SchemaFeature>, nested: bool) {
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    if nested
+        && map
+            .values()
+            .any(|child| child.get("type").and_then(Value::as_str) == Some("object"))
+    {
+        features.insert(SchemaFeature::NestedObject);
+    }
+    for child in map.values() {
+        collect_schema_features(child, features);
+    }
+}
+
+fn schema_contains_recursive_ref(root: &Value) -> bool {
+    let Some(defs) = root.get("$defs").and_then(Value::as_object) else {
+        return false;
+    };
+    defs.iter().any(|(name, definition)| {
+        let target = format!("#/$defs/{name}");
+        schema_has_ref(definition, &target)
+    })
+}
+
+fn schema_has_ref(value: &Value, target: &str) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("$ref").and_then(Value::as_str) == Some(target)
+                || map.values().any(|child| schema_has_ref(child, target))
+        }
+        Value::Array(items) => items.iter().any(|child| schema_has_ref(child, target)),
+        _ => false,
+    }
+}
+
+/// Function-tool parameters must be rooted at an object on the normalized tool surfaces. Preserve
+/// object-root response schemas directly; wrap every other response shape under `value` and unwrap
+/// it after execution so the application-visible response keeps its original schema semantics.
+pub(crate) fn forced_tool_parameter_schema(schema: &Value) -> (Value, bool) {
+    if schema
+        .as_object()
+        .is_some_and(|map| map.get("type").and_then(Value::as_str) == Some("object"))
+    {
+        return (schema.clone(), false);
+    }
+    (
+        serde_json::json!({
+            "type": "object",
+            "properties": {"value": schema},
+            "required": ["value"],
+            "additionalProperties": false
+        }),
+        true,
+    )
 }
 
 /// Routing policies independent of provider grammar.
@@ -583,6 +1172,7 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    pub attempt_timeout: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -591,6 +1181,7 @@ impl Default for RetryPolicy {
             max_attempts: 3,
             initial_backoff: Duration::from_millis(150),
             max_backoff: Duration::from_secs(2),
+            attempt_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -660,6 +1251,66 @@ mod tests {
             r#""enforced""#
         );
         Ok(())
+    }
+
+    #[test]
+    fn schema_feature_requirements_find_generated_tool_envelope_features()
+    -> Result<(), &'static str> {
+        let mut request = InferenceRequest::new("model", "prompt", 8);
+        request.tools.extend([
+            FunctionTool {
+                name: "a".to_owned(),
+                description: None,
+                parameters: json!({"type":"object","properties":{"x":{"type":"integer"}},"required":["x"],"additionalProperties":false}),
+                strict: true,
+            },
+            FunctionTool {
+                name: "b".to_owned(),
+                description: None,
+                parameters: json!({"type":"object","properties":{"y":{"type":"string"}},"required":["y"],"additionalProperties":false}),
+                strict: true,
+            },
+        ]);
+        request.tool_choice = Some(ToolChoice::Required);
+        request.parallel_tool_calls = Some(false);
+        let (_, features) = request
+            .structured_tool_response_schema()
+            .ok_or("tool envelope should compile")?;
+        assert!(features.contains(&SchemaFeature::OneOf));
+        assert!(features.contains(&SchemaFeature::NestedObject));
+        assert!(features.contains(&SchemaFeature::ArrayItems));
+        assert!(features.contains(&SchemaFeature::ArrayBounds));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_feature_requirements_detect_recursive_refs() {
+        let schema = json!({
+            "$defs": {
+                "node": {
+                    "oneOf": [
+                        {"type":"null"},
+                        {"type":"object","properties":{"child":{"$ref":"#/$defs/node"}},"required":["child"]}
+                    ]
+                }
+            },
+            "$ref":"#/$defs/node"
+        });
+        let features = schema_feature_requirements(&schema);
+        assert!(features.contains(&SchemaFeature::DefsRef));
+        assert!(features.contains(&SchemaFeature::RecursiveRef));
+        assert!(features.contains(&SchemaFeature::OneOf));
+    }
+
+    #[test]
+    fn schema_feature_requirements_fail_closed_on_unknown_validation_keyword() {
+        let schema = json!({
+            "type":"object",
+            "properties":{"value":{"type":"string","contentEncoding":"base64"}},
+            "required":["value"],
+            "additionalProperties":false
+        });
+        assert!(schema_feature_requirements(&schema).contains(&SchemaFeature::UnknownKeyword));
     }
 
     #[test]

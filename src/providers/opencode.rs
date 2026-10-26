@@ -625,6 +625,8 @@ impl InferenceProvider for OpenCodeConsole {
                 verified_reasoning_efforts: BTreeSet::new(),
                 rejected_reasoning_efforts: BTreeSet::new(),
                 constraint_enforcement: BTreeMap::new(),
+                verified_schema_features: BTreeMap::new(),
+                rejected_schema_features: BTreeMap::new(),
                 reasoning: model_metadata.reasoning_support(),
                 supports_implicit_caching: false,
             },

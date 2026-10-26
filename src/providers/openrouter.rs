@@ -7,8 +7,9 @@ use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
+use crate::model::STRUCTURED_TOOL_TRANSPORT_INSTRUCTION;
 use crate::{
     ArtificialAnalysisBenchmarks, BatchInferenceItem, BatchJob, BenchmarkObservation,
     BenchmarkSnapshot, BenchmarkSnapshotMeta, BenchmarkSource, BenchmarkTaskType, BenchmarkUnit,
@@ -257,9 +258,13 @@ impl OpenRouter {
             {
                 Some(StrictOutputTransport::Native)
             }
-            Some(ResponseSchema::JsonSchema { strict: true, .. }) => {
-                endpoint.capabilities.strict_output_transport()
-            }
+            Some(ResponseSchema::JsonSchema {
+                schema,
+                strict: true,
+                ..
+            }) => endpoint
+                .capabilities
+                .strict_output_transport_for_schema(schema),
             _ => None,
         }
     }
@@ -273,13 +278,14 @@ impl OpenRouter {
         else {
             return None;
         };
+        let (parameters, _) = crate::model::forced_tool_parameter_schema(schema);
         Some(json!({
             "type": "function",
             "function": {
                 "name": "__inference_redox_output",
                 "description": format!("Return the structured {name} result."),
                 "strict": true,
-                "parameters": schema,
+                "parameters": parameters,
             }
         }))
     }
@@ -306,15 +312,42 @@ impl OpenRouter {
         json!({"type": "function", "function": function})
     }
 
-    fn tool_response_format(tool: &crate::FunctionTool) -> Value {
-        json!({
+    fn tool_response_format(request: &InferenceRequest) -> Option<Value> {
+        let (schema, _) = request.structured_tool_response_schema()?;
+        Some(json!({
             "type": "json_schema",
             "json_schema": {
-                "name": "__inference_redox_tool_arguments",
+                "name": "__inference_redox_tool_turn",
                 "strict": true,
-                "schema": tool.parameters,
+                "schema": schema,
             }
-        })
+        }))
+    }
+
+    fn insert_provider_routing(
+        object: &mut serde_json::Map<String, Value>,
+        plan: &RoutePlan,
+        candidate: &RouteCandidate,
+    ) {
+        let effective_pricing = candidate.endpoint.pricing.effective(plan.prompt_tokens);
+        let mut provider = serde_json::Map::new();
+        provider.insert(
+            "only".to_owned(),
+            json!([Self::provider_selector(candidate)]),
+        );
+        provider.insert("allow_fallbacks".to_owned(), json!(false));
+        // Endpoint eligibility comes from inference-redox conformance evidence, not OpenRouter's
+        // supported_parameters declarations. With an exact endpoint pin, metadata filtering can
+        // only hide under-declared capabilities or turn stale catalog data into false negatives.
+        provider.insert("require_parameters".to_owned(), json!(false));
+        provider.insert(
+            "max_price".to_owned(),
+            json!({
+                "prompt": effective_pricing.prompt_per_token * 1_000_000.0,
+                "completion": effective_pricing.completion_per_token * 1_000_000.0,
+            }),
+        );
+        object.insert("provider".to_owned(), Value::Object(provider));
     }
 
     fn compile_body(
@@ -324,11 +357,25 @@ impl OpenRouter {
     ) -> Value {
         let mut object = serde_json::Map::new();
         object.insert("model".to_owned(), json!(request.model));
+        let forced_output = Self::structured_transport(request, &candidate.endpoint)
+            == Some(StrictOutputTransport::ForcedTool);
+        let tool_transport = candidate.endpoint.capabilities.tool_transport(request);
+        let translated_tool_response = (tool_transport == Some(ToolTransport::StructuredOutput))
+            .then(|| Self::tool_response_format(request))
+            .flatten();
+        let user_prompt = if translated_tool_response.is_some() {
+            format!(
+                "{}\n\n{STRUCTURED_TOOL_TRANSPORT_INSTRUCTION}",
+                request.prompt
+            )
+        } else {
+            request.prompt.clone()
+        };
         let mut messages = Vec::with_capacity(2);
         if let Some(system_prompt) = request.system_prompt.as_ref() {
             messages.push(json!({"role": "system", "content": system_prompt}));
         }
-        messages.push(json!({"role": "user", "content": request.prompt}));
+        messages.push(json!({"role": "user", "content": user_prompt}));
         object.insert("messages".to_owned(), Value::Array(messages));
         if let Some(maximum) = request.max_output_tokens {
             let use_completion_name = candidate
@@ -343,37 +390,11 @@ impl OpenRouter {
             object.insert(key.to_owned(), json!(maximum));
         }
 
-        let effective_pricing = candidate.endpoint.pricing.effective(plan.prompt_tokens);
-        let max_prompt_price = effective_pricing.prompt_per_token * 1_000_000.0;
-        let max_completion_price = effective_pricing.completion_per_token * 1_000_000.0;
-        let mut provider = serde_json::Map::new();
-        provider.insert(
-            "only".to_owned(),
-            json!([Self::provider_selector(candidate)]),
-        );
-        provider.insert("allow_fallbacks".to_owned(), json!(false));
-        // Endpoint eligibility comes from inference-redox conformance evidence, not OpenRouter's
-        // supported_parameters declarations. With an exact endpoint pin, metadata filtering can
-        // only hide under-declared capabilities or turn stale catalog data into false negatives.
-        provider.insert("require_parameters".to_owned(), json!(false));
-        provider.insert(
-            "max_price".to_owned(),
-            json!({
-                "prompt": max_prompt_price,
-                "completion": max_completion_price,
-            }),
-        );
-        object.insert("provider".to_owned(), Value::Object(provider));
+        Self::insert_provider_routing(&mut object, plan, candidate);
 
         if let Some(tier) = Self::service_tier(&candidate.endpoint.id) {
             object.insert("service_tier".to_owned(), json!(tier.as_str()));
         }
-        let forced_output = Self::structured_transport(request, &candidate.endpoint)
-            == Some(StrictOutputTransport::ForcedTool);
-        let tool_transport = candidate.endpoint.capabilities.tool_transport(request);
-        let translated_tool = (tool_transport == Some(ToolTransport::StructuredOutput))
-            .then(|| request.exact_required_tool())
-            .flatten();
         if let Some(schema) = request.requirements.response_schema.as_ref() {
             if forced_output {
                 if let Some(tool) = Self::forced_output_tool(schema) {
@@ -386,11 +407,8 @@ impl OpenRouter {
             } else {
                 object.insert("response_format".to_owned(), Self::response_format(schema));
             }
-        } else if let Some(tool) = translated_tool {
-            object.insert(
-                "response_format".to_owned(),
-                Self::tool_response_format(tool),
-            );
+        } else if let Some(response_format) = translated_tool_response {
+            object.insert("response_format".to_owned(), response_format);
         }
         if !forced_output
             && tool_transport == Some(ToolTransport::Native)
@@ -406,6 +424,12 @@ impl OpenRouter {
             && let Some(choice) = request.tool_choice.as_ref()
         {
             object.insert("tool_choice".to_owned(), Self::tool_choice(choice));
+        }
+        if !forced_output
+            && tool_transport == Some(ToolTransport::Native)
+            && let Some(parallel) = request.parallel_tool_calls
+        {
+            object.insert("parallel_tool_calls".to_owned(), json!(parallel));
         }
         if let Some(temperature) = request.temperature {
             object.insert("temperature".to_owned(), json!(temperature));
@@ -450,6 +474,9 @@ impl OpenRouter {
         }
         if let Some(choice) = request.tool_choice.as_ref() {
             object.insert("tool_choice".to_owned(), Self::tool_choice(choice));
+        }
+        if let Some(parallel) = request.parallel_tool_calls {
+            object.insert("parallel_tool_calls".to_owned(), json!(parallel));
         }
         if let Some(temperature) = request.temperature {
             object.insert("temperature".to_owned(), json!(temperature));
@@ -685,9 +712,7 @@ impl OpenRouter {
         let forced_output = Self::structured_transport(request, &candidate.endpoint)
             == Some(StrictOutputTransport::ForcedTool);
         let tool_transport = candidate.endpoint.capabilities.tool_transport(request);
-        let translated_tool = (tool_transport == Some(ToolTransport::StructuredOutput))
-            .then(|| request.exact_required_tool())
-            .flatten();
+        let translated_tool_response = tool_transport == Some(ToolTransport::StructuredOutput);
         let Some(mut content) = Self::response_content(&raw, forced_output) else {
             return Err(OpenRouterAttemptFailure {
                 phase: ExecutionFailurePhase::ResponseReceived,
@@ -701,28 +726,36 @@ impl OpenRouter {
                 quota_observations,
             });
         };
+        if forced_output {
+            content = Self::normalize_forced_output_content(
+                request,
+                &content,
+                retry_after,
+                &quota_observations,
+            )?;
+        }
+        if translated_tool_response {
+            content = Self::normalize_structured_tool_content(
+                &raw,
+                content,
+                retry_after,
+                &quota_observations,
+            )?;
+        }
         let mut tool_calls = if tool_transport == Some(ToolTransport::Native) {
             Self::response_tool_calls(&raw)
         } else {
             Vec::new()
         };
-        if let Some(tool) = translated_tool {
-            let arguments =
-                serde_json::from_str(&content).map_err(|error| OpenRouterAttemptFailure {
-                    phase: ExecutionFailurePhase::ResponseReceived,
-                    detail: format!(
-                        "OpenRouter structured-output tool fallback returned invalid JSON: {error}"
-                    ),
-                    retryable: false,
-                    retry_after,
-                    quota_observations: quota_observations.clone(),
-                })?;
-            tool_calls.push(ToolCall {
-                id: None,
-                name: tool.name.clone(),
-                arguments,
-            });
-            content.clear();
+        if translated_tool_response {
+            let (translated_content, translated_calls) = Self::parse_structured_tool_turn(
+                request,
+                &content,
+                retry_after,
+                &quota_observations,
+            )?;
+            content = translated_content;
+            tool_calls = translated_calls;
         }
         Ok(InferenceResponse {
             content,
@@ -737,6 +770,181 @@ impl OpenRouter {
             quota_observations,
             raw,
         })
+    }
+
+    fn normalize_structured_tool_content(
+        raw: &Value,
+        mut content: String,
+        retry_after: Option<Duration>,
+        quota_observations: &[crate::QuotaObservation],
+    ) -> Result<String, OpenRouterAttemptFailure> {
+        let failure = |detail: String| OpenRouterAttemptFailure {
+            phase: ExecutionFailurePhase::ResponseReceived,
+            detail,
+            retryable: false,
+            retry_after,
+            quota_observations: quota_observations.to_vec(),
+        };
+        if content.trim().is_empty()
+            && let Some(value) = raw
+                .pointer("/choices/0/message/content")
+                .filter(|value| !value.is_null() && !value.is_string())
+        {
+            content = serde_json::to_string(value).map_err(|error| {
+                failure(format!(
+                    "OpenRouter structured-output tool fallback could not normalize JSON content: {error}"
+                ))
+            })?;
+        }
+        if !content.trim().is_empty() {
+            return Ok(content);
+        }
+        let finish_reason = raw
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let usage = TokenUsage::from_openai_compatible(raw);
+        let content_kind = match raw.pointer("/choices/0/message/content") {
+            None => "missing",
+            Some(Value::Null) => "null",
+            Some(Value::String(_)) => "string",
+            Some(Value::Array(_)) => "array",
+            Some(Value::Object(_)) => "object",
+            Some(Value::Bool(_)) => "boolean",
+            Some(Value::Number(_)) => "number",
+        };
+        let unexpected_calls = Self::response_tool_calls(raw);
+        let call_names = unexpected_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        Err(failure(format!(
+            "OpenRouter structured-output tool fallback returned empty content \
+             (finish_reason={finish_reason}, content_kind={content_kind}, \
+             output_tokens={:?}, reasoning_tokens={:?}, unexpected_tool_calls={}, names=[{}])",
+            usage.output_tokens,
+            usage.reasoning_tokens,
+            unexpected_calls.len(),
+            call_names
+        )))
+    }
+
+    fn normalize_forced_output_content(
+        request: &InferenceRequest,
+        content: &str,
+        retry_after: Option<Duration>,
+        quota_observations: &[crate::QuotaObservation],
+    ) -> Result<String, OpenRouterAttemptFailure> {
+        let Some(ResponseSchema::JsonSchema { schema, .. }) =
+            request.requirements.response_schema.as_ref()
+        else {
+            return Ok(content.to_owned());
+        };
+        let (_, wrapped) = crate::model::forced_tool_parameter_schema(schema);
+        if !wrapped {
+            return Ok(content.to_owned());
+        }
+        let invalid = |detail: String| OpenRouterAttemptFailure {
+            phase: ExecutionFailurePhase::ResponseReceived,
+            detail,
+            retryable: false,
+            retry_after,
+            quota_observations: quota_observations.to_vec(),
+        };
+        let arguments: Value = serde_json::from_str(content).map_err(|error| {
+            invalid(format!(
+                "OpenRouter forced-output wrapper returned invalid JSON: {error}"
+            ))
+        })?;
+        let value = arguments
+            .get("value")
+            .ok_or_else(|| invalid("OpenRouter forced-output wrapper omitted value".to_owned()))?;
+        serde_json::to_string(value).map_err(|error| {
+            invalid(format!(
+                "OpenRouter forced-output wrapper could not serialize value: {error}"
+            ))
+        })
+    }
+
+    fn parse_structured_tool_turn(
+        request: &InferenceRequest,
+        content: &str,
+        retry_after: Option<Duration>,
+        quota_observations: &[crate::QuotaObservation],
+    ) -> Result<(String, Vec<ToolCall>), OpenRouterAttemptFailure> {
+        let invalid = |detail: String| OpenRouterAttemptFailure {
+            phase: ExecutionFailurePhase::ResponseReceived,
+            detail,
+            retryable: false,
+            retry_after,
+            quota_observations: quota_observations.to_vec(),
+        };
+        let value: Value = serde_json::from_str(content).map_err(|error| {
+            invalid(format!(
+                "OpenRouter structured-output tool fallback returned invalid JSON: {error}"
+            ))
+        })?;
+        let text = value
+            .get("text_response")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("structured tool fallback omitted text_response".to_owned()))?
+            .to_owned();
+        let calls = value
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                invalid("structured tool fallback omitted tool_calls array".to_owned())
+            })?;
+        if matches!(
+            request.tool_choice,
+            Some(ToolChoice::Required | ToolChoice::Function { .. })
+        ) && calls.is_empty()
+        {
+            return Err(invalid(
+                "structured tool fallback violated required tool choice".to_owned(),
+            ));
+        }
+        if request.parallel_tool_calls == Some(false) && calls.len() > 1 {
+            return Err(invalid(
+                "structured tool fallback violated parallel_tool_calls=false".to_owned(),
+            ));
+        }
+        let mut normalized = Vec::with_capacity(calls.len());
+        for call in calls {
+            let name = call
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("structured tool call omitted name".to_owned()))?;
+            let tool = request
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "structured tool fallback returned unknown tool {name}"
+                    ))
+                })?;
+            if let Some(ToolChoice::Function { name: required }) = request.tool_choice.as_ref()
+                && name != required
+            {
+                return Err(invalid(format!(
+                    "structured tool fallback called {name} instead of required {required}"
+                )));
+            }
+            let arguments = call.get("arguments").cloned().ok_or_else(|| {
+                invalid(format!(
+                    "structured tool call {} omitted arguments",
+                    tool.name
+                ))
+            })?;
+            normalized.push(ToolCall {
+                id: None,
+                name: tool.name.clone(),
+                arguments,
+            });
+        }
+        Ok((text, normalized))
     }
 
     fn response_content(raw: &Value, forced_output: bool) -> Option<String> {
@@ -1589,6 +1797,7 @@ impl OpenRouterEndpoint {
                     "system_role",
                     "tools",
                     "tool_choice",
+                    "parallel_tool_calls",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -1599,6 +1808,8 @@ impl OpenRouterEndpoint {
                 verified_reasoning_efforts: BTreeSet::new(),
                 rejected_reasoning_efforts: BTreeSet::new(),
                 constraint_enforcement: BTreeMap::new(),
+                verified_schema_features: BTreeMap::new(),
+                rejected_schema_features: BTreeMap::new(),
                 reasoning,
                 supports_implicit_caching: self.supports_implicit_caching.unwrap_or(false),
             },
@@ -1669,6 +1880,11 @@ impl InferenceProvider for OpenRouter {
                 "retry.max_attempts must be at least 1".to_owned(),
             ));
         }
+        if retry.attempt_timeout.is_zero() {
+            return Err(ProviderError::InvalidRequest(
+                "retry.attempt_timeout must be greater than zero".to_owned(),
+            ));
+        }
         let candidate = Self::only_candidate(plan, &request.model)?;
         let url = format!("{}/chat/completions", self.base_url);
         let mut backoff = retry.initial_backoff;
@@ -1677,10 +1893,24 @@ impl InferenceProvider for OpenRouter {
         let mut last_quota_observations = Vec::new();
 
         for attempt in 1..=retry.max_attempts {
-            match self
-                .execute_batch_once(&url, request, plan, candidate)
-                .await
-            {
+            let result = timeout(
+                retry.attempt_timeout,
+                self.execute_batch_once(&url, request, plan, candidate),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(OpenRouterAttemptFailure {
+                    phase: ExecutionFailurePhase::TransportUnknown,
+                    detail: format!(
+                        "request attempt timed out after {} ms",
+                        retry.attempt_timeout.as_millis()
+                    ),
+                    retryable: true,
+                    retry_after: None,
+                    quota_observations: Vec::new(),
+                })
+            });
+            match result {
                 Ok(response) => return Ok(response),
                 Err(failure) if !failure.retryable => {
                     return Err(failure.into_provider_error());
@@ -1716,6 +1946,46 @@ impl InferenceProvider for OpenRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schema_only_endpoint(
+        model: &str,
+        features: impl IntoIterator<Item = crate::SchemaFeature>,
+    ) -> Endpoint {
+        let mut capabilities = EndpointCapabilities::default();
+        capabilities
+            .adapter_parameters
+            .insert("structured_outputs".to_owned());
+        capabilities
+            .verified_parameters
+            .insert("structured_outputs".to_owned());
+        capabilities.constraint_enforcement.insert(
+            "structured_outputs".to_owned(),
+            crate::ConstraintEnforcement::Enforced,
+        );
+        capabilities.verified_schema_features.insert(
+            "structured_outputs".to_owned(),
+            features.into_iter().collect(),
+        );
+        Endpoint {
+            source: "openrouter".to_owned(),
+            credential: None,
+            provider_key: "schema-only".to_owned(),
+            id: "schema-only/fp8".to_owned(),
+            provider: "Schema Only".to_owned(),
+            model: model.to_owned(),
+            route_class: ModelRouteClass::Standard,
+            display_name: "Schema Only".to_owned(),
+            quantization: None,
+            status: 0,
+            context_length: Some(1_000),
+            max_prompt_tokens: None,
+            max_completion_tokens: None,
+            pricing: Pricing::default(),
+            stats: EndpointStats::default(),
+            workload_policy: crate::WorkloadPolicy::default(),
+            capabilities,
+        }
+    }
 
     #[test]
     fn execution_rejects_multi_candidate_gateway_plans() {
@@ -1805,6 +2075,7 @@ mod tests {
             include_reasoning: false,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             agentic: false,
             session_id: None,
             requirements: crate::RequestRequirements {
@@ -1997,12 +2268,46 @@ mod tests {
     }
 
     #[test]
+    fn forced_tool_fallback_wraps_and_unwraps_non_object_root_schema() -> Result<(), String> {
+        let schema = ResponseSchema::JsonSchema {
+            name: "array_answer".to_owned(),
+            schema: json!({
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            strict: true,
+        };
+        let tool = OpenRouter::forced_output_tool(&schema)
+            .ok_or_else(|| "forced output tool should compile".to_owned())?;
+        assert_eq!(
+            tool.pointer("/function/parameters/type")
+                .and_then(Value::as_str),
+            Some("object")
+        );
+        assert_eq!(
+            tool.pointer("/function/parameters/properties/value/type")
+                .and_then(Value::as_str),
+            Some("array")
+        );
+
+        let mut request = InferenceRequest::new("openai/example", "return one integer", 8);
+        request.requirements.response_schema = Some(schema);
+        let normalized =
+            OpenRouter::normalize_forced_output_content(&request, r#"{"value":[7]}"#, None, &[])
+                .map_err(|failure| failure.detail)?;
+        assert_eq!(normalized, "[7]");
+        Ok(())
+    }
+
+    #[test]
     fn compiles_explicit_function_tools_and_exact_choice() {
         let mut request = InferenceRequest::new("openai/example", "hello", 16);
         request.tools.push(crate::FunctionTool {
             name: "lookup".to_owned(),
             description: Some("Look up a value".to_owned()),
-            parameters: json!({"type": "object", "properties": {}}),
+            parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
             strict: true,
         });
         request.tool_choice = Some(ToolChoice::Function {
@@ -2067,6 +2372,10 @@ mod tests {
                 .and_then(Value::as_str),
             Some("lookup")
         );
+        assert_eq!(
+            body.pointer("/messages/0/content").and_then(Value::as_str),
+            Some("hello")
+        );
     }
 
     #[test]
@@ -2117,6 +2426,16 @@ mod tests {
             "structured_outputs".to_owned(),
             crate::ConstraintEnforcement::Enforced,
         );
+        endpoint.capabilities.verified_schema_features.insert(
+            "structured_outputs".to_owned(),
+            BTreeSet::from([
+                crate::SchemaFeature::ArrayType,
+                crate::SchemaFeature::ArrayItems,
+                crate::SchemaFeature::ArrayBounds,
+                crate::SchemaFeature::NestedObject,
+                crate::SchemaFeature::ToolTurnEnvelope,
+            ]),
+        );
         let plan = RoutePlan {
             prompt_tokens: 5,
             expected_output_tokens: 16,
@@ -2136,12 +2455,165 @@ mod tests {
             Some("json_schema")
         );
         assert_eq!(
-            body.pointer("/response_format/json_schema/schema/properties/value/type")
+            body.pointer("/response_format/json_schema/schema/properties/tool_calls/items/properties/arguments/properties/value/type")
                 .and_then(Value::as_str),
             Some("integer")
         );
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+        assert!(
+            body.pointer("/messages/0/content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains(STRUCTURED_TOOL_TRANSPORT_INSTRUCTION))
+        );
+    }
+
+    #[test]
+    fn compiles_auto_multi_tool_turn_as_structured_envelope() {
+        let mut request = InferenceRequest::new("openai/example", "maybe use tools", 32);
+        for name in ["lookup", "search"] {
+            request.tools.push(crate::FunctionTool {
+                name: name.to_owned(),
+                description: None,
+                parameters: json!({
+                    "type":"object",
+                    "properties":{"value":{"type":"integer"}},
+                    "required":["value"],
+                    "additionalProperties":false
+                }),
+                strict: true,
+            });
+        }
+        request.tool_choice = Some(ToolChoice::Auto);
+        request.parallel_tool_calls = Some(false);
+        let endpoint = schema_only_endpoint(
+            &request.model,
+            [
+                crate::SchemaFeature::OneOf,
+                crate::SchemaFeature::NestedObject,
+                crate::SchemaFeature::ArrayType,
+                crate::SchemaFeature::ArrayItems,
+                crate::SchemaFeature::ArrayBounds,
+                crate::SchemaFeature::ToolTurnEnvelope,
+            ],
+        );
+        let plan = RoutePlan {
+            prompt_tokens: 5,
+            expected_output_tokens: 32,
+            cheapest_cost_usd: 0.0,
+            cost_ceiling_usd: 0.0,
+            candidates: vec![RouteCandidate {
+                endpoint,
+                expected_cost_usd: 0.0,
+                expected_response_p75_seconds: None,
+                expected_response_p95_seconds: None,
+            }],
+        };
+        let body = OpenRouter::compile_body(&request, &plan, &plan.candidates[0]);
+        let schema = body.pointer("/response_format/json_schema/schema");
+        assert_eq!(
+            schema
+                .and_then(|value| value.pointer("/properties/tool_calls/maxItems"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            schema
+                .and_then(|value| value.pointer("/properties/tool_calls/minItems"))
+                .is_none()
+        );
+        assert_eq!(
+            schema
+                .and_then(|value| value.pointer("/properties/tool_calls/items/oneOf"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn normalizes_structured_json_object_content_before_tool_turn_parsing() -> Result<(), String> {
+        let mut request = InferenceRequest::new("openai/example", "use lookup", 16);
+        request.tools.push(crate::FunctionTool {
+            name: "lookup".to_owned(),
+            description: None,
+            parameters: json!({
+                "type":"object",
+                "properties":{"value":{"type":"integer"}},
+                "required":["value"],
+                "additionalProperties":false
+            }),
+            strict: true,
+        });
+        request.tool_choice = Some(ToolChoice::Auto);
+        let mut endpoint = schema_only_endpoint(
+            &request.model,
+            [
+                crate::SchemaFeature::ArrayType,
+                crate::SchemaFeature::ArrayItems,
+                crate::SchemaFeature::NestedObject,
+                crate::SchemaFeature::ToolTurnEnvelope,
+            ],
+        );
+        endpoint.stats.uptime_30m = Some(100.0);
+        let candidate = RouteCandidate {
+            endpoint,
+            expected_cost_usd: 0.0,
+            expected_response_p75_seconds: None,
+            expected_response_p95_seconds: None,
+        };
+        let raw = json!({
+            "model":"openai/example",
+            "provider":"schema-only",
+            "choices":[{
+                "finish_reason":"stop",
+                "message":{
+                    "content":{
+                        "text_response":"using lookup",
+                        "tool_calls":[{"name":"lookup","arguments":{"value":7}}]
+                    }
+                }
+            }]
+        });
+        let response =
+            OpenRouter::normalize_success_response(raw, &request, &candidate, None, vec![])
+                .map_err(|failure| failure.detail)?;
+        assert_eq!(response.content, "using lookup");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "lookup");
+        assert_eq!(response.tool_calls[0].arguments, json!({"value":7}));
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_structured_auto_turn_with_text_and_multiple_calls() -> Result<(), String> {
+        let mut request = InferenceRequest::new("openai/example", "maybe use tools", 32);
+        request.tools.extend([
+            crate::FunctionTool {
+                name: "lookup".to_owned(),
+                description: None,
+                parameters: json!({"type":"object"}),
+                strict: true,
+            },
+            crate::FunctionTool {
+                name: "search".to_owned(),
+                description: None,
+                parameters: json!({"type":"object"}),
+                strict: true,
+            },
+        ]);
+        request.tool_choice = Some(ToolChoice::Auto);
+        request.parallel_tool_calls = Some(true);
+        let content = r#"{"text_response":"I will use both.","tool_calls":[{"name":"lookup","arguments":{"value":7}},{"name":"search","arguments":{"query":"rust"}}]}"#;
+        let (text, calls) = OpenRouter::parse_structured_tool_turn(&request, content, None, &[])
+            .map_err(|failure| failure.detail)?;
+        assert_eq!(text, "I will use both.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].arguments, json!({"value":7}));
+        assert_eq!(calls[1].name, "search");
+        assert_eq!(calls[1].arguments, json!({"query":"rust"}));
+        Ok(())
     }
 
     #[test]

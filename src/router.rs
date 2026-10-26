@@ -124,9 +124,11 @@ fn supports_behavioral_request(endpoint: &Endpoint, request: &InferenceRequest) 
                 return false;
             }
         }
-        Some(ResponseSchema::JsonSchema { strict, .. }) => {
+        Some(ResponseSchema::JsonSchema { schema, strict, .. }) => {
             if *strict {
-                let transport = endpoint.capabilities.strict_output_transport();
+                let transport = endpoint
+                    .capabilities
+                    .strict_output_transport_for_schema(schema);
                 if transport.is_none()
                     || (!request.tools.is_empty()
                         && transport == Some(StrictOutputTransport::ForcedTool))

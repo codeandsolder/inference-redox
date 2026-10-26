@@ -190,6 +190,8 @@ impl InferenceProvider for NvidiaNim {
                 verified_reasoning_efforts: BTreeSet::new(),
                 rejected_reasoning_efforts: BTreeSet::new(),
                 constraint_enforcement: BTreeMap::new(),
+                verified_schema_features: BTreeMap::new(),
+                rejected_schema_features: BTreeMap::new(),
                 reasoning: ReasoningSupport::None,
                 supports_implicit_caching: false,
             },

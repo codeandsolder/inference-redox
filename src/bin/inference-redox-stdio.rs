@@ -52,6 +52,7 @@ struct WireRetryPolicy {
     max_attempts: Option<u32>,
     initial_backoff_ms: Option<u64>,
     max_backoff_ms: Option<u64>,
+    attempt_timeout_ms: Option<u64>,
 }
 
 impl WireRetryPolicy {
@@ -65,6 +66,9 @@ impl WireRetryPolicy {
             max_backoff: self
                 .max_backoff_ms
                 .map_or(defaults.max_backoff, Duration::from_millis),
+            attempt_timeout: self
+                .attempt_timeout_ms
+                .map_or(defaults.attempt_timeout, Duration::from_millis),
         }
     }
 }
@@ -1286,8 +1290,8 @@ mod tests {
         load_conformance_profile, save_conformance_profile,
     };
     use inference_redox::{
-        ConformanceObservation, ConformanceOutcome, ConformanceProfile, QuotaUnknownPolicy,
-        SuitabilityUnknownPolicy,
+        ConformanceObservation, ConformanceOutcome, ConformanceProbe, ConformanceProfile,
+        QuotaUnknownPolicy, SuitabilityUnknownPolicy,
     };
     use serde_json::json;
     use std::fs;
@@ -1398,6 +1402,36 @@ mod tests {
                 .and_then(|spec| spec.endpoint_id.as_deref()),
             Some("groq")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn conformance_wire_accepts_schema_feature_probe() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(json!({
+            "id": 41,
+            "op": "conformance",
+            "conformance": {
+                "model": "openai/gpt-oss-120b",
+                "source": "openrouter",
+                "endpoint_id": "near-ai/fp4",
+                "probes": [{
+                    "schema_feature": {
+                        "transport": "structured_outputs",
+                        "feature": "one_of"
+                    }
+                }]
+            }
+        }))?;
+        assert!(matches!(
+            wire.conformance
+                .as_ref()
+                .and_then(|spec| spec.probes.first())
+                .copied(),
+            Some(ConformanceProbe::SchemaFeature {
+                transport: inference_redox::SchemaFeatureTransport::StructuredOutputs,
+                feature: inference_redox::SchemaFeature::OneOf,
+            })
+        ));
         Ok(())
     }
 

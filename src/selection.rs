@@ -30,6 +30,8 @@ pub struct InferenceRequestTemplate {
     #[serde(default)]
     pub tool_choice: Option<crate::ToolChoice>,
     #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
     pub agentic: bool,
     #[serde(default)]
     pub session_id: Option<String>,
@@ -51,6 +53,7 @@ impl InferenceRequestTemplate {
             include_reasoning: self.include_reasoning,
             tools: self.tools.clone(),
             tool_choice: self.tool_choice.clone(),
+            parallel_tool_calls: self.parallel_tool_calls,
             agentic: self.agentic,
             session_id: self.session_id.clone(),
             requirements: self.requirements.clone(),
@@ -593,6 +596,7 @@ mod tests {
             include_reasoning: false,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             agentic: false,
             session_id: None,
             requirements: RequestRequirements {

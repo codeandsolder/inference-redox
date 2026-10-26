@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use inference_redox::{
     ConstraintEnforcement, Endpoint, EndpointCapabilities, EndpointStats, FunctionTool,
     InferenceRequest, Percentiles, Pricing, ReasoningEffort, ReasoningSupport, RequestRequirements,
-    ResponseSchema, RoutingStrategy, ToolChoice, build_route_plan,
+    ResponseSchema, RoutingStrategy, SchemaFeature, ToolChoice, build_route_plan,
 };
 use serde_json::json;
 
@@ -75,6 +75,8 @@ fn endpoint(id: &str, prompt: f64, completion: f64, latency: f64, throughput: f6
             verified_reasoning_efforts: BTreeSet::new(),
             rejected_reasoning_efforts: BTreeSet::new(),
             constraint_enforcement: BTreeMap::new(),
+            verified_schema_features: BTreeMap::new(),
+            rejected_schema_features: BTreeMap::new(),
             reasoning: ReasoningSupport::GatewayNormalized,
             supports_implicit_caching: true,
         },
@@ -159,7 +161,7 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
     request.requirements = RequestRequirements {
         response_schema: Some(ResponseSchema::JsonSchema {
             name: "x".into(),
-            schema: json!({"type":"object"}),
+            schema: json!({"type":"object","additionalProperties":false}),
             strict: true,
         }),
         reasoning: ReasoningEffort::High,
@@ -341,7 +343,7 @@ fn rejected_parameter_overrides_nominal_provider_claim() {
     request.requirements = RequestRequirements {
         response_schema: Some(ResponseSchema::JsonSchema {
             name: "x".into(),
-            schema: json!({"type":"object"}),
+            schema: json!({"type":"object","additionalProperties":false}),
             strict: true,
         }),
         ..RequestRequirements::default()
@@ -402,7 +404,7 @@ fn verified_parameter_can_fill_missing_provider_claim() -> Result<(), inference_
     request.requirements = RequestRequirements {
         response_schema: Some(ResponseSchema::JsonSchema {
             name: "x".into(),
-            schema: json!({"type":"object"}),
+            schema: json!({"type":"object","additionalProperties":false}),
             strict: true,
         }),
         ..RequestRequirements::default()
@@ -442,7 +444,7 @@ fn strict_schema_can_use_verified_enforced_tool_fallback()
     request.prompt_tokens = Some(10);
     request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
         name: "answer".to_owned(),
-        schema: json!({"type": "object"}),
+        schema: json!({"type":"object","additionalProperties":false}),
         strict: true,
     });
 
@@ -452,6 +454,118 @@ fn strict_schema_can_use_verified_enforced_tool_fallback()
         vec![route],
     )?;
     assert_eq!(plan.candidates[0].endpoint.id, "tool-fallback");
+    Ok(())
+}
+
+#[test]
+fn root_array_schema_can_use_wrapped_tool_fallback_without_root_array_support()
+-> Result<(), inference_redox::ProviderError> {
+    let mut route = endpoint("tool-fallback", 1e-6, 1e-6, 0.1, 100.0);
+    route
+        .capabilities
+        .supported_parameters
+        .remove("structured_outputs");
+    route
+        .capabilities
+        .verified_parameters
+        .extend(["tools".to_owned(), "tool_choice".to_owned()]);
+    route
+        .capabilities
+        .constraint_enforcement
+        .insert("tools".to_owned(), ConstraintEnforcement::Enforced);
+    route.capabilities.verified_schema_features.insert(
+        "tools".to_owned(),
+        BTreeSet::from([
+            SchemaFeature::ArrayType,
+            SchemaFeature::ArrayItems,
+            SchemaFeature::ArrayBounds,
+        ]),
+    );
+
+    let mut request = InferenceRequest::new("x/model", "x", 10);
+    request.prompt_tokens = Some(10);
+    request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
+        name: "answer".to_owned(),
+        schema: json!({
+            "type": "array",
+            "items": {"type": "integer"},
+            "minItems": 1,
+            "maxItems": 1
+        }),
+        strict: true,
+    });
+
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route],
+    )?;
+    assert_eq!(plan.candidates[0].endpoint.id, "tool-fallback");
+    assert!(
+        !plan.candidates[0]
+            .endpoint
+            .capabilities
+            .verified_schema_features
+            .get("tools")
+            .is_some_and(|features| features.contains(&SchemaFeature::RootArray))
+    );
+    Ok(())
+}
+
+#[test]
+fn strict_native_tool_schema_requires_verified_dialect_features()
+-> Result<(), inference_redox::ProviderError> {
+    let mut route = endpoint("native-tools", 1e-6, 1e-6, 0.1, 100.0);
+    route
+        .capabilities
+        .verified_parameters
+        .extend(["tools".to_owned(), "tool_choice".to_owned()]);
+    route
+        .capabilities
+        .constraint_enforcement
+        .insert("tools".to_owned(), ConstraintEnforcement::Enforced);
+
+    let mut request = InferenceRequest::new("x/model", "use lookup", 16);
+    request.prompt_tokens = Some(10);
+    request.tools.push(FunctionTool {
+        name: "lookup".to_owned(),
+        description: None,
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "values": {
+                    "type": "array",
+                    "items": {"type": "integer"}
+                }
+            },
+            "required": ["values"],
+            "additionalProperties": false
+        }),
+        strict: true,
+    });
+    request.tool_choice = Some(ToolChoice::Function {
+        name: "lookup".to_owned(),
+    });
+
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route.clone()],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+
+    route.capabilities.verified_schema_features.insert(
+        "tools".to_owned(),
+        BTreeSet::from([SchemaFeature::ArrayType, SchemaFeature::ArrayItems]),
+    );
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
     Ok(())
 }
 
@@ -485,7 +599,7 @@ fn strict_schema_rejects_unverified_or_hint_only_tool_fallback() {
         request.prompt_tokens = Some(10);
         request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
             name: "answer".to_owned(),
-            schema: json!({"type": "object"}),
+            schema: json!({"type":"object","additionalProperties":false}),
             strict: true,
         });
         assert!(matches!(
@@ -518,7 +632,7 @@ fn strict_schema_does_not_repurpose_tools_when_request_already_has_tools() {
     request.prompt_tokens = Some(10);
     request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
         name: "answer".to_owned(),
-        schema: json!({"type": "object"}),
+        schema: json!({"type":"object","additionalProperties":false}),
         strict: true,
     });
     request.tools.push(inference_redox::FunctionTool {
@@ -544,7 +658,7 @@ fn nominal_structured_output_claim_is_not_enough_for_strict_routing() {
     request.prompt_tokens = Some(10);
     request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
         name: "answer".to_owned(),
-        schema: json!({"type": "object"}),
+        schema: json!({"type":"object","additionalProperties":false}),
         strict: true,
     });
     assert!(matches!(
@@ -614,6 +728,16 @@ fn exact_forced_tool_can_use_enforced_structured_output_transport()
         "structured_outputs".to_owned(),
         ConstraintEnforcement::Enforced,
     );
+    route.capabilities.verified_schema_features.insert(
+        "structured_outputs".to_owned(),
+        BTreeSet::from([
+            SchemaFeature::ArrayType,
+            SchemaFeature::ArrayItems,
+            SchemaFeature::ArrayBounds,
+            SchemaFeature::NestedObject,
+            SchemaFeature::ToolTurnEnvelope,
+        ]),
+    );
     let mut request = InferenceRequest::new("x/model", "call lookup", 16);
     request.prompt_tokens = Some(10);
     request.tools.push(FunctionTool {
@@ -640,7 +764,8 @@ fn exact_forced_tool_can_use_enforced_structured_output_transport()
 }
 
 #[test]
-fn lossy_tool_choices_do_not_translate_through_structured_output() {
+fn auto_and_multi_required_translate_when_schema_features_are_verified()
+-> Result<(), inference_redox::ProviderError> {
     let mut route = endpoint("schema-only", 1e-6, 1e-6, 0.1, 100.0);
     route.capabilities.supported_parameters.remove("tools");
     route
@@ -655,6 +780,17 @@ fn lossy_tool_choices_do_not_translate_through_structured_output() {
         "structured_outputs".to_owned(),
         ConstraintEnforcement::Enforced,
     );
+    route.capabilities.verified_schema_features.insert(
+        "structured_outputs".to_owned(),
+        BTreeSet::from([
+            SchemaFeature::OneOf,
+            SchemaFeature::NestedObject,
+            SchemaFeature::ArrayType,
+            SchemaFeature::ArrayItems,
+            SchemaFeature::ArrayBounds,
+            SchemaFeature::ToolTurnEnvelope,
+        ]),
+    );
     let tool = |name: &str| FunctionTool {
         name: name.to_owned(),
         description: None,
@@ -665,23 +801,118 @@ fn lossy_tool_choices_do_not_translate_through_structured_output() {
     auto.prompt_tokens = Some(10);
     auto.tools.push(tool("lookup"));
     auto.tool_choice = Some(ToolChoice::Auto);
-    assert!(
-        build_route_plan(
-            RoutingStrategy::FastestResponseCheap(1.5),
-            &auto,
-            vec![route.clone()],
-        )
-        .is_err()
-    );
+    let auto_plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &auto,
+        vec![route.clone()],
+    )?;
+    assert_eq!(auto_plan.candidates.len(), 1);
 
     let mut required = InferenceRequest::new("x/model", "call one", 16);
     required.prompt_tokens = Some(10);
     required.tools.extend([tool("a"), tool("b")]);
     required.tool_choice = Some(ToolChoice::Required);
+    let required_plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &required,
+        vec![route],
+    )?;
+    assert_eq!(required_plan.candidates.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn parallel_schema_emulated_tools_require_multiple_turn_evidence()
+-> Result<(), inference_redox::ProviderError> {
+    let mut route = endpoint("schema-only", 1e-6, 1e-6, 0.1, 100.0);
+    route.capabilities.supported_parameters.remove("tools");
+    route
+        .capabilities
+        .supported_parameters
+        .remove("tool_choice");
+    route
+        .capabilities
+        .verified_parameters
+        .insert("structured_outputs".to_owned());
+    route.capabilities.constraint_enforcement.insert(
+        "structured_outputs".to_owned(),
+        ConstraintEnforcement::Enforced,
+    );
+    route.capabilities.verified_schema_features.insert(
+        "structured_outputs".to_owned(),
+        BTreeSet::from([
+            SchemaFeature::OneOf,
+            SchemaFeature::NestedObject,
+            SchemaFeature::ArrayType,
+            SchemaFeature::ArrayItems,
+            SchemaFeature::ToolTurnEnvelope,
+        ]),
+    );
+    let tool = |name: &str| FunctionTool {
+        name: name.to_owned(),
+        description: None,
+        parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+        strict: true,
+    };
+    let mut request = InferenceRequest::new("x/model", "use both", 16);
+    request.prompt_tokens = Some(10);
+    request.tools.extend([tool("a"), tool("b")]);
+    request.tool_choice = Some(ToolChoice::Auto);
+    request.parallel_tool_calls = Some(true);
+
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route.clone()],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+
+    route
+        .capabilities
+        .verified_schema_features
+        .entry("structured_outputs".to_owned())
+        .or_default()
+        .insert(SchemaFeature::ToolTurnMultiple);
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn structured_tool_translation_fails_closed_without_required_schema_features() {
+    let mut route = endpoint("schema-only", 1e-6, 1e-6, 0.1, 100.0);
+    route.capabilities.supported_parameters.remove("tools");
+    route
+        .capabilities
+        .supported_parameters
+        .remove("tool_choice");
+    route
+        .capabilities
+        .verified_parameters
+        .insert("structured_outputs".to_owned());
+    route.capabilities.constraint_enforcement.insert(
+        "structured_outputs".to_owned(),
+        ConstraintEnforcement::Enforced,
+    );
+    let mut request = InferenceRequest::new("x/model", "maybe call", 16);
+    request.prompt_tokens = Some(10);
+    request.tools.push(FunctionTool {
+        name: "lookup".to_owned(),
+        description: None,
+        parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+        strict: true,
+    });
+    request.tool_choice = Some(ToolChoice::Auto);
     assert!(
         build_route_plan(
             RoutingStrategy::FastestResponseCheap(1.5),
-            &required,
+            &request,
             vec![route],
         )
         .is_err()

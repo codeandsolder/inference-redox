@@ -671,6 +671,7 @@ impl InferencePool {
         }
         let plan = self.route(catalog, strategy, request).await?;
         let mut attempted = 0_usize;
+        let mut last_error = None;
         for candidate in plan.candidates.clone() {
             let instance = ProviderInstanceKey::new(
                 candidate.endpoint.source.clone(),
@@ -689,20 +690,23 @@ impl InferencePool {
                 cost_ceiling_usd: candidate.expected_cost_usd,
                 candidates: vec![candidate.clone()],
             };
-            if let Ok(response) = provider
+            match provider
                 .execute_plan(&native_request, &candidate_plan, retry)
                 .await
             {
-                return Ok(PooledInferenceResponse {
-                    plan,
-                    selected: candidate,
-                    response,
-                });
+                Ok(response) => {
+                    return Ok(PooledInferenceResponse {
+                        plan,
+                        selected: candidate,
+                        response,
+                    });
+                }
+                Err(error) => last_error = Some(error),
             }
         }
-        Err(ProviderError::Request(format!(
-            "all {attempted} ranked provider candidates failed"
-        )))
+        Err(last_error.unwrap_or_else(|| {
+            ProviderError::Request(format!("all {attempted} ranked provider candidates failed"))
+        }))
     }
 }
 
@@ -763,6 +767,8 @@ mod tests {
                     verified_reasoning_efforts: BTreeSet::new(),
                     rejected_reasoning_efforts: BTreeSet::new(),
                     constraint_enforcement: BTreeMap::new(),
+                    verified_schema_features: BTreeMap::new(),
+                    rejected_schema_features: BTreeMap::new(),
                     reasoning: ReasoningSupport::None,
                     supports_implicit_caching: false,
                 },
@@ -845,6 +851,8 @@ mod tests {
                     verified_reasoning_efforts: BTreeSet::new(),
                     rejected_reasoning_efforts: BTreeSet::new(),
                     constraint_enforcement: BTreeMap::new(),
+                    verified_schema_features: BTreeMap::new(),
+                    rejected_schema_features: BTreeMap::new(),
                     reasoning: ReasoningSupport::None,
                     supports_implicit_caching: false,
                 },
@@ -975,6 +983,7 @@ mod tests {
             include_reasoning: false,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             agentic: false,
             session_id: None,
             requirements: crate::RequestRequirements {
@@ -1391,6 +1400,40 @@ mod tests {
             .await?;
         assert_eq!(result.selected.endpoint.source, "openrouter");
         assert_eq!(result.response.provider.as_deref(), Some("openrouter"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn synchronous_infer_preserves_last_provider_error() -> Result<(), ProviderError> {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut pool = InferencePool::new();
+        pool.register(
+            "openrouter",
+            Arc::new(MockProvider {
+                source: "openrouter",
+                price: 0.0,
+                fail_execute: true,
+                calls,
+            }),
+        );
+        let request = InferenceRequest::new("vendor/model", "hi", 8);
+        let error = pool
+            .infer(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                RetryPolicy::default(),
+            )
+            .await
+            .err()
+            .ok_or_else(|| ProviderError::Request("expected provider failure".to_owned()))?;
+        assert!(matches!(
+            error,
+            ProviderError::Execution {
+                detail,
+                ..
+            } if detail == "mock failure"
+        ));
         Ok(())
     }
 

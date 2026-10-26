@@ -29,6 +29,7 @@ pub use catalog::{
 };
 pub use conformance::{
     ConformanceObservation, ConformanceOutcome, ConformanceProbe, ConformanceProfile,
+    SchemaFeatureTransport,
 };
 pub use inventory::{
     InventoryResolution, NativeModelRecord, ProviderInventory, ProviderModelObservation,
@@ -37,8 +38,8 @@ pub use model::{
     AgenticPolicy, ConstraintEnforcement, EffectivePricing, Endpoint, EndpointCapabilities,
     EndpointStats, FunctionTool, InferenceRequest, InferenceResponse, Percentiles, Pricing,
     PricingOverride, ReasoningEffort, ReasoningSupport, RequestRequirements, ResponseSchema,
-    RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy, StrictOutputTransport, TokenUsage,
-    ToolCall, ToolChoice, ToolTransport, WorkloadPolicy,
+    RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy, SchemaFeature, StrictOutputTransport,
+    TokenUsage, ToolCall, ToolChoice, ToolTransport, WorkloadPolicy, schema_feature_requirements,
 };
 pub use pool::{
     InferencePool, PooledInferenceResponse, QuotaExecutionContext, QuotaInferenceError,
