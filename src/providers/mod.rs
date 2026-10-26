@@ -1,5 +1,6 @@
 pub mod groq;
 pub mod kilo;
+pub mod mistral;
 pub mod nvidia;
 pub mod ollama;
 mod openai_compatible;

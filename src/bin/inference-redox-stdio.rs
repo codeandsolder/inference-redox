@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use inference_redox::providers::{
-    groq::GroqCloud, kilo::KiloGateway, nvidia::NvidiaNim, ollama::OllamaCloud,
-    opencode::OpenCodeConsole, openrouter::OpenRouter,
+    groq::GroqCloud, kilo::KiloGateway, mistral::MistralCloud, nvidia::NvidiaNim,
+    ollama::OllamaCloud, opencode::OpenCodeConsole, openrouter::OpenRouter,
 };
 use inference_redox::{
     BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, ConformanceProbe,
@@ -165,6 +165,8 @@ struct Providers {
     openrouter: Arc<OpenRouter>,
     nvidia: Option<Arc<NvidiaNim>>,
     groq: Option<Arc<GroqCloud>>,
+    mistral: Option<Arc<MistralCloud>>,
+    codestral: Option<Arc<MistralCloud>>,
     ollama: Option<Arc<OllamaCloud>>,
     kilo: Arc<KiloGateway>,
     opencode: Option<Arc<OpenCodeConsole>>,
@@ -186,6 +188,16 @@ impl Providers {
         }
         if let Some(groq) = self.groq.as_ref()
             && let Ok(inventory) = groq.inventory(&base_catalog).await
+        {
+            inventories.push(inventory);
+        }
+        if let Some(mistral) = self.mistral.as_ref()
+            && let Ok(inventory) = mistral.inventory(&base_catalog).await
+        {
+            inventories.push(inventory);
+        }
+        if let Some(codestral) = self.codestral.as_ref()
+            && let Ok(inventory) = codestral.inventory(&base_catalog).await
         {
             inventories.push(inventory);
         }
@@ -224,6 +236,12 @@ impl Providers {
         if let Some(groq) = self.groq.as_ref() {
             pool.register("groq", Arc::clone(groq));
         }
+        if let Some(mistral) = self.mistral.as_ref() {
+            pool.register("mistral", Arc::clone(mistral));
+        }
+        if let Some(codestral) = self.codestral.as_ref() {
+            pool.register("codestral", Arc::clone(codestral));
+        }
         if let Some(ollama) = self.ollama.as_ref() {
             pool.register("ollama-cloud", Arc::clone(ollama));
         }
@@ -251,6 +269,14 @@ impl Providers {
                 .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
             "groq" => self
                 .groq
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
+            "mistral" => self
+                .mistral
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
+            "codestral" => self
+                .codestral
                 .as_ref()
                 .map(|provider| Arc::clone(provider) as Arc<dyn InferenceProvider>),
             "ollama-cloud" => self
@@ -1260,6 +1286,8 @@ struct ApiKeys {
     openrouter: String,
     nvidia: Option<String>,
     groq: Option<String>,
+    mistral: Option<String>,
+    codestral: Option<String>,
     ollama: Option<String>,
     kilo: Option<String>,
     opencode: Option<String>,
@@ -1282,6 +1310,8 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         .or(from_file("NVIDIA_API_KEY")?)
         .or(from_file("NVIDIA_API_key")?);
     let groq = environment_key("GROQ_API_KEY").or(from_file("GROQ_API_KEY")?);
+    let mistral = environment_key("MISTRAL_API_KEY").or(from_file("MISTRAL_API_KEY")?);
+    let codestral = environment_key("CODESTRAL_API_KEY").or(from_file("CODESTRAL_API_KEY")?);
     let ollama = environment_key("OLLAMA_API_KEY").or(from_file("OLLAMA_API_KEY")?);
     let kilo = environment_key("KILO_API_KEY").or(from_file("KILO_API_KEY")?);
     let opencode = environment_key("OPENCODE_API_KEY").or(from_file("OPENCODE_API_KEY")?);
@@ -1289,6 +1319,8 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
         openrouter,
         nvidia,
         groq,
+        mistral,
+        codestral,
         ollama,
         kilo,
         opencode,
@@ -1312,6 +1344,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         groq: keys
             .groq
             .map(|key| Arc::new(GroqCloud::new(key).with_quota_pool("default"))),
+        mistral: keys
+            .mistral
+            .map(|key| Arc::new(MistralCloud::new(key).with_quota_pool("default"))),
+        codestral: keys
+            .codestral
+            .map(|key| Arc::new(MistralCloud::codestral(key).with_quota_pool("personal"))),
         ollama: keys.ollama.map(|key| Arc::new(OllamaCloud::new(key))),
         kilo: Arc::new(KiloGateway::new(keys.kilo).with_quota_pool("default-egress")),
         opencode,
