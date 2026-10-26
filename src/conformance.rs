@@ -1339,6 +1339,69 @@ impl ConformanceProfile {
         self.observations.push(observation);
     }
 
+    /// Record negative structured-output evidence learned from a real inference response.
+    ///
+    /// Only provider-attributable failures with concrete validation violations become evidence;
+    /// local schema-compilation failures stay local and do not poison an endpoint.
+    pub fn record_runtime_schema_failure(
+        &mut self,
+        endpoint: &Endpoint,
+        transport: SchemaFeatureTransport,
+        transported_features: &BTreeSet<SchemaFeature>,
+        failure: &crate::StructuredOutputFailure,
+    ) {
+        if failure.violations.is_empty() {
+            return;
+        }
+        let mapped_features: BTreeSet<SchemaFeature> = failure
+            .violations
+            .iter()
+            .filter_map(|violation| {
+                crate::structured_output::schema_feature_for_validation_keyword(&violation.keyword)
+            })
+            .collect();
+        let mut attributed: BTreeSet<SchemaFeature> = mapped_features
+            .intersection(transported_features)
+            .copied()
+            .collect();
+        // Canonical lowering can change the keyword spelling while preserving semantics, e.g.
+        // oneOf(const a,const b) -> enum(a,b). If exactly one wire feature is involved, attribution
+        // remains unambiguous. With multiple possible wire features, fail closed at transport level.
+        if attributed.is_empty()
+            && !mapped_features.is_empty()
+            && transported_features.len() == 1
+            && let Some(feature) = transported_features.iter().next()
+        {
+            attributed.insert(*feature);
+        }
+        if !attributed.is_empty() {
+            for feature in attributed {
+                let probe = ConformanceProbe::SchemaFeature { transport, feature };
+                self.record(runtime_schema_observation(
+                    endpoint,
+                    probe,
+                    ConformanceOutcome::Failed,
+                    Some(false),
+                    &failure.summary,
+                ));
+            }
+            return;
+        }
+        let probe = match transport {
+            SchemaFeatureTransport::StructuredOutputs => ConformanceProbe::StrictJsonSchema,
+            SchemaFeatureTransport::Tools => ConformanceProbe::ToolSchemaStrict,
+        };
+        // The request itself completed successfully; the constraint did not. Existing base
+        // enforcement logic represents that as a passed execution with constraint=false.
+        self.record(runtime_schema_observation(
+            endpoint,
+            probe,
+            ConformanceOutcome::Passed,
+            Some(false),
+            &failure.summary,
+        ));
+    }
+
     /// Apply only observations scoped to this exact endpoint/model route.
     pub fn apply_to_endpoint(&self, endpoint: &mut Endpoint) {
         let source = endpoint.source.clone();
@@ -1357,6 +1420,39 @@ impl ConformanceProfile {
                     .is_none_or(|id| id == &endpoint_id)
         });
         apply_observations(&mut endpoint.capabilities, observations);
+    }
+}
+
+fn runtime_schema_observation(
+    endpoint: &Endpoint,
+    probe: ConformanceProbe,
+    outcome: ConformanceOutcome,
+    constraint_satisfied: Option<bool>,
+    detail: &str,
+) -> ConformanceObservation {
+    ConformanceObservation {
+        source: endpoint.source.clone(),
+        credential: endpoint.credential.clone(),
+        provider_key: endpoint.provider_key.clone(),
+        endpoint_id: Some(endpoint.id.clone()),
+        native_model_id: endpoint.model.clone(),
+        canonical_id: None,
+        parameter: probe.parameter().to_owned(),
+        reasoning_effort: None,
+        reasoning_tokens: None,
+        completion_tokens: None,
+        reasoning_chars: None,
+        reasoning_trace: None,
+        response_content: None,
+        tool_arguments: None,
+        puzzle_correct: None,
+        finish_reason: None,
+        constraint_satisfied,
+        test_id: probe.test_id(),
+        test_version: probe.test_version(),
+        outcome,
+        observed_unix_ms: unix_time_ms(),
+        detail: Some(detail.to_owned()),
     }
 }
 

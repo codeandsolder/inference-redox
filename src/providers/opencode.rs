@@ -417,7 +417,7 @@ impl OpenCodeConsole {
                 } => json!({
                     "type": "json_schema",
                     "name": name,
-                    "schema": schema,
+                    "schema": crate::lower_json_schema(schema),
                     "strict": strict,
                 }),
             };
@@ -485,7 +485,10 @@ impl OpenCodeConsole {
                             .to_owned(),
                     ));
                 }
-                generation.insert("responseJsonSchema".to_owned(), schema.clone());
+                generation.insert(
+                    "responseJsonSchema".to_owned(),
+                    crate::lower_json_schema(schema),
+                );
             }
         }
         if !generation.is_empty() {
@@ -583,6 +586,7 @@ impl OpenCodeConsole {
             usage_cost_usd,
             usage,
             tool_calls: Vec::new(),
+            output_repairs: Vec::new(),
             quota_observations,
             raw,
         })

@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
-use crate::router::supports_request;
+use crate::router::{lowered_strict_schema, supports_request};
 use crate::{
     ConformanceProfile, InferenceProvider, InferenceRequest, InferenceRequestTemplate,
     InferenceResponse, ModelCatalog, ModelLookup, ModelRouteClass, ModelRouteSelectionCandidate,
@@ -33,7 +34,7 @@ impl ProviderInstanceKey {
 #[derive(Clone, Default)]
 pub struct InferencePool {
     providers: BTreeMap<ProviderInstanceKey, Arc<dyn InferenceProvider>>,
-    conformance: ConformanceProfile,
+    conformance: Arc<Mutex<ConformanceProfile>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,8 +183,23 @@ impl InferencePool {
 
     #[must_use]
     pub fn with_conformance_profile(mut self, profile: ConformanceProfile) -> Self {
+        self.conformance = Arc::new(Mutex::new(profile));
+        self
+    }
+
+    /// Share mutable conformance evidence with a long-lived caller such as the stdio bridge.
+    #[must_use]
+    pub fn with_shared_conformance_profile(
+        mut self,
+        profile: Arc<Mutex<ConformanceProfile>>,
+    ) -> Self {
         self.conformance = profile;
         self
+    }
+
+    /// Snapshot the current in-process conformance evidence.
+    pub async fn conformance_profile(&self) -> ConformanceProfile {
+        self.conformance.lock().await.clone()
     }
 
     pub fn register<P>(&mut self, source: impl Into<String>, provider: Arc<P>)
@@ -252,6 +268,7 @@ impl InferencePool {
             }
         };
 
+        let conformance = self.conformance.lock().await.clone();
         let mut endpoints = Vec::new();
         let mut discovery_error = None;
         for route in resolved.routes {
@@ -281,7 +298,7 @@ impl InferencePool {
                     endpoint.credential.clone_from(&instance.credential);
                     endpoint.model.clone_from(&route.id);
                     endpoint.route_class = route.route_class;
-                    self.conformance.apply_to_endpoint(endpoint);
+                    conformance.apply_to_endpoint(endpoint);
                 }
                 endpoints.extend(discovered);
             }
@@ -292,6 +309,22 @@ impl InferencePool {
                 .unwrap_or_else(|| ProviderError::NoEligibleEndpoint(request.model.clone())));
         }
         Ok(endpoints)
+    }
+
+    async fn record_runtime_schema_failure(
+        &self,
+        endpoint: &crate::Endpoint,
+        request: &InferenceRequest,
+        failure: &crate::StructuredOutputFailure,
+    ) {
+        let Some((transport, features)) = runtime_schema_transport(endpoint, request, failure)
+        else {
+            return;
+        };
+        self.conformance
+            .lock()
+            .await
+            .record_runtime_schema_failure(endpoint, transport, &features, failure);
     }
 
     /// Build one cost/performance plan across every registered execution surface.
@@ -318,13 +351,18 @@ impl InferencePool {
     ) -> Result<QuotaEndpointDiscovery, ProviderError> {
         let endpoints = self.endpoints(catalog, request).await?;
         let prompt_tokens = request_prompt_tokens(request);
+        let lowered_strict_schema = lowered_strict_schema(request);
         let demand = QuotaDemand::for_request(request);
         let mut reports = Vec::new();
         let mut admitted = Vec::new();
-        for endpoint in endpoints
-            .into_iter()
-            .filter(|endpoint| supports_request(endpoint, request, prompt_tokens))
-        {
+        for endpoint in endpoints.into_iter().filter(|endpoint| {
+            supports_request(
+                endpoint,
+                request,
+                prompt_tokens,
+                lowered_strict_schema.as_ref(),
+            )
+        }) {
             let route_key = QuotaRouteKey::from_endpoint(&endpoint);
             let instance =
                 ProviderInstanceKey::new(endpoint.source.clone(), endpoint.credential.clone());
@@ -524,14 +562,23 @@ impl InferencePool {
                     policy.now_unix,
                 )
                 .map_err(|error| SelectedRouteExecutionError::Accounting(error.to_string()))?;
-                Ok(QuotaPooledInferenceResponse {
-                    quota_plan: QuotaAwareRoutePlan {
-                        plan,
-                        quota_reports: vec![validation.quota],
-                    },
-                    selected: candidate,
-                    response,
-                })
+                match crate::structured_output::validate_inference_response(&request, response) {
+                    Ok(response) => Ok(QuotaPooledInferenceResponse {
+                        quota_plan: QuotaAwareRoutePlan {
+                            plan,
+                            quota_reports: vec![validation.quota],
+                        },
+                        selected: candidate,
+                        response,
+                    }),
+                    Err(failure) => {
+                        self.record_runtime_schema_failure(&candidate.endpoint, &request, &failure)
+                            .await;
+                        Err(SelectedRouteExecutionError::Provider(
+                            ProviderError::Response(failure.to_string()),
+                        ))
+                    }
+                }
             }
             Err(error) => {
                 settle_failed_quota(ledger, reservation, &route, &error, policy.now_unix).map_err(
@@ -629,11 +676,25 @@ impl InferencePool {
                         &response,
                         quota.now_unix,
                     )?;
-                    return Ok(QuotaPooledInferenceResponse {
-                        quota_plan,
-                        selected: candidate,
-                        response,
-                    });
+                    match crate::structured_output::validate_inference_response(request, response) {
+                        Ok(response) => {
+                            return Ok(QuotaPooledInferenceResponse {
+                                quota_plan,
+                                selected: candidate,
+                                response,
+                            });
+                        }
+                        Err(failure) => {
+                            self.record_runtime_schema_failure(
+                                &candidate.endpoint,
+                                request,
+                                &failure,
+                            )
+                            .await;
+                            last_error =
+                                Some(Box::new(ProviderError::Response(failure.to_string())));
+                        }
+                    }
                 }
                 Err(error) => {
                     settle_failed_quota(ledger, reservation, &route_key, &error, quota.now_unix)?;
@@ -695,11 +756,24 @@ impl InferencePool {
                 .await
             {
                 Ok(response) => {
-                    return Ok(PooledInferenceResponse {
-                        plan,
-                        selected: candidate,
-                        response,
-                    });
+                    match crate::structured_output::validate_inference_response(request, response) {
+                        Ok(response) => {
+                            return Ok(PooledInferenceResponse {
+                                plan,
+                                selected: candidate,
+                                response,
+                            });
+                        }
+                        Err(failure) => {
+                            self.record_runtime_schema_failure(
+                                &candidate.endpoint,
+                                request,
+                                &failure,
+                            )
+                            .await;
+                            last_error = Some(ProviderError::Response(failure.to_string()));
+                        }
+                    }
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -707,6 +781,91 @@ impl InferencePool {
         Err(last_error.unwrap_or_else(|| {
             ProviderError::Request(format!("all {attempted} ranked provider candidates failed"))
         }))
+    }
+}
+
+fn runtime_schema_transport(
+    endpoint: &crate::Endpoint,
+    request: &InferenceRequest,
+    failure: &crate::StructuredOutputFailure,
+) -> Option<(
+    crate::SchemaFeatureTransport,
+    BTreeSet<crate::SchemaFeature>,
+)> {
+    let tool_failure = failure.violations.iter().any(|violation| {
+        violation.instance_path.starts_with("/tool_calls")
+            || matches!(
+                violation.keyword.as_str(),
+                "tool_choice" | "tool_name" | "parallel_tool_calls"
+            )
+    });
+    if tool_failure && !request.tools.is_empty() {
+        return runtime_tool_schema_transport(endpoint, request);
+    }
+    match request.requirements.response_schema.as_ref() {
+        Some(crate::ResponseSchema::JsonObject) => Some((
+            crate::SchemaFeatureTransport::StructuredOutputs,
+            BTreeSet::new(),
+        )),
+        Some(crate::ResponseSchema::JsonSchema {
+            schema,
+            strict: true,
+            ..
+        }) => {
+            let lowered = crate::lower_json_schema(schema);
+            let transport = endpoint
+                .capabilities
+                .strict_output_transport_for_lowered_schema_with_policy(
+                    &lowered,
+                    request.requirements.schema_evidence,
+                )?;
+            match transport {
+                crate::StrictOutputTransport::Native => Some((
+                    crate::SchemaFeatureTransport::StructuredOutputs,
+                    crate::schema_feature_requirements(&lowered),
+                )),
+                crate::StrictOutputTransport::ForcedTool => {
+                    let (tool_schema, _) =
+                        crate::model::forced_tool_parameter_schema_from_lowered(&lowered);
+                    Some((
+                        crate::SchemaFeatureTransport::Tools,
+                        crate::schema_feature_requirements(&tool_schema),
+                    ))
+                }
+            }
+        }
+        Some(crate::ResponseSchema::JsonSchema { strict: false, .. }) | None => {
+            if request.tools.is_empty() {
+                None
+            } else {
+                runtime_tool_schema_transport(endpoint, request)
+            }
+        }
+    }
+}
+
+fn runtime_tool_schema_transport(
+    endpoint: &crate::Endpoint,
+    request: &InferenceRequest,
+) -> Option<(
+    crate::SchemaFeatureTransport,
+    BTreeSet<crate::SchemaFeature>,
+)> {
+    match endpoint.capabilities.tool_transport(request)? {
+        crate::ToolTransport::Native => {
+            let features = request.tools.iter().filter(|tool| tool.strict).fold(
+                BTreeSet::new(),
+                |mut features, tool| {
+                    let lowered = crate::lower_json_schema(&tool.parameters);
+                    features.extend(crate::schema_feature_requirements(&lowered));
+                    features
+                },
+            );
+            Some((crate::SchemaFeatureTransport::Tools, features))
+        }
+        crate::ToolTransport::StructuredOutput => request
+            .lowered_structured_tool_response_schema()
+            .map(|(_, features)| (crate::SchemaFeatureTransport::StructuredOutputs, features)),
     }
 }
 
@@ -804,8 +963,80 @@ mod tests {
                     reasoning_tokens: None,
                 },
                 tool_calls: Vec::new(),
+                output_repairs: Vec::new(),
                 quota_observations: Vec::new(),
                 raw: json!({"native_model": request.model, "mock_price": self.price}),
+            })
+        }
+    }
+
+    struct StructuredProvider {
+        content: &'static str,
+    }
+
+    #[async_trait]
+    impl InferenceProvider for StructuredProvider {
+        async fn endpoints(&self, model: &str) -> Result<Vec<Endpoint>, ProviderError> {
+            Ok(vec![Endpoint {
+                source: "openrouter".to_owned(),
+                credential: None,
+                provider_key: "structured".to_owned(),
+                id: "structured/fp8".to_owned(),
+                provider: "Structured".to_owned(),
+                model: model.to_owned(),
+                route_class: ModelRouteClass::Standard,
+                display_name: "Structured".to_owned(),
+                quantization: None,
+                status: 0,
+                context_length: Some(100_000),
+                max_prompt_tokens: None,
+                max_completion_tokens: None,
+                pricing: Pricing::default(),
+                stats: EndpointStats {
+                    uptime_30m: Some(100.0),
+                    ..EndpointStats::default()
+                },
+                workload_policy: crate::WorkloadPolicy::default(),
+                capabilities: EndpointCapabilities {
+                    adapter_parameters: BTreeSet::from([
+                        "max_tokens".to_owned(),
+                        "response_format".to_owned(),
+                        "structured_outputs".to_owned(),
+                    ]),
+                    supported_parameters: BTreeSet::from([
+                        "max_tokens".to_owned(),
+                        "response_format".to_owned(),
+                        "structured_outputs".to_owned(),
+                    ]),
+                    verified_parameters: BTreeSet::new(),
+                    rejected_parameters: BTreeSet::new(),
+                    verified_reasoning_efforts: BTreeSet::new(),
+                    rejected_reasoning_efforts: BTreeSet::new(),
+                    constraint_enforcement: BTreeMap::new(),
+                    verified_schema_features: BTreeMap::new(),
+                    rejected_schema_features: BTreeMap::new(),
+                    reasoning: ReasoningSupport::None,
+                    supports_implicit_caching: false,
+                },
+            }])
+        }
+
+        async fn execute_plan(
+            &self,
+            request: &InferenceRequest,
+            _plan: &RoutePlan,
+            _retry: RetryPolicy,
+        ) -> Result<InferenceResponse, ProviderError> {
+            Ok(InferenceResponse {
+                content: self.content.to_owned(),
+                model: Some(request.model.clone()),
+                provider: Some("Structured".to_owned()),
+                usage_cost_usd: Some(0.0),
+                usage: crate::TokenUsage::default(),
+                tool_calls: Vec::new(),
+                output_repairs: Vec::new(),
+                quota_observations: Vec::new(),
+                raw: json!({}),
             })
         }
     }
@@ -1365,6 +1596,135 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn learn_mode_repairs_unambiguous_real_response() -> Result<(), ProviderError> {
+        let mut pool = InferencePool::new();
+        pool.register(
+            "openrouter",
+            Arc::new(StructuredProvider {
+                content: r#"{"n":"1"}"#,
+            }),
+        );
+        let mut request = InferenceRequest::new("vendor/model", "return one", 8);
+        request.requirements.schema_evidence = crate::SchemaEvidencePolicy::Learn;
+        request.requirements.response_schema = Some(crate::ResponseSchema::JsonSchema {
+            name: "answer".to_owned(),
+            schema: json!({
+                "type":"object",
+                "properties":{"n":{"type":"integer"}},
+                "required":["n"],
+                "additionalProperties":false
+            }),
+            strict: true,
+        });
+        let result = pool
+            .infer(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                RetryPolicy::default(),
+            )
+            .await?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.response.content).ok(),
+            Some(json!({"n":1}))
+        );
+        assert_eq!(result.response.output_repairs.len(), 1);
+        assert_eq!(
+            result.response.output_repairs[0].kind,
+            crate::OutputRepairKind::StringToInteger
+        );
+        assert_eq!(pool.conformance_profile().await.observations, Vec::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learn_mode_baseline_failure_demotes_strict_transport() {
+        let mut pool = InferencePool::new();
+        pool.register(
+            "openrouter",
+            Arc::new(StructuredProvider {
+                content: "not-json",
+            }),
+        );
+        let mut request = InferenceRequest::new("vendor/model", "return n", 8);
+        request.requirements.schema_evidence = crate::SchemaEvidencePolicy::Learn;
+        request.requirements.response_schema = Some(crate::ResponseSchema::JsonSchema {
+            name: "answer".to_owned(),
+            schema: json!({
+                "type":"object",
+                "properties":{"n":{"type":"integer"}},
+                "required":["n"],
+                "additionalProperties":false
+            }),
+            strict: true,
+        });
+        let first = pool
+            .infer(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                RetryPolicy::default(),
+            )
+            .await;
+        assert!(matches!(first, Err(ProviderError::Response(_))));
+        let profile = pool.conformance_profile().await;
+        assert!(profile.observations.iter().any(|observation| {
+            observation.test_id == "strict-json-schema"
+                && observation.outcome == crate::ConformanceOutcome::Passed
+                && observation.constraint_satisfied == Some(false)
+        }));
+        assert!(matches!(
+            pool.route(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+            )
+            .await,
+            Err(ProviderError::NoEligibleEndpoint(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn learn_mode_negative_evidence_blocks_same_wire_feature_next_time() {
+        let mut pool = InferencePool::new();
+        pool.register(
+            "openrouter",
+            Arc::new(StructuredProvider { content: r#""c""# }),
+        );
+        let mut request = InferenceRequest::new("vendor/model", "return a or b", 8);
+        request.requirements.schema_evidence = crate::SchemaEvidencePolicy::Learn;
+        request.requirements.response_schema = Some(crate::ResponseSchema::JsonSchema {
+            name: "answer".to_owned(),
+            schema: json!({"oneOf":[{"const":"a"},{"const":"b"}]}),
+            strict: true,
+        });
+        let first = pool
+            .infer(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                RetryPolicy::default(),
+            )
+            .await;
+        assert!(matches!(first, Err(ProviderError::Response(_))));
+
+        let profile = pool.conformance_profile().await;
+        assert!(profile.observations.iter().any(|observation| {
+            observation.test_id == "schema-feature-structured_outputs-enum"
+                && observation.outcome == crate::ConformanceOutcome::Failed
+        }));
+        assert!(matches!(
+            pool.route(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+            )
+            .await,
+            Err(ProviderError::NoEligibleEndpoint(_))
+        ));
     }
 
     #[tokio::test]

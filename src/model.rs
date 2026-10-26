@@ -181,6 +181,19 @@ pub enum ConstraintEnforcement {
     Enforced,
 }
 
+/// How much empirical JSON-Schema evidence routing requires before trying an endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaEvidencePolicy {
+    /// Require positive endpoint-local evidence for every required schema feature.
+    #[default]
+    Proven,
+    /// Allow unknown schema behavior, but never retry features already observed to fail.
+    /// Intended for retryable low-priority work where useful inference can double as conformance
+    /// sampling.
+    Learn,
+}
+
 /// JSON-Schema features whose support is probed independently after base enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -471,64 +484,105 @@ impl EndpointCapabilities {
         &self,
         schema: &Value,
     ) -> Option<StrictOutputTransport> {
-        let native_features = schema_feature_requirements(schema);
+        self.strict_output_transport_for_schema_with_policy(schema, SchemaEvidencePolicy::Proven)
+    }
+
+    /// Select strict structured-output transport under the caller's empirical-evidence policy.
+    #[must_use]
+    pub fn strict_output_transport_for_schema_with_policy(
+        &self,
+        schema: &Value,
+        policy: SchemaEvidencePolicy,
+    ) -> Option<StrictOutputTransport> {
+        let lowered = crate::lower_json_schema(schema);
+        self.strict_output_transport_for_lowered_schema_with_policy(&lowered, policy)
+    }
+
+    pub(crate) fn strict_output_transport_for_lowered_schema_with_policy(
+        &self,
+        lowered_schema: &Value,
+        policy: SchemaEvidencePolicy,
+    ) -> Option<StrictOutputTransport> {
+        let native_features = schema_feature_requirements(lowered_schema);
         if self.supports_parameter("structured_outputs")
-            && self.constraint_enforcement("structured_outputs")
-                == Some(ConstraintEnforcement::Enforced)
-            && self.verified_schema_feature_set("structured_outputs", &native_features)
+            && self.schema_transport_evidence_allows("structured_outputs", &native_features, policy)
         {
             return Some(StrictOutputTransport::Native);
         }
-        let (tool_schema, _) = forced_tool_parameter_schema(schema);
+        let (tool_schema, _) = forced_tool_parameter_schema_from_lowered(lowered_schema);
         let tool_features = schema_feature_requirements(&tool_schema);
         if self.supports_parameter("tools")
             && self.supports_parameter("tool_choice")
-            && self.constraint_enforcement("tools") == Some(ConstraintEnforcement::Enforced)
-            && self.verified_schema_feature_set("tools", &tool_features)
+            && self.schema_transport_evidence_allows("tools", &tool_features, policy)
         {
             return Some(StrictOutputTransport::ForcedTool);
         }
         None
     }
 
+    fn schema_transport_evidence_allows(
+        &self,
+        parameter: &str,
+        features: &BTreeSet<SchemaFeature>,
+        policy: SchemaEvidencePolicy,
+    ) -> bool {
+        match policy {
+            SchemaEvidencePolicy::Proven => {
+                self.constraint_enforcement(parameter) == Some(ConstraintEnforcement::Enforced)
+                    && self.verified_schema_feature_set(parameter, features)
+            }
+            SchemaEvidencePolicy::Learn => {
+                if matches!(
+                    self.constraint_enforcement(parameter),
+                    Some(ConstraintEnforcement::Ineffective | ConstraintEnforcement::HintOnly)
+                ) {
+                    return false;
+                }
+                let rejected = self.rejected_schema_features.get(parameter);
+                !features
+                    .iter()
+                    .any(|feature| rejected.is_some_and(|set| set.contains(feature)))
+            }
+        }
+    }
+
     /// Select a semantics-preserving transport for a tool request. Native tools are preferred.
     /// Structured output may emulate exact, required, and auto choices only when the endpoint has
-    /// positive evidence for every JSON-Schema feature needed by that exact generated envelope.
+    /// enough evidence under the request's schema policy for the generated envelope.
     #[must_use]
     pub fn tool_transport(&self, request: &InferenceRequest) -> Option<ToolTransport> {
         if request.tools.is_empty() || matches!(request.tool_choice, Some(ToolChoice::None)) {
             return None;
         }
+        let policy = request.requirements.schema_evidence;
         let probe_native = request.requirements.required_parameters.contains("tools");
+        let parameter_allows = |parameter: &str| match policy {
+            SchemaEvidencePolicy::Proven => self.verified_parameter(parameter),
+            SchemaEvidencePolicy::Learn => self.supports_parameter(parameter),
+        };
         let native_choice_ok = match request.tool_choice.as_ref() {
             Some(ToolChoice::Required | ToolChoice::Function { .. }) => {
-                self.verified_parameter("tool_choice")
+                parameter_allows("tool_choice")
                     || (probe_native && self.adapter_parameters.contains("tool_choice"))
             }
             Some(ToolChoice::Auto) | None => true,
             Some(ToolChoice::None) => return None,
         };
         let native_parallel_ok = request.parallel_tool_calls.is_none()
-            || self.verified_parameter("parallel_tool_calls")
+            || parameter_allows("parallel_tool_calls")
             || (probe_native && self.adapter_parameters.contains("parallel_tool_calls"));
-        let strict_tools = request
-            .tools
-            .iter()
-            .filter(|tool| tool.strict)
-            .collect::<Vec<_>>();
-        let native_schema_ok = strict_tools.is_empty()
+        let strict_features = request.tools.iter().filter(|tool| tool.strict).fold(
+            BTreeSet::new(),
+            |mut features, tool| {
+                let lowered = crate::lower_json_schema(&tool.parameters);
+                features.extend(schema_feature_requirements(&lowered));
+                features
+            },
+        );
+        let native_schema_ok = strict_features.is_empty()
             || probe_native
-            || (self.constraint_enforcement("tools") == Some(ConstraintEnforcement::Enforced)
-                && self.verified_schema_feature_set(
-                    "tools",
-                    &strict_tools
-                        .iter()
-                        .fold(BTreeSet::new(), |mut features, tool| {
-                            features.extend(schema_feature_requirements(&tool.parameters));
-                            features
-                        }),
-                ));
-        if (self.verified_parameter("tools")
+            || self.schema_transport_evidence_allows("tools", &strict_features, policy);
+        if (parameter_allows("tools")
             || (probe_native && self.adapter_parameters.contains("tools")))
             && native_choice_ok
             && native_parallel_ok
@@ -537,13 +591,15 @@ impl EndpointCapabilities {
             return Some(ToolTransport::Native);
         }
         if request.requirements.response_schema.is_none()
-            && self.verified_parameter("structured_outputs")
-            && self.constraint_enforcement("structured_outputs")
-                == Some(ConstraintEnforcement::Enforced)
             && request
-                .structured_tool_response_schema()
+                .lowered_structured_tool_response_schema()
                 .is_some_and(|(_, features)| {
-                    self.verified_schema_feature_set("structured_outputs", &features)
+                    self.supports_parameter("structured_outputs")
+                        && self.schema_transport_evidence_allows(
+                            "structured_outputs",
+                            &features,
+                            policy,
+                        )
                 })
         {
             return Some(ToolTransport::StructuredOutput);
@@ -672,6 +728,9 @@ pub struct RequestRequirements {
     /// Require positive conformance evidence for the requested reasoning effort.
     #[serde(default)]
     pub require_verified_reasoning: bool,
+    /// Whether strict structured output must be pre-proven or may learn from useful traffic.
+    #[serde(default)]
+    pub schema_evidence: SchemaEvidencePolicy,
     pub required_parameters: BTreeSet<String>,
     pub minimum_uptime_30m: Option<f64>,
 }
@@ -692,6 +751,7 @@ impl Default for RequestRequirements {
             reasoning: ReasoningEffort::None,
             reasoning_max_tokens: None,
             require_verified_reasoning: false,
+            schema_evidence: SchemaEvidencePolicy::Proven,
             required_parameters: BTreeSet::new(),
             minimum_uptime_30m: Some(95.0),
         }
@@ -832,6 +892,22 @@ impl InferenceRequest {
             features.insert(SchemaFeature::ToolTurnMultiple);
         }
         Some((schema, features))
+    }
+
+    /// Canonicalize a generated tool-turn envelope without introducing new feature classes.
+    #[must_use]
+    pub fn lowered_structured_tool_response_schema(
+        &self,
+    ) -> Option<(Value, BTreeSet<SchemaFeature>)> {
+        let (schema, _) = self.structured_tool_response_schema()?;
+        let lowered = crate::lower_json_schema(&schema);
+        let mut features = schema_feature_requirements(&lowered);
+        features.insert(SchemaFeature::NestedObject);
+        features.insert(SchemaFeature::ToolTurnEnvelope);
+        if self.parallel_tool_calls == Some(true) {
+            features.insert(SchemaFeature::ToolTurnMultiple);
+        }
+        Some((lowered, features))
     }
 }
 
@@ -1122,16 +1198,21 @@ fn schema_has_ref(value: &Value, target: &str) -> bool {
 /// object-root response schemas directly; wrap every other response shape under `value` and unwrap
 /// it after execution so the application-visible response keeps its original schema semantics.
 pub(crate) fn forced_tool_parameter_schema(schema: &Value) -> (Value, bool) {
-    if schema
+    let lowered = crate::lower_json_schema(schema);
+    forced_tool_parameter_schema_from_lowered(&lowered)
+}
+
+pub(crate) fn forced_tool_parameter_schema_from_lowered(lowered: &Value) -> (Value, bool) {
+    if lowered
         .as_object()
         .is_some_and(|map| map.get("type").and_then(Value::as_str) == Some("object"))
     {
-        return (schema.clone(), false);
+        return (lowered.clone(), false);
     }
     (
         serde_json::json!({
             "type": "object",
-            "properties": {"value": schema},
+            "properties": {"value": lowered},
             "required": ["value"],
             "additionalProperties": false
         }),
@@ -1228,6 +1309,9 @@ pub struct InferenceResponse {
     /// Provider-independent normalized function calls. Provider-specific raw payload is retained.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    /// Narrow local coercions applied after provider output and before returning the response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_repairs: Vec<crate::OutputRepair>,
     /// Recognized, normalized quota measurements from response headers. No raw headers are kept.
     #[serde(default)]
     pub quota_observations: Vec<crate::QuotaObservation>,

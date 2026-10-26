@@ -29,6 +29,7 @@ pub(crate) fn supports_request(
     endpoint: &Endpoint,
     request: &InferenceRequest,
     prompt_tokens: u64,
+    lowered_strict_schema: Option<&serde_json::Value>,
 ) -> bool {
     if endpoint.status < 0
         || !request
@@ -73,13 +74,17 @@ pub(crate) fn supports_request(
     {
         return false;
     }
-    if !supports_behavioral_request(endpoint, request) {
+    if !supports_behavioral_request(endpoint, request, lowered_strict_schema) {
         return false;
     }
     supports_reasoning_request(endpoint, request)
 }
 
-fn supports_behavioral_request(endpoint: &Endpoint, request: &InferenceRequest) -> bool {
+fn supports_behavioral_request(
+    endpoint: &Endpoint,
+    request: &InferenceRequest,
+    lowered_strict_schema: Option<&serde_json::Value>,
+) -> bool {
     if !request
         .requirements
         .required_parameters
@@ -120,15 +125,37 @@ fn supports_behavioral_request(endpoint: &Endpoint, request: &InferenceRequest) 
     match request.requirements.response_schema.as_ref() {
         None => {}
         Some(ResponseSchema::JsonObject) => {
-            if !endpoint.capabilities.verified_parameter("response_format") {
+            let supported = match request.requirements.schema_evidence {
+                crate::SchemaEvidencePolicy::Proven => {
+                    endpoint.capabilities.verified_parameter("response_format")
+                }
+                crate::SchemaEvidencePolicy::Learn => {
+                    endpoint.capabilities.supports_parameter("response_format")
+                        && !matches!(
+                            endpoint
+                                .capabilities
+                                .constraint_enforcement("structured_outputs"),
+                            Some(
+                                crate::ConstraintEnforcement::Ineffective
+                                    | crate::ConstraintEnforcement::HintOnly
+                            )
+                        )
+                }
+            };
+            if !supported {
                 return false;
             }
         }
-        Some(ResponseSchema::JsonSchema { schema, strict, .. }) => {
+        Some(ResponseSchema::JsonSchema { strict, .. }) => {
             if *strict {
-                let transport = endpoint
-                    .capabilities
-                    .strict_output_transport_for_schema(schema);
+                let transport = lowered_strict_schema.and_then(|lowered| {
+                    endpoint
+                        .capabilities
+                        .strict_output_transport_for_lowered_schema_with_policy(
+                            lowered,
+                            request.requirements.schema_evidence,
+                        )
+                });
                 if transport.is_none()
                     || (!request.tools.is_empty()
                         && transport == Some(StrictOutputTransport::ForcedTool))
@@ -226,6 +253,17 @@ pub(crate) fn validate_strategy(strategy: RoutingStrategy) -> Result<f64, Provid
     }
 }
 
+pub(crate) fn lowered_strict_schema(request: &InferenceRequest) -> Option<serde_json::Value> {
+    match request.requirements.response_schema.as_ref() {
+        Some(ResponseSchema::JsonSchema {
+            schema,
+            strict: true,
+            ..
+        }) => Some(crate::lower_json_schema(schema)),
+        _ => None,
+    }
+}
+
 /// Filter and rank provider endpoints for a request shape.
 ///
 /// # Errors
@@ -247,10 +285,27 @@ pub fn build_route_plan(
     }
 
     let multiplier = validate_strategy(strategy)?;
+    if let Some(ResponseSchema::JsonSchema {
+        schema,
+        strict: true,
+        ..
+    }) = request.requirements.response_schema.as_ref()
+    {
+        crate::structured_output::validate_schema_offline(schema)
+            .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
+    }
+    let lowered_strict_schema = lowered_strict_schema(request);
 
     let mut eligible: Vec<RouteCandidate> = endpoints
         .into_iter()
-        .filter(|endpoint| supports_request(endpoint, request, prompt_tokens))
+        .filter(|endpoint| {
+            supports_request(
+                endpoint,
+                request,
+                prompt_tokens,
+                lowered_strict_schema.as_ref(),
+            )
+        })
         .map(|endpoint| RouteCandidate {
             expected_cost_usd: endpoint
                 .pricing

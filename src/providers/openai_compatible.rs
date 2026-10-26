@@ -41,14 +41,17 @@ pub(crate) fn response_format(schema: &ResponseSchema) -> Value {
             name,
             schema,
             strict,
-        } => json!({
-            "type": "json_schema",
-            "json_schema": {
-                "name": name,
-                "schema": schema,
-                "strict": strict,
-            }
-        }),
+        } => {
+            let lowered = crate::lower_json_schema(schema);
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": name,
+                    "schema": lowered,
+                    "strict": strict,
+                }
+            })
+        }
     }
 }
 
@@ -288,6 +291,7 @@ pub(crate) async fn execute_chat_with_retry(
         usage_cost_usd,
         usage: TokenUsage::from_openai_compatible(&raw),
         tool_calls: Vec::new(),
+        output_repairs: Vec::new(),
         quota_observations,
         raw,
     })

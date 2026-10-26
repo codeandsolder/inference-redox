@@ -196,14 +196,17 @@ impl OpenRouter {
                 name,
                 schema,
                 strict,
-            } => json!({
-                "type": "json_schema",
-                "json_schema": {
-                    "name": name,
-                    "strict": strict,
-                    "schema": schema,
-                }
-            }),
+            } => {
+                let lowered = crate::lower_json_schema(schema);
+                json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": name,
+                        "strict": strict,
+                        "schema": lowered,
+                    }
+                })
+            }
         }
     }
 
@@ -264,7 +267,10 @@ impl OpenRouter {
                 ..
             }) => endpoint
                 .capabilities
-                .strict_output_transport_for_schema(schema),
+                .strict_output_transport_for_schema_with_policy(
+                    schema,
+                    request.requirements.schema_evidence,
+                ),
             _ => None,
         }
     }
@@ -308,12 +314,15 @@ impl OpenRouter {
             function.insert("description".to_owned(), json!(description));
         }
         function.insert("strict".to_owned(), json!(tool.strict));
-        function.insert("parameters".to_owned(), tool.parameters.clone());
+        function.insert(
+            "parameters".to_owned(),
+            crate::lower_json_schema(&tool.parameters),
+        );
         json!({"type": "function", "function": function})
     }
 
     fn tool_response_format(request: &InferenceRequest) -> Option<Value> {
-        let (schema, _) = request.structured_tool_response_schema()?;
+        let (schema, _) = request.lowered_structured_tool_response_schema()?;
         Some(json!({
             "type": "json_schema",
             "json_schema": {
@@ -767,6 +776,7 @@ impl OpenRouter {
             usage_cost_usd: raw.pointer("/usage/cost").and_then(Value::as_f64),
             usage: TokenUsage::from_openai_compatible(&raw),
             tool_calls,
+            output_repairs: Vec::new(),
             quota_observations,
             raw,
         })

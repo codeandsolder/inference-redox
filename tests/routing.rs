@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use inference_redox::{
     ConstraintEnforcement, Endpoint, EndpointCapabilities, EndpointStats, FunctionTool,
     InferenceRequest, Percentiles, Pricing, ReasoningEffort, ReasoningSupport, RequestRequirements,
-    ResponseSchema, RoutingStrategy, SchemaFeature, ToolChoice, build_route_plan,
+    ResponseSchema, RoutingStrategy, SchemaEvidencePolicy, SchemaFeature, ToolChoice,
+    build_route_plan,
 };
 use serde_json::json;
 
@@ -102,6 +103,121 @@ fn fastest_within_cost_band_wins() -> Result<(), inference_redox::ProviderError>
             .iter()
             .all(|candidate| candidate.endpoint.id != "too-expensive")
     );
+    Ok(())
+}
+
+#[test]
+fn learn_schema_policy_admits_unknown_then_rejects_observed_wire_feature()
+-> Result<(), inference_redox::ProviderError> {
+    let route = endpoint("learn-me", 0.0, 0.0, 0.1, 100.0);
+    let mut request = InferenceRequest::new("x/model", "return a or b", 8);
+    request.prompt_tokens = Some(10);
+    request.requirements.response_schema = Some(ResponseSchema::JsonSchema {
+        name: "answer".to_owned(),
+        schema: json!({"oneOf":[{"const":"a"},{"const":"b"}]}),
+        strict: true,
+    });
+
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route.clone()],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+
+    request.requirements.schema_evidence = SchemaEvidencePolicy::Learn;
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route.clone()],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
+
+    let lowered = inference_redox::lower_json_schema(
+        request
+            .requirements
+            .response_schema
+            .as_ref()
+            .and_then(|schema| match schema {
+                ResponseSchema::JsonSchema { schema, .. } => Some(schema),
+                ResponseSchema::JsonObject => None,
+            })
+            .ok_or_else(|| {
+                inference_redox::ProviderError::InvalidRequest("missing schema".to_owned())
+            })?,
+    );
+    let wire_features = inference_redox::schema_feature_requirements(&lowered);
+    assert_eq!(wire_features, BTreeSet::from([SchemaFeature::Enum]));
+
+    let mut rejected = route;
+    rejected
+        .capabilities
+        .rejected_schema_features
+        .insert("structured_outputs".to_owned(), wire_features);
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![rejected],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn learn_schema_policy_applies_to_strict_tool_parameters()
+-> Result<(), inference_redox::ProviderError> {
+    let mut route = endpoint("learn-tools", 0.0, 0.0, 0.1, 100.0);
+    route
+        .capabilities
+        .supported_parameters
+        .remove("structured_outputs");
+    route
+        .capabilities
+        .supported_parameters
+        .extend(["tools".to_owned(), "tool_choice".to_owned()]);
+    let mut request = InferenceRequest::new("x/model", "call lookup", 8);
+    request.prompt_tokens = Some(10);
+    request.tools.push(FunctionTool {
+        name: "lookup".to_owned(),
+        description: None,
+        parameters: json!({"oneOf":[{"const":"a"},{"const":"b"}]}),
+        strict: true,
+    });
+    request.tool_choice = Some(ToolChoice::Required);
+
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route.clone()],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
+
+    request.requirements.schema_evidence = SchemaEvidencePolicy::Learn;
+    let plan = build_route_plan(
+        RoutingStrategy::FastestResponseCheap(1.5),
+        &request,
+        vec![route.clone()],
+    )?;
+    assert_eq!(plan.candidates.len(), 1);
+
+    route
+        .capabilities
+        .rejected_schema_features
+        .insert("tools".to_owned(), BTreeSet::from([SchemaFeature::Enum]));
+    assert!(matches!(
+        build_route_plan(
+            RoutingStrategy::FastestResponseCheap(1.5),
+            &request,
+            vec![route],
+        ),
+        Err(inference_redox::ProviderError::NoEligibleEndpoint(_))
+    ));
     Ok(())
 }
 

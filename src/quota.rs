@@ -1122,6 +1122,7 @@ mod tests {
                 reasoning_tokens: Some(56),
             },
             tool_calls: Vec::new(),
+            output_repairs: Vec::new(),
             quota_observations: Vec::new(),
             raw: serde_json::Value::Null,
         };

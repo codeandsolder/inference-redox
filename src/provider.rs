@@ -124,7 +124,14 @@ pub trait InferenceProvider: Send + Sync {
                 candidates: vec![candidate],
             };
             match self.execute_plan(request, &candidate_plan, retry).await {
-                Ok(response) => return Ok((plan, response)),
+                Ok(response) => {
+                    match crate::structured_output::validate_inference_response(request, response) {
+                        Ok(response) => return Ok((plan, response)),
+                        Err(failure) => {
+                            last_error = Some(ProviderError::Response(failure.to_string()));
+                        }
+                    }
+                }
                 Err(error) => last_error = Some(error),
             }
         }

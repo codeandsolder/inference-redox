@@ -208,9 +208,9 @@ impl Providers {
         Ok(catalog)
     }
 
-    async fn pool(&self) -> InferencePool {
-        let profile = self.conformance.lock().await.clone();
-        let mut pool = InferencePool::new().with_conformance_profile(profile);
+    fn pool(&self) -> InferencePool {
+        let mut pool =
+            InferencePool::new().with_shared_conformance_profile(Arc::clone(&self.conformance));
         pool.register("openrouter", Arc::clone(&self.openrouter));
         if let Some(nvidia) = self.nvidia.as_ref() {
             pool.register("nvidia", Arc::clone(nvidia));
@@ -226,6 +226,11 @@ impl Providers {
             pool.register("opencode-go", Arc::clone(opencode_go));
         }
         pool
+    }
+
+    async fn persist_conformance(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let profile = self.conformance.lock().await.clone();
+        save_conformance_profile(self.conformance_cache_path.as_ref(), &profile)
     }
 
     fn provider(&self, source: &str) -> Option<Arc<dyn InferenceProvider>> {
@@ -299,6 +304,27 @@ async fn write_error(stdout: &Arc<Mutex<tokio::io::Stdout>>, id: Value, error: i
         },
     )
     .await;
+}
+
+async fn write_result_or_error<T: Serialize, E: std::fmt::Display>(
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    id: Value,
+    result: Result<T, E>,
+) {
+    match result {
+        Ok(result) => {
+            write_json(
+                stdout,
+                &WireSuccess {
+                    id,
+                    ok: true,
+                    result,
+                },
+            )
+            .await;
+        }
+        Err(error) => write_error(stdout, id, error.to_string()).await,
+    }
 }
 
 async fn run_conformance(
@@ -663,7 +689,7 @@ async fn handle_pool_operation(
             return;
         }
     };
-    let pool = providers.pool().await;
+    let pool = providers.pool();
     let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
     match op {
         Operation::RoutePool => match pool.route(&catalog, strategy, &request).await {
@@ -682,7 +708,18 @@ async fn handle_pool_operation(
         },
         Operation::InferPool => {
             let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
-            match pool.infer(&catalog, strategy, &request, retry).await {
+            let result = pool.infer(&catalog, strategy, &request, retry).await;
+            if !persist_schema_conformance_or_write_error(
+                providers,
+                stdout,
+                &id,
+                request.requirements.response_schema.is_some(),
+            )
+            .await
+            {
+                return;
+            }
+            match result {
                 Ok(result) => {
                     write_json(
                         stdout,
@@ -753,7 +790,7 @@ async fn handle_model_selection_operation(
         quota_unknown_policy: selection.quota_unknown_policy,
         now_unix: unix_time_seconds(),
     };
-    let pool = providers.pool().await;
+    let pool = providers.pool();
     let mut ledger = providers.quota.lock().await;
     match pool
         .select_with_quota(
@@ -817,7 +854,7 @@ async fn handle_selected_route_operation(
         now_unix: unix_time_seconds(),
         max_cost_usd: execution.max_cost_usd,
     };
-    let pool = providers.pool().await;
+    let pool = providers.pool();
     let mut ledger = providers.quota.lock().await;
     match op {
         Operation::ValidateSelectedQuota => match pool
@@ -845,7 +882,7 @@ async fn handle_selected_route_operation(
         },
         Operation::InferSelectedQuota => {
             let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
-            match pool
+            let result = pool
                 .infer_selected_with_quota(
                     &catalog,
                     &selected,
@@ -854,8 +891,18 @@ async fn handle_selected_route_operation(
                     &mut ledger,
                     policy,
                 )
-                .await
+                .await;
+            if !persist_schema_conformance_or_write_error(
+                providers,
+                stdout,
+                &id,
+                request_template.requirements.response_schema.is_some(),
+            )
+            .await
             {
+                return;
+            }
+            match result {
                 Ok(result) => {
                     write_json(
                         stdout,
@@ -872,6 +919,27 @@ async fn handle_selected_route_operation(
         }
         _ => {}
     }
+}
+
+async fn persist_schema_conformance_or_write_error(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    id: &Value,
+    has_schema: bool,
+) -> bool {
+    if !has_schema {
+        return true;
+    }
+    if let Err(error) = providers.persist_conformance().await {
+        write_error(
+            stdout,
+            id.clone(),
+            format!("failed to persist conformance cache: {error}"),
+        )
+        .await;
+        return false;
+    }
+    true
 }
 
 async fn handle_quota_pool_operation(
@@ -917,13 +985,13 @@ async fn handle_quota_pool_operation(
             return;
         }
     };
-    let pool = providers.pool().await;
+    let pool = providers.pool();
     let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
     let now_unix = unix_time_seconds();
     let mut ledger = providers.quota.lock().await;
     match op {
         Operation::RoutePoolQuota => {
-            match pool
+            let result = pool
                 .route_with_quota(
                     &catalog,
                     strategy,
@@ -932,21 +1000,8 @@ async fn handle_quota_pool_operation(
                     unknown_policy,
                     now_unix,
                 )
-                .await
-            {
-                Ok(result) => {
-                    write_json(
-                        stdout,
-                        &WireSuccess {
-                            id,
-                            ok: true,
-                            result,
-                        },
-                    )
-                    .await;
-                }
-                Err(error) => write_error(stdout, id, error.to_string()).await,
-            }
+                .await;
+            write_result_or_error(stdout, id, result).await;
         }
         Operation::InferPoolQuota => {
             let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
@@ -954,23 +1009,20 @@ async fn handle_quota_pool_operation(
                 unknown_policy,
                 now_unix,
             };
-            match pool
+            let result = pool
                 .infer_with_quota(&catalog, strategy, &request, retry, &mut ledger, quota)
-                .await
+                .await;
+            if !persist_schema_conformance_or_write_error(
+                providers,
+                stdout,
+                &id,
+                request.requirements.response_schema.is_some(),
+            )
+            .await
             {
-                Ok(result) => {
-                    write_json(
-                        stdout,
-                        &WireSuccess {
-                            id,
-                            ok: true,
-                            result,
-                        },
-                    )
-                    .await;
-                }
-                Err(error) => write_error(stdout, id, error.to_string()).await,
+                return;
             }
+            write_result_or_error(stdout, id, result).await;
         }
         _ => {}
     }

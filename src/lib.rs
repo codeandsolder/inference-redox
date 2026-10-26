@@ -12,6 +12,7 @@ mod quota;
 mod quota_headers;
 mod router;
 mod selection;
+mod structured_output;
 mod suitability;
 
 pub mod providers;
@@ -38,8 +39,9 @@ pub use model::{
     AgenticPolicy, ConstraintEnforcement, EffectivePricing, Endpoint, EndpointCapabilities,
     EndpointStats, FunctionTool, InferenceRequest, InferenceResponse, Percentiles, Pricing,
     PricingOverride, ReasoningEffort, ReasoningSupport, RequestRequirements, ResponseSchema,
-    RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy, SchemaFeature, StrictOutputTransport,
-    TokenUsage, ToolCall, ToolChoice, ToolTransport, WorkloadPolicy, schema_feature_requirements,
+    RetryPolicy, RouteCandidate, RoutePlan, RoutingStrategy, SchemaEvidencePolicy, SchemaFeature,
+    StrictOutputTransport, TokenUsage, ToolCall, ToolChoice, ToolTransport, WorkloadPolicy,
+    schema_feature_requirements,
 };
 pub use pool::{
     InferencePool, PooledInferenceResponse, QuotaExecutionContext, QuotaInferenceError,
@@ -62,4 +64,9 @@ pub use selection::{
 pub use suitability::{
     BenchmarkAggregation, BenchmarkKind, BenchmarkRequirement, ModelSuitabilityReport,
     ModelSuitabilityRequirements, SuitabilityCheck, SuitabilityStatus,
+};
+
+pub use structured_output::{
+    OutputRepair, OutputRepairKind, SchemaViolation, StructuredOutputFailure, lower_json_schema,
+    validate_and_repair_json_text, validate_and_repair_value,
 };
