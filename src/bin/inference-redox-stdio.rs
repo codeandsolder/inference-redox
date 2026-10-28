@@ -74,6 +74,7 @@ impl WireRetryPolicy {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireConformanceRequest {
     model: String,
     source: String,
@@ -102,6 +103,7 @@ struct WireSelectedRouteExecutionPolicy {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireRequest {
     id: Value,
     op: Operation,
