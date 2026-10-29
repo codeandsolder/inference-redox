@@ -2793,6 +2793,19 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_in_progress_batch_state() -> Result<(), ProviderError> {
+        let batch = OpenRouter::normalize_batch(json!({
+            "id": "batch-2",
+            "status": "in_progress",
+            "results": null
+        }))?;
+        assert_eq!(batch.status, BatchStatus::InProgress);
+        assert!(!batch.is_terminal());
+        assert!(!batch.is_success());
+        Ok(())
+    }
+
+    #[test]
     fn free_inkling_routes_require_agentic_harnesses() {
         for model in [
             "thinkingmachines/inkling:free",

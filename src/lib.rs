@@ -17,7 +17,7 @@ mod suitability;
 
 pub mod providers;
 
-pub use batch::{BatchInferenceItem, BatchJob};
+pub use batch::{BatchInferenceItem, BatchJob, BatchStatus};
 pub use benchmarks::{
     BenchmarkCatalog, BenchmarkObservation, BenchmarkSnapshot, BenchmarkSnapshotMeta,
     BenchmarkSource, BenchmarkTaskType, BenchmarkUnit,
