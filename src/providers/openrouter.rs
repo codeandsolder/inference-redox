@@ -1,3 +1,4 @@
+use crate::batch::BatchStatus;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -554,11 +555,11 @@ impl OpenRouter {
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::Response("batch response omitted id".to_owned()))?
             .to_owned();
-        let status = raw
-            .get("status")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProviderError::Response("batch response omitted status".to_owned()))?
-            .to_owned();
+        let status: BatchStatus =
+            serde_json::from_value(raw.get("status").cloned().ok_or_else(|| {
+                ProviderError::Response("batch response omitted status".to_owned())
+            })?)
+            .map_err(|error| ProviderError::Response(format!("invalid batch status: {error}")))?;
         let results = raw.get("results").and_then(Value::as_array).cloned();
         Ok(BatchJob {
             id,
@@ -2788,6 +2789,19 @@ mod tests {
         assert!(batch.is_terminal());
         assert!(batch.is_success());
         assert_eq!(batch.results.as_ref().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_in_progress_batch_state() -> Result<(), ProviderError> {
+        let batch = OpenRouter::normalize_batch(json!({
+            "id": "batch-2",
+            "status": "in_progress",
+            "results": null
+        }))?;
+        assert_eq!(batch.status, BatchStatus::InProgress);
+        assert!(!batch.is_terminal());
+        assert!(!batch.is_success());
         Ok(())
     }
 
