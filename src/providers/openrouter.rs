@@ -1,3 +1,4 @@
+use crate::batch::BatchStatus;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -554,11 +555,11 @@ impl OpenRouter {
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::Response("batch response omitted id".to_owned()))?
             .to_owned();
-        let status = raw
-            .get("status")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProviderError::Response("batch response omitted status".to_owned()))?
-            .to_owned();
+        let status: BatchStatus =
+            serde_json::from_value(raw.get("status").cloned().ok_or_else(|| {
+                ProviderError::Response("batch response omitted status".to_owned())
+            })?)
+            .map_err(|error| ProviderError::Response(format!("invalid batch status: {error}")))?;
         let results = raw.get("results").and_then(Value::as_array).cloned();
         Ok(BatchJob {
             id,
