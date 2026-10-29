@@ -1501,7 +1501,7 @@ fn schema_feature_probe_identity(test_id: &str) -> Option<(SchemaFeatureTranspor
         let feature = rest.strip_prefix("tools-")?;
         (SchemaFeatureTransport::Tools, feature)
     };
-    Some((transport, SchemaFeature::from_str_name(feature_name)?))
+    Some((transport, feature_name.parse::<SchemaFeature>().ok()?))
 }
 
 fn apply_observations<'a>(

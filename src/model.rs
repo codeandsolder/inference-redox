@@ -336,18 +336,33 @@ impl SchemaFeature {
             Self::UnknownKeyword => "unknown_keyword",
         }
     }
+}
 
-    #[must_use]
-    pub fn from_str_name(value: &str) -> Option<Self> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseSchemaFeatureError;
+
+impl std::fmt::Display for ParseSchemaFeatureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unknown JSON-Schema feature")
+    }
+}
+
+impl std::error::Error for ParseSchemaFeatureError {}
+
+impl std::str::FromStr for SchemaFeature {
+    type Err = ParseSchemaFeatureError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value == Self::ToolTurnEnvelope.as_str() {
-            return Some(Self::ToolTurnEnvelope);
+            return Ok(Self::ToolTurnEnvelope);
         }
         if value == Self::ToolTurnMultiple.as_str() {
-            return Some(Self::ToolTurnMultiple);
+            return Ok(Self::ToolTurnMultiple);
         }
         Self::ALL
             .into_iter()
             .find(|feature| feature.as_str() == value)
+            .ok_or(ParseSchemaFeatureError)
     }
 }
 
