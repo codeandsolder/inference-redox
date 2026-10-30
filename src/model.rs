@@ -6,7 +6,10 @@ use serde_json::Value;
 
 use crate::ModelRouteClass;
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "token counts are intentionally projected into f64 for scoring arithmetic"
+)]
 fn tokens_as_f64(tokens: u64) -> f64 {
     tokens as f64
 }
