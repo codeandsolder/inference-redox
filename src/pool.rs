@@ -51,7 +51,7 @@ pub struct QuotaPooledInferenceResponse {
     pub response: InferenceResponse,
 }
 
-pub(crate) struct QuotaEndpointDiscovery {
+pub struct QuotaEndpointDiscovery {
     pub endpoints: Vec<crate::Endpoint>,
     pub reports: Vec<QuotaAdmissionReport>,
 }
@@ -102,7 +102,7 @@ pub enum QuotaRoutingError {
     #[error("no quota-admissible endpoint for {model}")]
     NoQuotaAdmissible {
         model: String,
-        reports: Box<Vec<QuotaAdmissionReport>>,
+        reports: Vec<QuotaAdmissionReport>,
     },
 }
 
@@ -406,7 +406,7 @@ impl InferencePool {
         if discovery.endpoints.is_empty() {
             return Err(QuotaRoutingError::NoQuotaAdmissible {
                 model: request.model.clone(),
-                reports: Box::new(discovery.reports),
+                reports: discovery.reports,
             });
         }
         let plan = build_route_plan(strategy, request, discovery.endpoints)?;
@@ -1294,6 +1294,7 @@ mod tests {
         assert_eq!(result.selected.endpoint.id, "openrouter");
         let calls = calls.lock().map_err(|_| "poisoned test mutex")?;
         assert!(calls.iter().any(|call| call == "execute:vendor/model"));
+        drop(calls);
         Ok(())
     }
 
@@ -1447,6 +1448,7 @@ mod tests {
             .lock()
             .map_err(|_| ProviderError::Catalog("poisoned test mutex".to_owned()))?;
         assert!(calls.iter().any(|call| call == "execute:vendor/model"));
+        drop(calls);
         Ok(())
     }
 
@@ -2136,9 +2138,10 @@ mod tests {
         );
         let failing = failing_calls.lock();
         assert!(failing.is_ok());
-        if let Ok(calls) = failing {
+        if let Ok(calls) = failing.as_ref() {
             assert!(calls.iter().any(|call| call.starts_with("execute:")));
         }
+        drop(failing);
         let healthy = healthy_calls.lock();
         assert!(healthy.is_ok());
         if let Ok(calls) = healthy {

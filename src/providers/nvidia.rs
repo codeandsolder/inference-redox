@@ -55,7 +55,7 @@ impl NvidiaNim {
     }
 
     #[must_use]
-    pub fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
+    pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self
     }
@@ -120,6 +120,7 @@ impl NvidiaNim {
                     fetched_at: Instant::now(),
                     models: models.clone(),
                 });
+                drop(cache);
                 Ok(models)
             }
             Err(error) => stale.ok_or(error),

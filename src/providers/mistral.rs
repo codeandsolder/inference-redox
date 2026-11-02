@@ -105,7 +105,7 @@ impl MistralCloud {
     }
 
     #[must_use]
-    pub fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
+    pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self
     }
@@ -148,6 +148,7 @@ impl MistralCloud {
                     fetched_at: Instant::now(),
                     models: models.clone(),
                 });
+                drop(cache);
                 Ok(models)
             }
             Err(_) if self.surface == MistralSurface::Codestral => {
@@ -427,7 +428,7 @@ impl MistralCloud {
     ) {
         let pool = self.quota_pool.as_deref().unwrap_or("default");
         let scope_model = if self.surface == MistralSurface::Studio {
-            format!("{}/{}/{}", self.surface.source(), pool, route.model)
+            format!("{}/{pool}/{}", self.surface.source(), route.model)
         } else {
             format!("{}/{pool}", self.surface.source())
         };

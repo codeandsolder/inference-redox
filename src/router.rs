@@ -25,7 +25,7 @@ pub fn request_prompt_tokens(request: &InferenceRequest) -> u64 {
     })
 }
 
-pub(crate) fn supports_request(
+pub fn supports_request(
     endpoint: &Endpoint,
     request: &InferenceRequest,
     prompt_tokens: u64,
@@ -239,11 +239,11 @@ fn optional_f64_cmp(left: Option<f64>, right: Option<f64>) -> Ordering {
     clippy::cast_precision_loss,
     reason = "token counts are intentionally projected into f64 for scoring arithmetic"
 )]
-fn tokens_as_f64(tokens: u64) -> f64 {
+const fn tokens_as_f64(tokens: u64) -> f64 {
     tokens as f64
 }
 
-pub(crate) fn validate_strategy(strategy: RoutingStrategy) -> Result<f64, ProviderError> {
+pub fn validate_strategy(strategy: RoutingStrategy) -> Result<f64, ProviderError> {
     match strategy {
         RoutingStrategy::FastestResponseCheap(multiplier)
             if multiplier.is_finite() && multiplier >= 1.0 =>
@@ -256,7 +256,7 @@ pub(crate) fn validate_strategy(strategy: RoutingStrategy) -> Result<f64, Provid
     }
 }
 
-pub(crate) fn lowered_strict_schema(request: &InferenceRequest) -> Option<serde_json::Value> {
+pub fn lowered_strict_schema(request: &InferenceRequest) -> Option<serde_json::Value> {
     match request.requirements.response_schema.as_ref() {
         Some(ResponseSchema::JsonSchema {
             schema,

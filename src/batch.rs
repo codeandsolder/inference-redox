@@ -24,7 +24,7 @@ pub struct BatchInferenceItem {
 }
 
 /// Normalized `OpenRouter` batch state. `raw` retains fields we do not normalize yet.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchJob {
     pub id: String,
     pub status: BatchStatus,
@@ -34,7 +34,7 @@ pub struct BatchJob {
 
 impl BatchJob {
     #[must_use]
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         matches!(
             self.status,
             BatchStatus::Completed

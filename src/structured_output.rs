@@ -127,7 +127,7 @@ fn contains_model_guidance(value: &Value) -> bool {
 }
 
 /// Verify that a strict caller schema can be checked locally without network access.
-pub(crate) fn validate_schema_offline(schema: &Value) -> Result<(), StructuredOutputFailure> {
+pub fn validate_schema_offline(schema: &Value) -> Result<(), StructuredOutputFailure> {
     jsonschema::options()
         .offline()
         .build(schema)
@@ -274,7 +274,7 @@ fn validation_failure(validator: &jsonschema::Validator, value: &Value) -> Struc
     }
 }
 
-fn display_path(path: &str) -> &str {
+const fn display_path(path: &str) -> &str {
     if path.is_empty() { "/" } else { path }
 }
 
@@ -497,7 +497,7 @@ fn replace_at_pointer(value: &mut Value, path: &str, replacement: Value) -> bool
 }
 
 /// Enforce the application-visible response contract locally after provider execution.
-pub(crate) fn validate_inference_response(
+pub fn validate_inference_response(
     request: &crate::InferenceRequest,
     mut response: crate::InferenceResponse,
 ) -> Result<crate::InferenceResponse, StructuredOutputFailure> {
@@ -626,7 +626,7 @@ fn prefix_pointer(prefix: &str, path: &str) -> String {
 
 /// Map a validator keyword failure onto the existing route-level schema capability model.
 #[must_use]
-pub(crate) fn schema_feature_for_validation_keyword(keyword: &str) -> Option<SchemaFeature> {
+pub fn schema_feature_for_validation_keyword(keyword: &str) -> Option<SchemaFeature> {
     match keyword {
         "oneOf" => Some(SchemaFeature::OneOf),
         "anyOf" => Some(SchemaFeature::AnyOf),

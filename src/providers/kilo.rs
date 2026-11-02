@@ -124,6 +124,7 @@ impl KiloGateway {
                     fetched_at: Instant::now(),
                     models: models.clone(),
                 });
+                drop(cache);
                 Ok(models)
             }
             Err(error) => stale.ok_or(error),

@@ -44,7 +44,7 @@ pub enum ProviderError {
 
 impl ProviderError {
     #[must_use]
-    pub fn execution_phase(&self) -> Option<ExecutionFailurePhase> {
+    pub const fn execution_phase(&self) -> Option<ExecutionFailurePhase> {
         match self {
             Self::Execution { phase, .. } => Some(*phase),
             _ => None,

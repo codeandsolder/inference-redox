@@ -251,7 +251,7 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
 -> Result<(), inference_redox::ProviderError> {
     let mut capable = endpoint("capable", 2e-6, 2e-6, 0.2, 100.0);
     capable.capabilities.reasoning =
-        ReasoningSupport::Exact([ReasoningEffort::High].into_iter().collect());
+        ReasoningSupport::Exact(std::iter::once(ReasoningEffort::High).collect());
     capable.capabilities.constraint_enforcement.insert(
         "structured_outputs".to_owned(),
         ConstraintEnforcement::Enforced,
@@ -263,7 +263,7 @@ fn strict_schema_and_reasoning_are_filtered_before_price()
         .remove("structured_outputs");
     let mut cheap_but_wrong_reasoning = endpoint("wrong-reasoning", 0.1e-6, 0.1e-6, 0.1, 100.0);
     cheap_but_wrong_reasoning.capabilities.reasoning =
-        ReasoningSupport::Exact([ReasoningEffort::Low].into_iter().collect());
+        ReasoningSupport::Exact(std::iter::once(ReasoningEffort::Low).collect());
     cheap_but_wrong_reasoning
         .capabilities
         .constraint_enforcement
