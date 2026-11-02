@@ -28,6 +28,10 @@ pub struct ModelReasoning {
     pub default_effort: Option<String>,
 }
 
+#[expect(
+    clippy::struct_field_names,
+    reason = "the *_index suffix is part of the upstream benchmark metric names"
+)]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ArtificialAnalysisBenchmarks {
     pub intelligence_index: Option<f64>,

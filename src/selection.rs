@@ -152,7 +152,7 @@ fn suitability_admitted(status: SuitabilityStatus, policy: SuitabilityUnknownPol
     }
 }
 
-fn suitability_rank(status: SuitabilityStatus) -> u8 {
+const fn suitability_rank(status: SuitabilityStatus) -> u8 {
     match status {
         SuitabilityStatus::Suitable => 0,
         SuitabilityStatus::Unknown => 1,

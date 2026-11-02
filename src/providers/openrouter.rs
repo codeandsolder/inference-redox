@@ -84,7 +84,7 @@ enum OpenRouterServiceTier {
 }
 
 impl OpenRouterServiceTier {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Flex => "flex",
             Self::Priority => "priority",
@@ -130,13 +130,13 @@ impl OpenRouter {
     }
 
     #[must_use]
-    pub fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
+    pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self
     }
 
     #[must_use]
-    pub fn with_benchmark_ttl(mut self, ttl: Duration) -> Self {
+    pub const fn with_benchmark_ttl(mut self, ttl: Duration) -> Self {
         self.benchmark_ttl = ttl;
         self
     }
@@ -752,12 +752,7 @@ impl OpenRouter {
                 &quota_observations,
             )?;
         }
-        let mut tool_calls = if tool_transport == Some(ToolTransport::Native) {
-            Self::response_tool_calls(&raw)
-        } else {
-            Vec::new()
-        };
-        if translated_tool_response {
+        let tool_calls = if translated_tool_response {
             let (translated_content, translated_calls) = Self::parse_structured_tool_turn(
                 request,
                 &content,
@@ -765,8 +760,12 @@ impl OpenRouter {
                 &quota_observations,
             )?;
             content = translated_content;
-            tool_calls = translated_calls;
-        }
+            translated_calls
+        } else if tool_transport == Some(ToolTransport::Native) {
+            Self::response_tool_calls(&raw)
+        } else {
+            Vec::new()
+        };
         Ok(InferenceResponse {
             content,
             model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
@@ -833,11 +832,10 @@ impl OpenRouter {
         Err(failure(format!(
             "OpenRouter structured-output tool fallback returned empty content \
              (finish_reason={finish_reason}, content_kind={content_kind}, \
-             output_tokens={:?}, reasoning_tokens={:?}, unexpected_tool_calls={}, names=[{}])",
+             output_tokens={:?}, reasoning_tokens={:?}, unexpected_tool_calls={}, names=[{call_names}])",
             usage.output_tokens,
             usage.reasoning_tokens,
-            unexpected_calls.len(),
-            call_names
+            unexpected_calls.len()
         )))
     }
 
@@ -1089,6 +1087,7 @@ impl OpenRouter {
                     fetched_at: Instant::now(),
                     catalog: catalog.clone(),
                 });
+                drop(cache);
                 Ok(catalog)
             }
             Err(error) => stale.ok_or(error),
@@ -1156,6 +1155,7 @@ impl OpenRouter {
                         snapshot: snapshot.clone(),
                     },
                 );
+                drop(cache);
                 Ok(snapshot)
             }
             Err(error) => {
@@ -1831,13 +1831,14 @@ impl OpenRouterEndpoint {
 #[async_trait]
 impl InferenceProvider for OpenRouter {
     async fn endpoints(&self, model: &str) -> Result<Vec<Endpoint>, ProviderError> {
-        let mut cache = self.catalog_cache.lock().await;
+        let cache = self.catalog_cache.lock().await;
         if let Some(cached) = cache.get(model)
             && cached.fetched_at.elapsed() <= self.catalog_ttl
         {
             return Ok(cached.endpoints.clone());
         }
         let stale = cache.get(model).map(|cached| cached.endpoints.clone());
+        drop(cache);
         let url = self.model_endpoint_url(model)?;
         let fetched = async {
             let response = self
@@ -1866,6 +1867,7 @@ impl InferenceProvider for OpenRouter {
         .await;
         match fetched {
             Ok(endpoints) => {
+                let mut cache = self.catalog_cache.lock().await;
                 cache.insert(
                     model.to_owned(),
                     CachedEndpoints {
@@ -1873,6 +1875,7 @@ impl InferenceProvider for OpenRouter {
                         endpoints: endpoints.clone(),
                     },
                 );
+                drop(cache);
                 Ok(endpoints)
             }
             Err(error) => stale.ok_or(error),

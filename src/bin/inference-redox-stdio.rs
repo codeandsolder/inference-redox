@@ -325,7 +325,7 @@ async fn suitability_reports(
     Ok(catalog.suitability_reports_with_benchmarks(requirements, &benchmarks))
 }
 
-async fn write_json<T: Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
+async fn write_json<T: Serialize + Sync>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
     let Ok(mut bytes) = serde_json::to_vec(value) else {
         return;
     };
@@ -333,6 +333,7 @@ async fn write_json<T: Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value:
     let mut output = stdout.lock().await;
     let _ = output.write_all(&bytes).await;
     let _ = output.flush().await;
+    drop(output);
 }
 
 async fn write_error(stdout: &Arc<Mutex<tokio::io::Stdout>>, id: Value, error: impl Into<String>) {
@@ -347,7 +348,7 @@ async fn write_error(stdout: &Arc<Mutex<tokio::io::Stdout>>, id: Value, error: i
     .await;
 }
 
-async fn write_result_or_error<T: Serialize, E: std::fmt::Display>(
+async fn write_result_or_error<T: Serialize + Sync, E: std::fmt::Display>(
     stdout: &Arc<Mutex<tokio::io::Stdout>>,
     id: Value,
     result: Result<T, E>,
@@ -896,35 +897,26 @@ async fn handle_selected_route_operation(
         max_cost_usd: execution.max_cost_usd,
     };
     let pool = providers.pool();
-    let mut ledger = providers.quota.lock().await;
     match op {
-        Operation::ValidateSelectedQuota => match pool
-            .revalidate_selected_with_quota(
-                &catalog,
-                &selected,
-                &request_template,
-                &mut ledger,
-                policy,
-            )
-            .await
-        {
-            Ok(result) => {
-                write_json(
-                    stdout,
-                    &WireSuccess {
-                        id,
-                        ok: true,
-                        result,
-                    },
+        Operation::ValidateSelectedQuota => {
+            let result = {
+                let mut ledger = providers.quota.lock().await;
+                pool.revalidate_selected_with_quota(
+                    &catalog,
+                    &selected,
+                    &request_template,
+                    &mut ledger,
+                    policy,
                 )
-                .await;
-            }
-            Err(error) => write_error(stdout, id, error.to_string()).await,
-        },
+                .await
+            };
+            write_result_or_error(stdout, id, result).await;
+        }
         Operation::InferSelectedQuota => {
             let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
-            let result = pool
-                .infer_selected_with_quota(
+            let result = {
+                let mut ledger = providers.quota.lock().await;
+                pool.infer_selected_with_quota(
                     &catalog,
                     &selected,
                     &request_template,
@@ -932,7 +924,8 @@ async fn handle_selected_route_operation(
                     &mut ledger,
                     policy,
                 )
-                .await;
+                .await
+            };
             if !persist_schema_conformance_or_write_error(
                 providers,
                 stdout,
@@ -943,20 +936,7 @@ async fn handle_selected_route_operation(
             {
                 return;
             }
-            match result {
-                Ok(result) => {
-                    write_json(
-                        stdout,
-                        &WireSuccess {
-                            id,
-                            ok: true,
-                            result,
-                        },
-                    )
-                    .await;
-                }
-                Err(error) => write_error(stdout, id, error.to_string()).await,
-            }
+            write_result_or_error(stdout, id, result).await;
         }
         _ => {}
     }
@@ -1029,11 +1009,11 @@ async fn handle_quota_pool_operation(
     let pool = providers.pool();
     let strategy = RoutingStrategy::FastestResponseCheap(multiplier);
     let now_unix = unix_time_seconds();
-    let mut ledger = providers.quota.lock().await;
     match op {
         Operation::RoutePoolQuota => {
-            let result = pool
-                .route_with_quota(
+            let result = {
+                let mut ledger = providers.quota.lock().await;
+                pool.route_with_quota(
                     &catalog,
                     strategy,
                     &request,
@@ -1041,7 +1021,8 @@ async fn handle_quota_pool_operation(
                     unknown_policy,
                     now_unix,
                 )
-                .await;
+                .await
+            };
             write_result_or_error(stdout, id, result).await;
         }
         Operation::InferPoolQuota => {
@@ -1050,9 +1031,11 @@ async fn handle_quota_pool_operation(
                 unknown_policy,
                 now_unix,
             };
-            let result = pool
-                .infer_with_quota(&catalog, strategy, &request, retry, &mut ledger, quota)
-                .await;
+            let result = {
+                let mut ledger = providers.quota.lock().await;
+                pool.infer_with_quota(&catalog, strategy, &request, retry, &mut ledger, quota)
+                    .await
+            };
             if !persist_schema_conformance_or_write_error(
                 providers,
                 stdout,
@@ -1074,10 +1057,12 @@ async fn handle_quota_state_operation(
     stdout: &Arc<Mutex<tokio::io::Stdout>>,
     id: Value,
 ) {
-    let ledger = providers.quota.lock().await;
-    let result = WireQuotaState {
-        graph: ledger.graph().snapshot(),
-        observation_bindings: ledger.observation_map().snapshot(),
+    let result = {
+        let ledger = providers.quota.lock().await;
+        WireQuotaState {
+            graph: ledger.graph().snapshot(),
+            observation_bindings: ledger.observation_map().snapshot(),
+        }
     };
     write_json(
         stdout,

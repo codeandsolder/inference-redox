@@ -1,20 +1,21 @@
 name: CI
+
 on:
   push:
   pull_request:
+
 permissions:
   contents: read
+
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.1
-          components: rustfmt,clippy
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+  rust-1-99-shared-sccache:
+    name: Rust 1.99.1 shared sccache
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9be344b41c4c7e53f451d7ab1f66d7d9e7a9a6f4 # main
+    with:
+      rust-toolchain: "1.99.1"
+      rust-components: "clippy rustfmt"
+      rustflags: "-C target-cpu=x86-64-v2"
+      command: >-
+        cargo +1.99.1 fmt --all -- --check &&
+        CARGO_BUILD_WARNINGS=deny cargo +1.99.1 clippy --workspace --all-targets --all-features -- -D warnings -A unfulfilled-lint-expectations &&
+        cargo +1.99.1 test --workspace --all-features

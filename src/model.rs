@@ -6,8 +6,11 @@ use serde_json::Value;
 
 use crate::ModelRouteClass;
 
-#[allow(clippy::cast_precision_loss)]
-fn tokens_as_f64(tokens: u64) -> f64 {
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "token counts are intentionally projected into f64 for scoring arithmetic"
+)]
+const fn tokens_as_f64(tokens: u64) -> f64 {
     tokens as f64
 }
 
@@ -26,7 +29,7 @@ impl Percentiles {
     #[must_use]
     pub fn p75_or_interpolate(self) -> Option<f64> {
         self.p75.or_else(|| match (self.p50, self.p90) {
-            (Some(p50), Some(p90)) => Some(p50 + (p90 - p50) * 0.625),
+            (Some(p50), Some(p90)) => Some(f64::mul_add(p90 - p50, 0.625, p50)),
             (Some(p50), None) => Some(p50),
             (None, Some(p90)) => Some(p90),
             (None, None) => self.p99.or(self.p95),
@@ -37,7 +40,7 @@ impl Percentiles {
     #[must_use]
     pub fn p95_or_interpolate(self) -> Option<f64> {
         self.p95.or_else(|| match (self.p90, self.p99) {
-            (Some(p90), Some(p99)) => Some(p90 + (p99 - p90) * (5.0 / 9.0)),
+            (Some(p90), Some(p99)) => Some(f64::mul_add(p99 - p90, 5.0 / 9.0, p90)),
             (Some(p90), None) => Some(p90),
             (None, Some(p99)) => Some(p99),
             (None, None) => self.p75.or(self.p50),
@@ -46,6 +49,10 @@ impl Percentiles {
 }
 
 /// Effective token rates after request-shape pricing overrides are applied.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the *_per_token suffix carries the pricing unit in the public model"
+)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct EffectivePricing {
     pub prompt_per_token: f64,
@@ -112,9 +119,11 @@ impl Pricing {
     #[must_use]
     pub fn expected_cost(&self, prompt_tokens: u64, output_tokens: u64) -> f64 {
         let effective = self.effective(prompt_tokens);
-        let token_cost = effective.prompt_per_token * tokens_as_f64(prompt_tokens)
-            + effective.completion_per_token * tokens_as_f64(output_tokens);
-        self.request + token_cost * (1.0 - self.discount.clamp(0.0, 1.0))
+        let token_cost = effective.completion_per_token.mul_add(
+            tokens_as_f64(output_tokens),
+            effective.prompt_per_token * tokens_as_f64(prompt_tokens),
+        );
+        token_cost.mul_add(1.0 - self.discount.clamp(0.0, 1.0), self.request)
     }
 }
 
@@ -133,7 +142,7 @@ pub enum ReasoningEffort {
 
 impl ReasoningEffort {
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Minimal => "minimal",
@@ -366,10 +375,10 @@ impl std::str::FromStr for SchemaFeature {
     }
 }
 
-pub(crate) const STRUCTURED_TOOL_TRANSPORT_INSTRUCTION: &str = "Represent all tool calls only through the structured response contract using text_response and tool_calls; do not use any native tool-calling channel.";
+pub const STRUCTURED_TOOL_TRANSPORT_INSTRUCTION: &str = "Represent all tool calls only through the structured response contract using text_response and tool_calls; do not use any native tool-calling channel.";
 
 /// Provider-independent function tool definition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionTool {
     pub name: String,
     #[serde(default)]
@@ -380,7 +389,7 @@ pub struct FunctionTool {
 }
 
 /// One normalized function call produced by a model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(default)]
     pub id: Option<String>,
@@ -399,7 +408,7 @@ pub enum ToolChoice {
 }
 
 /// Requested output schema mode.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResponseSchema {
     JsonObject,
     JsonSchema {
@@ -927,7 +936,9 @@ impl InferenceRequest {
 }
 
 /// Conservatively collect non-baseline JSON-Schema features used by an application/generated
-/// schema. Basic object/type/required/const/additionalProperties(bool) behavior is established by
+/// schema.
+///
+/// Basic object/type/required/const/additionalProperties(bool) behavior is established by
 /// the base enforcement probe. Any unrecognized validation keyword inserts `UnknownKeyword`, which
 /// can never be verified and therefore makes cross-transport translation fail closed.
 #[must_use]
@@ -1212,12 +1223,12 @@ fn schema_has_ref(value: &Value, target: &str) -> bool {
 /// Function-tool parameters must be rooted at an object on the normalized tool surfaces. Preserve
 /// object-root response schemas directly; wrap every other response shape under `value` and unwrap
 /// it after execution so the application-visible response keeps its original schema semantics.
-pub(crate) fn forced_tool_parameter_schema(schema: &Value) -> (Value, bool) {
+pub fn forced_tool_parameter_schema(schema: &Value) -> (Value, bool) {
     let lowered = crate::lower_json_schema(schema);
     forced_tool_parameter_schema_from_lowered(&lowered)
 }
 
-pub(crate) fn forced_tool_parameter_schema_from_lowered(lowered: &Value) -> (Value, bool) {
+pub fn forced_tool_parameter_schema_from_lowered(lowered: &Value) -> (Value, bool) {
     if lowered
         .as_object()
         .is_some_and(|map| map.get("type").and_then(Value::as_str) == Some("object"))
@@ -1283,6 +1294,10 @@ impl Default for RetryPolicy {
 }
 
 /// Normalized token accounting reported by an upstream response.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the *_tokens suffix makes the accounting unit explicit in the public model"
+)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,

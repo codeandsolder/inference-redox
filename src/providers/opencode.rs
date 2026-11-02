@@ -53,21 +53,21 @@ enum OpenCodeSurface {
 }
 
 impl OpenCodeSurface {
-    fn source(self) -> &'static str {
+    const fn source(self) -> &'static str {
         match self {
             Self::PayAsYouGo => "opencode",
             Self::Go => "opencode-go",
         }
     }
 
-    fn display_name(self) -> &'static str {
+    const fn display_name(self) -> &'static str {
         match self {
             Self::PayAsYouGo => "OpenCode Console",
             Self::Go => "OpenCode Go",
         }
     }
 
-    fn route_class(self) -> ModelRouteClass {
+    const fn route_class(self) -> ModelRouteClass {
         match self {
             Self::PayAsYouGo => ModelRouteClass::Standard,
             Self::Go => ModelRouteClass::Subscription,
@@ -98,7 +98,7 @@ enum Dialect {
 }
 
 impl Dialect {
-    fn endpoint_name(self) -> &'static str {
+    const fn endpoint_name(self) -> &'static str {
         match self {
             Self::OpenAiChat => "chat-completions",
             Self::OpenAiResponses => "responses",
@@ -240,7 +240,7 @@ impl OpenCodeConsole {
     }
 
     #[must_use]
-    pub fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
+    pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self
     }
@@ -440,7 +440,7 @@ impl OpenCodeConsole {
     fn compile_anthropic(request: &InferenceRequest) -> Value {
         let maximum = request
             .max_output_tokens
-            .unwrap_or(request.expected_output_tokens.max(1));
+            .unwrap_or_else(|| request.expected_output_tokens.max(1));
         let mut body = Map::new();
         body.insert("model".to_owned(), json!(request.model));
         body.insert("max_tokens".to_owned(), json!(maximum));

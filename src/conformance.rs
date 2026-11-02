@@ -1471,14 +1471,20 @@ impl ConformanceObservation {
     }
 
     fn matches_endpoint(&self, endpoint: &Endpoint) -> bool {
-        self.source == endpoint.source
-            && self.credential == endpoint.credential
-            && self.provider_key == endpoint.provider_key
-            && self.native_model_id == endpoint.model
-            && self
-                .endpoint_id
-                .as_ref()
-                .is_none_or(|endpoint_id| endpoint_id == &endpoint.id)
+        (
+            &self.source,
+            &self.credential,
+            &self.provider_key,
+            &self.native_model_id,
+        ) == (
+            &endpoint.source,
+            &endpoint.credential,
+            &endpoint.provider_key,
+            &endpoint.model,
+        ) && self
+            .endpoint_id
+            .as_ref()
+            .is_none_or(|endpoint_id| endpoint_id == &endpoint.id)
     }
 
     fn same_probe_scope(&self, other: &Self) -> bool {

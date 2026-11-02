@@ -2,7 +2,7 @@ use reqwest::header::HeaderMap;
 
 use crate::{QuotaMetric, QuotaObservation};
 
-pub(crate) fn standard_rate_limit_observations(headers: &HeaderMap) -> Vec<QuotaObservation> {
+pub fn standard_rate_limit_observations(headers: &HeaderMap) -> Vec<QuotaObservation> {
     let requests = observation(
         headers,
         "rate_limit.requests",

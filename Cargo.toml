@@ -21,11 +21,11 @@ tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"
-missing_docs = "allow"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+struct_field_names = "warn"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"

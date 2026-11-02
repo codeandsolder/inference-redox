@@ -12,10 +12,7 @@ use crate::{
     RetryPolicy, TokenUsage,
 };
 
-pub(crate) fn base_chat_body(
-    request: &InferenceRequest,
-    max_tokens_field: &str,
-) -> Map<String, Value> {
+pub fn base_chat_body(request: &InferenceRequest, max_tokens_field: &str) -> Map<String, Value> {
     let mut messages = Vec::with_capacity(2);
     if let Some(system_prompt) = request.system_prompt.as_ref() {
         messages.push(json!({"role": "system", "content": system_prompt}));
@@ -34,7 +31,7 @@ pub(crate) fn base_chat_body(
     body
 }
 
-pub(crate) fn response_format(schema: &ResponseSchema) -> Value {
+pub fn response_format(schema: &ResponseSchema) -> Value {
     match schema {
         ResponseSchema::JsonObject => json!({"type": "json_object"}),
         ResponseSchema::JsonSchema {
@@ -115,8 +112,7 @@ fn response_shape_detail(provider: &str, raw: &Value) -> String {
     let message_keys = raw
         .pointer("/choices/0/message")
         .and_then(Value::as_object)
-        .map(|message| message.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
+        .map_or_default(|message| message.keys().cloned().collect::<Vec<_>>());
     let finish_reason = raw
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str)
@@ -131,7 +127,7 @@ fn response_shape_detail(provider: &str, raw: &Value) -> String {
 }
 
 #[derive(Debug)]
-pub(crate) struct JsonResponse {
+pub struct JsonResponse {
     pub raw: Value,
     pub quota_observations: Vec<crate::QuotaObservation>,
 }
@@ -181,7 +177,7 @@ async fn execute_once(
     })
 }
 
-pub(crate) async fn execute_json_with_retry_headers(
+pub async fn execute_json_with_retry_headers(
     client: &Client,
     api_key: Option<&str>,
     url: &str,
@@ -252,7 +248,7 @@ pub(crate) async fn execute_json_with_retry_headers(
     })
 }
 
-pub(crate) async fn execute_json_with_retry(
+pub async fn execute_json_with_retry(
     client: &Client,
     api_key: Option<&str>,
     url: &str,
@@ -262,7 +258,7 @@ pub(crate) async fn execute_json_with_retry(
     execute_json_with_retry_headers(client, api_key, url, body, &HeaderMap::new(), retry).await
 }
 
-pub(crate) async fn execute_chat_with_retry(
+pub async fn execute_chat_with_retry(
     client: &Client,
     api_key: Option<&str>,
     url: &str,

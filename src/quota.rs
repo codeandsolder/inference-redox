@@ -146,7 +146,7 @@ pub struct QuotaDemand {
 
 impl QuotaDemand {
     #[must_use]
-    pub fn for_request(request: &InferenceRequest) -> Self {
+    pub const fn for_request(request: &InferenceRequest) -> Self {
         Self {
             requests: 1,
             input_tokens: request.prompt_tokens,
@@ -157,14 +157,14 @@ impl QuotaDemand {
     }
 
     #[must_use]
-    pub fn with_credits(mut self, credits: u64) -> Self {
+    pub const fn with_credits(mut self, credits: u64) -> Self {
         self.credits = Some(credits);
         self
     }
 
     /// Replace request estimates with provider-reported token counts where they are available.
     #[must_use]
-    pub fn with_actual_usage(mut self, response: &crate::InferenceResponse) -> Self {
+    pub const fn with_actual_usage(mut self, response: &crate::InferenceResponse) -> Self {
         if let Some(tokens) = response.usage.input_tokens {
             self.input_tokens = Some(tokens);
         }
@@ -472,7 +472,10 @@ impl QuotaLedger {
     }
 
     #[must_use]
-    pub fn with_observation_map(graph: QuotaGraph, observation_map: QuotaObservationMap) -> Self {
+    pub const fn with_observation_map(
+        graph: QuotaGraph,
+        observation_map: QuotaObservationMap,
+    ) -> Self {
         Self {
             graph,
             observation_map,
@@ -483,20 +486,20 @@ impl QuotaLedger {
     }
 
     #[must_use]
-    pub fn graph(&self) -> &QuotaGraph {
+    pub const fn graph(&self) -> &QuotaGraph {
         &self.graph
     }
 
-    pub fn graph_mut(&mut self) -> &mut QuotaGraph {
+    pub const fn graph_mut(&mut self) -> &mut QuotaGraph {
         &mut self.graph
     }
 
     #[must_use]
-    pub fn observation_map(&self) -> &QuotaObservationMap {
+    pub const fn observation_map(&self) -> &QuotaObservationMap {
         &self.observation_map
     }
 
-    pub fn observation_map_mut(&mut self) -> &mut QuotaObservationMap {
+    pub const fn observation_map_mut(&mut self) -> &mut QuotaObservationMap {
         &mut self.observation_map
     }
 

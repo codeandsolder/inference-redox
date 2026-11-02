@@ -106,7 +106,7 @@ pub enum SuitabilityCheck {
 }
 
 impl SuitabilityCheck {
-    fn status(&self) -> SuitabilityStatus {
+    const fn status(&self) -> SuitabilityStatus {
         match self {
             Self::Benchmark { status, .. }
             | Self::RichBenchmark { status, .. }

@@ -29,7 +29,8 @@ struct Case {
 
 fn key_from_file(path: &str, name: &str) -> Option<String> {
     fs::read_to_string(path).ok()?.lines().find_map(|line| {
-        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
         let (key, value) = line.split_once('=')?;
         (key.trim() == name).then(|| value.trim().trim_matches(['\'', '"']).to_owned())
     })
@@ -209,14 +210,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(std::io::Error::other)?;
     let concurrency: usize = args[5].parse()?;
+    let source = &target.source;
+    let route_id = &target.route_id;
+    let endpoint_id = &endpoint.id;
+    let pending = cases.len();
+    let completed_count = completed.len();
     eprintln!(
-        "target={} route={} endpoint={} pending={} completed={} constrained={}",
-        target.source,
-        target.route_id,
-        endpoint.id,
-        cases.len(),
-        completed.len(),
-        constrained
+        "target={source} route={route_id} endpoint={endpoint_id} pending={pending} completed={completed_count} constrained={constrained}"
     );
 
     let concurrency = concurrency.max(1);
