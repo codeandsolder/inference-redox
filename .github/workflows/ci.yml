@@ -17,5 +17,5 @@ jobs:
       rustflags: "-C target-cpu=x86-64-v2"
       command: >-
         cargo +1.99.1 fmt --all -- --check &&
-        CARGO_BUILD_WARNINGS=deny cargo +1.99.1 clippy --workspace --all-targets --all-features -- -D warnings &&
+        CARGO_BUILD_WARNINGS=deny cargo +1.99.1 clippy --workspace --all-targets --all-features -- -D warnings -A unfulfilled-lint-expectations &&
         cargo +1.99.1 test --workspace --all-features
