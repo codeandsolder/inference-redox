@@ -1,26 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended",
-    "github>codeandsolder/ci-workflows:renovate-ci-trust-root"
+    "github>codeandsolder/ci-workflows:renovate-fleet"
   ],
-  "rangeStrategy": "bump",
-  "minimumReleaseAge": "3 days",
-  "minimumReleaseAgeBehaviour": "timestamp-required",
-  "internalChecksFilter": "strict",
-  "packageRules": [
-    {
-      "description": "Advance canonical shared CI and strict Rust pins immediately, but never automerge trust-root updates",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "matchPackageNames": [
-        "/^codeandsolder\\/(?:ci-workflows|rust-skills2)(?:\\/|$)/"
-      ],
-      "minimumReleaseAge": null,
-      "groupName": "Shared CI trust roots",
-      "groupSlug": "shared-ci-trust-roots",
-      "automerge": false
-    }
-  ]
+  "rangeStrategy": "bump"
 }
