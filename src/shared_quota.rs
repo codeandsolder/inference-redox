@@ -68,7 +68,7 @@ impl SharedQuotaLedger {
 
 /// In-flight reservation. Dropping the future conservatively charges the reservation,
 /// since cancellation cannot prove whether the upstream has begun processing.
-pub(crate) struct QuotaReservationLease {
+pub struct QuotaReservationLease {
     ledger: SharedQuotaLedger,
     reservation: Option<QuotaReservationId>,
     route: QuotaRouteKey,
