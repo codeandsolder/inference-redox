@@ -812,6 +812,9 @@ pub struct InferenceRequest {
     /// Stable opaque conversation identifier. Required by routes whose terms/session policy demand it.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Opaque digest of the reusable prompt prefix, used only for observed cache affinity.
+    #[serde(default)]
+    pub cache_prefix_fingerprint: Option<String>,
     pub requirements: RequestRequirements,
 }
 
@@ -836,6 +839,7 @@ impl InferenceRequest {
             parallel_tool_calls: None,
             agentic: false,
             session_id: None,
+            cache_prefix_fingerprint: None,
             requirements: RequestRequirements::default(),
         }
     }

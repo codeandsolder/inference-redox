@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 
 use crate::{
-    AgenticPolicy, Endpoint, InferenceRequest, ProviderError, ReasoningEffort, ResponseSchema,
-    RouteCandidate, RoutePlan, RoutingStrategy, StrictOutputTransport, ToolChoice,
+    AgenticPolicy, CacheAffinityProfile, Endpoint, InferenceRequest, ProviderError,
+    ReasoningEffort, ResponseSchema, RouteCandidate, RoutePlan, RoutingStrategy,
+    StrictOutputTransport, ToolChoice,
 };
 
 /// Cheap cross-model token estimate used only for routing/cost prediction.
@@ -276,6 +277,18 @@ pub fn build_route_plan(
     request: &InferenceRequest,
     endpoints: Vec<Endpoint>,
 ) -> Result<RoutePlan, ProviderError> {
+    build_route_plan_with_affinity(strategy, request, endpoints, None, 0)
+}
+
+/// Like `build_route_plan`, with optional fresh observed prefix-cache evidence.
+/// Quota reservations and dispatch cost limits must still use uncached worst-case costs.
+pub(crate) fn build_route_plan_with_affinity(
+    strategy: RoutingStrategy,
+    request: &InferenceRequest,
+    endpoints: Vec<Endpoint>,
+    affinity: Option<&CacheAffinityProfile>,
+    now_unix: u64,
+) -> Result<RoutePlan, ProviderError> {
     let prompt_tokens = request_prompt_tokens(request);
     if request
         .max_output_tokens
@@ -327,6 +340,12 @@ pub fn build_route_plan(
         })
         .filter(|candidate| {
             candidate.expected_cost_usd.is_finite() && candidate.expected_cost_usd >= 0.0
+        })
+        .map(|mut candidate| {
+            if let Some(profile) = affinity {
+                profile.adjust_candidate(request, prompt_tokens, &mut candidate, now_unix);
+            }
+            candidate
         })
         .collect();
 
