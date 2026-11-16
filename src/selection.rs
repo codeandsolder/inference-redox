@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BenchmarkCatalog, InferencePool, InferenceRequest, ModelCatalog, ModelSuitabilityReport,
-    ModelSuitabilityRequirements, ProviderError, QuotaAdmissionReport, QuotaLedger, QuotaRouteKey,
-    QuotaUnknownPolicy, RequestRequirements, RouteCandidate, RoutingStrategy, SuitabilityStatus,
-    request_prompt_tokens,
+    ModelSuitabilityRequirements, ProviderError, QuotaAdmissionReport, QuotaRouteKey,
+    QuotaUnknownPolicy, RequestRequirements, RouteCandidate, RoutingStrategy, SharedQuotaLedger,
+    SuitabilityStatus, request_prompt_tokens,
 };
 
 /// Request shape for work whose model has not been selected yet.
@@ -336,7 +336,7 @@ impl InferencePool {
         evidence: ModelSelectionEvidence<'_>,
         request_template: &InferenceRequestTemplate,
         models: impl Iterator<Item = EligibleModel>,
-        ledger: &mut QuotaLedger,
+        ledger: &SharedQuotaLedger,
         policy: ModelSelectionPolicy,
     ) -> SelectionDiscovery {
         let mut discovery = SelectionDiscovery::default();
@@ -404,21 +404,17 @@ impl InferencePool {
         discovery
     }
 
-    /// Select a canonical model and concrete execution route from suitability, live provider,
-    /// conformance, quota, and request-economics evidence.
-    ///
-    /// Catalog pricing is used only to bound endpoint discovery fan-out. Final route ordering is
-    /// recomputed globally from live endpoints after quota filtering.
+    /// Select with a shared quota ledger without holding its mutex over endpoint discovery.
     ///
     /// # Errors
-    /// Returns an error for an invalid strategy, zero discovery limit, or malformed request shape.
+    /// Returns the same eligibility, quota, and strategy failures as borrowed-ledger selection.
     pub async fn select_with_quota(
         &self,
         evidence: ModelSelectionEvidence<'_>,
         request_template: &InferenceRequestTemplate,
         strategy: RoutingStrategy,
         policy: ModelSelectionPolicy,
-        ledger: &mut QuotaLedger,
+        ledger: &SharedQuotaLedger,
     ) -> Result<ModelSelectionPlan, ProviderError> {
         crate::router::validate_strategy(strategy)?;
         if policy.discovery_limit == 0 {
@@ -685,14 +681,14 @@ mod tests {
                 price: 1e-6,
             }),
         );
-        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let ledger = SharedQuotaLedger::new(crate::QuotaLedger::new(crate::QuotaGraph::new()));
         let plan = pool
             .select_with_quota(
                 evidence(&catalog, &suitability),
                 &request_template(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 selection(2),
-                &mut ledger,
+                &ledger,
             )
             .await?;
         assert_eq!(plan.considered_models, 2);
@@ -744,14 +740,14 @@ mod tests {
                 price: 1e-6,
             }),
         );
-        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let ledger = SharedQuotaLedger::new(crate::QuotaLedger::new(crate::QuotaGraph::new()));
         let plan = pool
             .select_with_quota(
                 evidence(&catalog, &suitability),
                 &request_template(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 selection(1),
-                &mut ledger,
+                &ledger,
             )
             .await?;
         assert_eq!(plan.considered_models, 2);
@@ -805,14 +801,14 @@ mod tests {
                 price: 1e-6,
             }),
         );
-        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let ledger = SharedQuotaLedger::new(crate::QuotaLedger::new(crate::QuotaGraph::new()));
         let plan = pool
             .select_with_quota(
                 evidence(&catalog, &suitability),
                 &template,
                 RoutingStrategy::FastestResponseCheap(1.5),
                 selection(1),
-                &mut ledger,
+                &ledger,
             )
             .await?;
         assert_eq!(plan.considered_models, 1);
@@ -841,14 +837,14 @@ mod tests {
         };
         let mut pool = InferencePool::new();
         pool.register("flaky", Arc::new(FailingDiscoveryProvider));
-        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let ledger = SharedQuotaLedger::new(crate::QuotaLedger::new(crate::QuotaGraph::new()));
         let plan = pool
             .select_with_quota(
                 evidence(&catalog, &suitability),
                 &request_template(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 selection(1),
-                &mut ledger,
+                &ledger,
             )
             .await?;
         assert_eq!(plan.rejections.len(), 1);
@@ -883,14 +879,14 @@ mod tests {
                 price: 0.0,
             }),
         );
-        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let ledger = SharedQuotaLedger::new(crate::QuotaLedger::new(crate::QuotaGraph::new()));
         let plan = pool
             .select_with_quota(
                 evidence(&catalog, &suitability),
                 &request_template(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 selection(1),
-                &mut ledger,
+                &ledger,
             )
             .await?;
         assert_eq!(plan.considered_models, 0);

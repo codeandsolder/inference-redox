@@ -12,7 +12,8 @@ use crate::{
     InferenceRequestTemplate, InferenceResponse, ModelCatalog, ModelLookup, ModelRouteClass,
     ModelRouteSelectionCandidate, ProviderError, QuotaAdmission, QuotaAdmissionReport,
     QuotaAwareRoutePlan, QuotaDemand, QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy,
-    RouteCandidate, RoutePlan, RoutingStrategy, build_route_plan, request_prompt_tokens,
+    RouteCandidate, RoutePlan, RoutingStrategy, SharedQuotaLedger, build_route_plan,
+    request_prompt_tokens,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -147,62 +148,6 @@ fn ensure_synchronous_request(request: &InferenceRequest) -> Result<(), Provider
         ))
     } else {
         Ok(())
-    }
-}
-
-fn commit_successful_quota(
-    ledger: &mut QuotaLedger,
-    reservation: crate::QuotaReservationId,
-    route: &QuotaRouteKey,
-    demand: QuotaDemand,
-    response: &InferenceResponse,
-    now_unix: u64,
-) -> Result<(), QuotaInferenceError> {
-    let actual = demand.with_actual_usage(response);
-    if ledger
-        .commit_with_observations(
-            reservation,
-            route,
-            Some(actual),
-            &response.quota_observations,
-            now_unix,
-        )
-        .is_some()
-    {
-        Ok(())
-    } else {
-        Err(QuotaInferenceError::LedgerInvariant(
-            "failed to commit successful inference reservation".to_owned(),
-        ))
-    }
-}
-
-fn settle_failed_quota(
-    ledger: &mut QuotaLedger,
-    reservation: crate::QuotaReservationId,
-    route: &QuotaRouteKey,
-    error: &ProviderError,
-    now_unix: u64,
-) -> Result<(), QuotaInferenceError> {
-    let accounted = if error.execution_phase().is_some() {
-        ledger
-            .commit_with_observations(
-                reservation,
-                route,
-                None,
-                error.quota_observations(),
-                now_unix,
-            )
-            .is_some()
-    } else {
-        ledger.release(reservation)
-    };
-    if accounted {
-        Ok(())
-    } else {
-        Err(QuotaInferenceError::LedgerInvariant(
-            "failed to settle failed inference reservation".to_owned(),
-        ))
     }
 }
 
@@ -407,15 +352,31 @@ impl InferencePool {
         )
     }
 
+    /// The shared variant never holds a ledger lock over provider discovery.
     pub(crate) async fn quota_admitted_endpoints(
         &self,
         catalog: &ModelCatalog,
+        request: &InferenceRequest,
+        ledger: &SharedQuotaLedger,
+        unknown_policy: QuotaUnknownPolicy,
+        now_unix: u64,
+    ) -> Result<QuotaEndpointDiscovery, ProviderError> {
+        let endpoints = self.endpoints(catalog, request).await?;
+        ledger
+            .with_mut(|state| {
+                self.filter_quota_endpoints(endpoints, request, state, unknown_policy, now_unix)
+            })
+            .map_err(|error| ProviderError::Response(error.to_string()))?
+    }
+
+    fn filter_quota_endpoints(
+        &self,
+        endpoints: Vec<crate::Endpoint>,
         request: &InferenceRequest,
         ledger: &mut QuotaLedger,
         unknown_policy: QuotaUnknownPolicy,
         now_unix: u64,
     ) -> Result<QuotaEndpointDiscovery, ProviderError> {
-        let endpoints = self.endpoints(catalog, request).await?;
         let prompt_tokens = request_prompt_tokens(request);
         let lowered_strict_schema = lowered_strict_schema(request);
         let demand = QuotaDemand::for_request(request);
@@ -452,23 +413,33 @@ impl InferencePool {
         })
     }
 
-    /// Build a route plan after quota filtering, before computing the request cost floor.
+    /// Route with shared quota state while allowing other requests to discover concurrently.
     ///
     /// # Errors
-    /// Returns provider/routing errors normally, or a quota-specific failure carrying every
-    /// shape-eligible route's admission report when quota removes all candidates.
+    /// Returns provider, quota-admission, or accounting-lock errors.
     pub async fn route_with_quota(
         &self,
         catalog: &ModelCatalog,
         strategy: RoutingStrategy,
         request: &InferenceRequest,
-        ledger: &mut QuotaLedger,
+        ledger: &SharedQuotaLedger,
         unknown_policy: QuotaUnknownPolicy,
         now_unix: u64,
     ) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
         let discovery = self
             .quota_admitted_endpoints(catalog, request, ledger, unknown_policy, now_unix)
             .await?;
+        self.finish_quota_route(strategy, request, discovery, now_unix)
+            .await
+    }
+
+    async fn finish_quota_route(
+        &self,
+        strategy: RoutingStrategy,
+        request: &InferenceRequest,
+        discovery: QuotaEndpointDiscovery,
+        now_unix: u64,
+    ) -> Result<QuotaAwareRoutePlan, QuotaRoutingError> {
         if discovery.endpoints.is_empty() {
             return Err(QuotaRoutingError::NoQuotaAdmissible {
                 model: request.model.clone(),
@@ -494,16 +465,42 @@ impl InferencePool {
     /// pricing, and quota evidence.
     ///
     /// # Errors
-    /// Returns an error when the exact route disappeared, the request shape no longer fits,
-    /// the current expected cost exceeds policy, or quota does not admit the route.
+    /// Shared-state exact-route revalidation with no lock held during provider discovery.
+    ///
+    /// # Errors
+    /// Returns route, cost, quota, or ledger-invariant errors.
     pub async fn revalidate_selected_with_quota(
         &self,
         catalog: &ModelCatalog,
         selected: &ModelRouteSelectionCandidate,
         request_template: &InferenceRequestTemplate,
-        ledger: &mut QuotaLedger,
+        ledger: &SharedQuotaLedger,
         policy: SelectedRouteExecutionPolicy,
     ) -> Result<SelectedRouteValidation, SelectedRouteExecutionError> {
+        let (request, candidate, maximum_cost_usd) = self
+            .inspect_selected_route(catalog, selected, request_template, policy)
+            .await?;
+        ledger
+            .with_mut(|state| {
+                self.validate_selected_ledger(
+                    &request,
+                    selected,
+                    candidate,
+                    maximum_cost_usd,
+                    state,
+                    policy,
+                )
+            })
+            .map_err(|error| SelectedRouteExecutionError::Accounting(error.to_string()))?
+    }
+
+    async fn inspect_selected_route(
+        &self,
+        catalog: &ModelCatalog,
+        selected: &ModelRouteSelectionCandidate,
+        request_template: &InferenceRequestTemplate,
+        policy: SelectedRouteExecutionPolicy,
+    ) -> Result<(InferenceRequest, RouteCandidate, f64), SelectedRouteExecutionError> {
         if !policy.max_cost_usd.is_finite() || policy.max_cost_usd < 0.0 {
             return Err(SelectedRouteExecutionError::InvalidPolicy(
                 "max_cost_usd must be finite and non-negative".to_owned(),
@@ -556,6 +553,18 @@ impl InferencePool {
                 maximum_usd: policy.max_cost_usd,
             });
         }
+        Ok((request, candidate, maximum_cost_usd))
+    }
+
+    fn validate_selected_ledger(
+        &self,
+        request: &InferenceRequest,
+        selected: &ModelRouteSelectionCandidate,
+        candidate: RouteCandidate,
+        maximum_cost_usd: f64,
+        ledger: &mut QuotaLedger,
+        policy: SelectedRouteExecutionPolicy,
+    ) -> Result<SelectedRouteValidation, SelectedRouteExecutionError> {
         let route = QuotaRouteKey::from_endpoint(&candidate.endpoint);
         let instance = ProviderInstanceKey::new(
             candidate.endpoint.source.clone(),
@@ -565,7 +574,7 @@ impl InferencePool {
             SelectedRouteExecutionError::RouteUnavailable(selected.canonical_id.clone())
         })?;
         provider.configure_quota_route(&route, ledger)?;
-        let report = ledger.evaluate(&route, QuotaDemand::for_request(&request), policy.now_unix);
+        let report = ledger.evaluate(&route, QuotaDemand::for_request(request), policy.now_unix);
         let admitted = match report.admission {
             QuotaAdmission::Admitted => true,
             QuotaAdmission::Indeterminate => {
@@ -585,17 +594,17 @@ impl InferencePool {
         })
     }
 
-    /// Execute one exact previously selected synchronous route after fresh revalidation.
+    /// Execute an exactly revalidated route using a shared, cancellation-safe reservation.
     ///
     /// # Errors
-    /// Returns revalidation, quota-accounting, provider-execution, or batch-lifecycle errors.
+    /// Returns route, quota, execution, schema, or accounting errors.
     pub async fn infer_selected_with_quota(
         &self,
         catalog: &ModelCatalog,
         selected: &ModelRouteSelectionCandidate,
         request_template: &InferenceRequestTemplate,
         retry: RetryPolicy,
-        ledger: &mut QuotaLedger,
+        ledger: &SharedQuotaLedger,
         policy: SelectedRouteExecutionPolicy,
     ) -> Result<QuotaPooledInferenceResponse, SelectedRouteExecutionError> {
         if selected.route.endpoint.route_class == ModelRouteClass::Batch {
@@ -609,15 +618,29 @@ impl InferencePool {
         let request = request_template.for_model(candidate.endpoint.model.clone());
         let demand = QuotaDemand::for_request(&request);
         let reservation = ledger
-            .reserve_with_policy(&route, demand, policy.now_unix, policy.quota_unknown_policy)
+            .with_mut(|state| {
+                state.reserve_with_policy(
+                    &route,
+                    demand,
+                    policy.now_unix,
+                    policy.quota_unknown_policy,
+                )
+            })
+            .map_err(|error| SelectedRouteExecutionError::Accounting(error.to_string()))?
             .map_err(|report| SelectedRouteExecutionError::QuotaUnavailable { report })?;
+        let mut lease = ledger.lease(reservation, route, demand, policy.now_unix);
         let instance = ProviderInstanceKey::new(
             candidate.endpoint.source.clone(),
             candidate.endpoint.credential.clone(),
         );
-        let provider = self.providers.get(&instance).ok_or_else(|| {
-            SelectedRouteExecutionError::RouteUnavailable(selected.canonical_id.clone())
-        })?;
+        let Some(provider) = self.providers.get(&instance) else {
+            lease
+                .release_before_dispatch()
+                .map_err(|error| SelectedRouteExecutionError::Accounting(error.to_string()))?;
+            return Err(SelectedRouteExecutionError::RouteUnavailable(
+                selected.canonical_id.clone(),
+            ));
+        };
         let plan = single_candidate_plan(
             &candidate,
             request_prompt_tokens(&request),
@@ -625,15 +648,9 @@ impl InferencePool {
         );
         match provider.execute_plan(&request, &plan, retry).await {
             Ok(response) => {
-                commit_successful_quota(
-                    ledger,
-                    reservation,
-                    &route,
-                    demand,
-                    &response,
-                    policy.now_unix,
-                )
-                .map_err(|error| SelectedRouteExecutionError::Accounting(error.to_string()))?;
+                lease
+                    .commit_success(&response)
+                    .map_err(|error| SelectedRouteExecutionError::Accounting(error.to_string()))?;
                 match crate::structured_output::validate_inference_response(&request, response) {
                     Ok(response) => {
                         self.record_cache_affinity(
@@ -662,31 +679,54 @@ impl InferencePool {
                 }
             }
             Err(error) => {
-                settle_failed_quota(ledger, reservation, &route, &error, policy.now_unix).map_err(
-                    |accounting| SelectedRouteExecutionError::Accounting(accounting.to_string()),
-                )?;
+                if error.execution_phase().is_some() {
+                    lease.commit_ambiguous_failure(error.quota_observations())
+                } else {
+                    lease.release_before_dispatch()
+                }
+                .map_err(|accounting| {
+                    SelectedRouteExecutionError::Accounting(accounting.to_string())
+                })?;
                 Err(SelectedRouteExecutionError::Provider(error))
             }
         }
     }
 
-    /// Execute a synchronous route with quota reservation and conservative post-call accounting.
+    async fn validate_recorded_response(
+        &self,
+        request: &InferenceRequest,
+        candidate: &RouteCandidate,
+        response: InferenceResponse,
+        now_unix: u64,
+    ) -> Result<InferenceResponse, ProviderError> {
+        match crate::structured_output::validate_inference_response(request, response) {
+            Ok(response) => {
+                self.record_cache_affinity(request, &candidate.endpoint, &response, now_unix)
+                    .await;
+                Ok(response)
+            }
+            Err(failure) => {
+                self.record_runtime_schema_failure(&candidate.endpoint, request, &failure)
+                    .await;
+                Err(ProviderError::Response(failure.to_string()))
+            }
+        }
+    }
+
+    /// Dispatch using a shared quota ledger, without holding its lock across any network I/O.
     ///
-    /// Known finite quota is reserved per candidate immediately before dispatch. Successful calls
-    /// commit normalized actual token usage where available. Structured execution failures commit
-    /// the reserved worst case; local/non-dispatch failures release it. Quota is re-evaluated before
-    /// every failover candidate so shared buckets cannot be multiplied by sibling credentials.
+    /// A per-dispatch lease settles actual usage or response-phase failure. Cancellation of an
+    /// in-flight future conservatively commits the reservation instead of leaking capacity.
     ///
     /// # Errors
-    /// Returns quota-routing errors, ledger invariant failures, or an aggregate failure after all
-    /// currently quota-admissible synchronous candidates fail.
+    /// Returns routing, quota, accounting, and aggregate provider execution failures.
     pub async fn infer_with_quota(
         &self,
         catalog: &ModelCatalog,
         strategy: RoutingStrategy,
         request: &InferenceRequest,
         retry: RetryPolicy,
-        ledger: &mut QuotaLedger,
+        ledger: &SharedQuotaLedger,
         quota: QuotaExecutionContext,
     ) -> Result<QuotaPooledInferenceResponse, QuotaInferenceError> {
         ensure_synchronous_request(request).map_err(QuotaRoutingError::Provider)?;
@@ -705,24 +745,28 @@ impl InferencePool {
         let mut last_error = None;
         for candidate in quota_plan.plan.candidates.clone() {
             let route_key = QuotaRouteKey::from_endpoint(&candidate.endpoint);
-            let Ok(reservation) = ledger.reserve_with_policy(
-                &route_key,
-                demand,
-                quota.now_unix,
-                quota.unknown_policy,
-            ) else {
+            let reservation = ledger
+                .with_mut(|state| {
+                    state.reserve_with_policy(
+                        &route_key,
+                        demand,
+                        quota.now_unix,
+                        quota.unknown_policy,
+                    )
+                })
+                .map_err(|error| QuotaInferenceError::LedgerInvariant(error.to_string()))?;
+            let Ok(reservation) = reservation else {
                 continue;
             };
+            let mut lease = ledger.lease(reservation, route_key, demand, quota.now_unix);
             let instance = ProviderInstanceKey::new(
                 candidate.endpoint.source.clone(),
                 candidate.endpoint.credential.clone(),
             );
             let Some(provider) = self.providers.get(&instance) else {
-                if !ledger.release(reservation) {
-                    return Err(QuotaInferenceError::LedgerInvariant(
-                        "failed to release reservation for missing provider instance".to_owned(),
-                    ));
-                }
+                lease
+                    .release_before_dispatch()
+                    .map_err(|error| QuotaInferenceError::LedgerInvariant(error.to_string()))?;
                 continue;
             };
             attempted += 1;
@@ -738,43 +782,32 @@ impl InferencePool {
                 .await
             {
                 Ok(response) => {
-                    commit_successful_quota(
-                        ledger,
-                        reservation,
-                        &route_key,
-                        demand,
-                        &response,
-                        quota.now_unix,
-                    )?;
-                    match crate::structured_output::validate_inference_response(request, response) {
+                    lease
+                        .commit_success(&response)
+                        .map_err(|error| QuotaInferenceError::LedgerInvariant(error.to_string()))?;
+                    match self
+                        .validate_recorded_response(request, &candidate, response, quota.now_unix)
+                        .await
+                    {
                         Ok(response) => {
-                            self.record_cache_affinity(
-                                request,
-                                &candidate.endpoint,
-                                &response,
-                                quota.now_unix,
-                            )
-                            .await;
                             return Ok(QuotaPooledInferenceResponse {
                                 quota_plan,
                                 selected: candidate,
                                 response,
                             });
                         }
-                        Err(failure) => {
-                            self.record_runtime_schema_failure(
-                                &candidate.endpoint,
-                                request,
-                                &failure,
-                            )
-                            .await;
-                            last_error =
-                                Some(Box::new(ProviderError::Response(failure.to_string())));
-                        }
+                        Err(error) => last_error = Some(Box::new(error)),
                     }
                 }
                 Err(error) => {
-                    settle_failed_quota(ledger, reservation, &route_key, &error, quota.now_unix)?;
+                    if error.execution_phase().is_some() {
+                        lease.commit_ambiguous_failure(error.quota_observations())
+                    } else {
+                        lease.release_before_dispatch()
+                    }
+                    .map_err(|accounting| {
+                        QuotaInferenceError::LedgerInvariant(accounting.to_string())
+                    })?;
                     last_error = Some(Box::new(error));
                 }
             }
@@ -1317,13 +1350,13 @@ mod tests {
                 calls,
             }),
         );
-        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(crate::QuotaGraph::new()));
         let error = pool
             .revalidate_selected_with_quota(
                 &catalog(),
                 &selected_candidate(ModelRouteClass::Standard, 0.0),
                 &selected_template(),
-                &mut ledger,
+                &ledger,
                 SelectedRouteExecutionPolicy {
                     quota_unknown_policy: QuotaUnknownPolicy::Allow,
                     now_unix: 100,
@@ -1354,14 +1387,14 @@ mod tests {
                 calls: Arc::clone(&calls),
             }),
         );
-        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(crate::QuotaGraph::new()));
         let result = pool
             .infer_selected_with_quota(
                 &catalog(),
                 &selected_candidate(ModelRouteClass::Standard, 1e-6),
                 &selected_template(),
                 RetryPolicy::default(),
-                &mut ledger,
+                &ledger,
                 SelectedRouteExecutionPolicy {
                     quota_unknown_policy: QuotaUnknownPolicy::Allow,
                     now_unix: 100,
@@ -1381,14 +1414,14 @@ mod tests {
     async fn selected_batch_route_never_enters_sync_execution()
     -> Result<(), Box<dyn std::error::Error>> {
         let pool = InferencePool::new();
-        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(crate::QuotaGraph::new()));
         let error = pool
             .infer_selected_with_quota(
                 &catalog(),
                 &selected_candidate(ModelRouteClass::Batch, 0.0),
                 &selected_template(),
                 RetryPolicy::default(),
-                &mut ledger,
+                &ledger,
                 SelectedRouteExecutionPolicy {
                     quota_unknown_policy: QuotaUnknownPolicy::Allow,
                     now_unix: 100,
@@ -1936,7 +1969,7 @@ mod tests {
         graph.insert_resource(expensive_resource);
         assert!(graph.bind(cheap_route, &cheap_id));
         assert!(graph.bind(expensive_route, &expensive_id));
-        let mut ledger = QuotaLedger::new(graph);
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(graph));
         let request = InferenceRequest::new("vendor/model", "hi", 8);
 
         let result = pool
@@ -1944,7 +1977,7 @@ mod tests {
                 &catalog(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 &request,
-                &mut ledger,
+                &ledger,
                 QuotaUnknownPolicy::Reject,
                 100,
             )
@@ -1976,13 +2009,13 @@ mod tests {
             }),
         );
         let request = InferenceRequest::new("vendor/model", "hi", 8);
-        let mut ledger = QuotaLedger::new(crate::QuotaGraph::new());
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(crate::QuotaGraph::new()));
         let permissive = pool
             .route_with_quota(
                 &catalog(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 &request,
-                &mut ledger,
+                &ledger,
                 QuotaUnknownPolicy::Allow,
                 100,
             )
@@ -1998,7 +2031,7 @@ mod tests {
                 &catalog(),
                 RoutingStrategy::FastestResponseCheap(1.5),
                 &request,
-                &mut ledger,
+                &ledger,
                 QuotaUnknownPolicy::Reject,
                 100,
             )
@@ -2046,7 +2079,7 @@ mod tests {
         let mut graph = crate::QuotaGraph::new();
         graph.insert_resource(resource);
         assert!(graph.bind(route, &resource_id));
-        let mut ledger = QuotaLedger::new(graph);
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(graph));
         let mut request = InferenceRequest::new("vendor/model", "hi", 8);
         request.prompt_tokens = Some(100);
         request.max_output_tokens = Some(200);
@@ -2056,7 +2089,7 @@ mod tests {
                 RoutingStrategy::FastestResponseCheap(1.5),
                 &request,
                 RetryPolicy::default(),
-                &mut ledger,
+                &ledger,
                 QuotaExecutionContext {
                     unknown_policy: QuotaUnknownPolicy::Reject,
                     now_unix: 100,
@@ -2065,7 +2098,9 @@ mod tests {
             .await?;
         assert_eq!(result.response.usage.total_tokens, Some(30));
         assert_eq!(
-            ledger.graph().resource(&resource_id).map(|r| r.remaining),
+            ledger
+                .with_mut(|state| state.graph().resource(&resource_id).map(|r| r.remaining))
+                .map_err(|error| QuotaInferenceError::LedgerInvariant(error.to_string()))?,
             Some(crate::QuotaAmount::Finite(970))
         );
         Ok(())
@@ -2115,7 +2150,8 @@ mod tests {
             assert!(graph.bind(route.clone(), &shared_id));
             observation_map.bind(route, "rate_limit.requests", shared_id.clone());
         }
-        let mut ledger = QuotaLedger::with_observation_map(graph, observation_map);
+        let ledger =
+            SharedQuotaLedger::new(QuotaLedger::with_observation_map(graph, observation_map));
         let request = InferenceRequest::new("vendor/model", "hi", 8);
         let result = pool
             .infer_with_quota(
@@ -2123,7 +2159,7 @@ mod tests {
                 RoutingStrategy::FastestResponseCheap(1.5),
                 &request,
                 RetryPolicy::default(),
-                &mut ledger,
+                &ledger,
                 QuotaExecutionContext {
                     unknown_policy: QuotaUnknownPolicy::Reject,
                     now_unix: 100,
@@ -2136,9 +2172,12 @@ mod tests {
         ));
         assert_eq!(
             ledger
-                .graph()
-                .resource(&shared_id)
-                .map(|resource| resource.remaining),
+                .with_mut(|state| state
+                    .graph()
+                    .resource(&shared_id)
+                    .map(|resource| resource.remaining))
+                .ok()
+                .flatten(),
             Some(crate::QuotaAmount::Finite(0))
         );
         let healthy = healthy_calls.lock();
@@ -2192,7 +2231,7 @@ mod tests {
             };
             assert!(graph.bind(route, &shared_id));
         }
-        let mut ledger = QuotaLedger::new(graph);
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(graph));
         let request = InferenceRequest::new("vendor/model", "hi", 8);
         let result = pool
             .infer_with_quota(
@@ -2200,7 +2239,7 @@ mod tests {
                 RoutingStrategy::FastestResponseCheap(1.5),
                 &request,
                 RetryPolicy::default(),
-                &mut ledger,
+                &ledger,
                 QuotaExecutionContext {
                     unknown_policy: QuotaUnknownPolicy::Reject,
                     now_unix: 100,
@@ -2212,7 +2251,10 @@ mod tests {
             Err(QuotaInferenceError::AllCandidatesFailed { attempted: 1, .. })
         ));
         assert_eq!(
-            ledger.graph().resource(&shared_id).map(|r| r.remaining),
+            ledger
+                .with_mut(|state| state.graph().resource(&shared_id).map(|r| r.remaining))
+                .ok()
+                .flatten(),
             Some(crate::QuotaAmount::Finite(0))
         );
         let failing = failing_calls.lock();
@@ -2244,5 +2286,216 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(ProviderError::InvalidRequest(_))));
+    }
+
+    struct BarrierProvider {
+        mock: MockProvider,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl InferenceProvider for BarrierProvider {
+        async fn endpoints(&self, model: &str) -> Result<Vec<Endpoint>, ProviderError> {
+            self.mock.endpoints(model).await
+        }
+
+        async fn execute_plan(
+            &self,
+            request: &InferenceRequest,
+            plan: &RoutePlan,
+            retry: RetryPolicy,
+        ) -> Result<InferenceResponse, ProviderError> {
+            self.barrier.wait().await;
+            self.mock.execute_plan(request, plan, retry).await
+        }
+    }
+
+    struct SuspendedProvider {
+        mock: MockProvider,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl InferenceProvider for SuspendedProvider {
+        async fn endpoints(&self, model: &str) -> Result<Vec<Endpoint>, ProviderError> {
+            self.mock.endpoints(model).await
+        }
+
+        async fn execute_plan(
+            &self,
+            _request: &InferenceRequest,
+            _plan: &RoutePlan,
+            _retry: RetryPolicy,
+        ) -> Result<InferenceResponse, ProviderError> {
+            self.started.notify_one();
+            std::future::pending::<Result<InferenceResponse, ProviderError>>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_quota_allows_independent_inference_calls_to_overlap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut pool = InferencePool::new();
+        pool.register(
+            "nvidia",
+            Arc::new(BarrierProvider {
+                mock: MockProvider {
+                    source: "nvidia",
+                    price: 0.0,
+                    fail_execute: false,
+                    calls,
+                },
+                barrier,
+            }),
+        );
+        let catalog = catalog();
+        let request = InferenceRequest::new("vendor/model", "hi", 8);
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(crate::QuotaGraph::new()));
+        let quota = QuotaExecutionContext {
+            unknown_policy: QuotaUnknownPolicy::Allow,
+            now_unix: 100,
+        };
+        let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                pool.infer_with_quota(
+                    &catalog,
+                    RoutingStrategy::FastestResponseCheap(1.5),
+                    &request,
+                    RetryPolicy::default(),
+                    &ledger,
+                    quota,
+                ),
+                pool.infer_with_quota(
+                    &catalog,
+                    RoutingStrategy::FastestResponseCheap(1.5),
+                    &request,
+                    RetryPolicy::default(),
+                    &ledger,
+                    quota,
+                )
+            )
+        })
+        .await?;
+        assert_eq!(left?.response.content, "ok");
+        assert_eq!(right?.response.content, "ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_commits_request_and_releases_concurrency_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut pool = InferencePool::new();
+        pool.register(
+            "nvidia",
+            Arc::new(SuspendedProvider {
+                mock: MockProvider {
+                    source: "nvidia",
+                    price: 0.0,
+                    fail_execute: false,
+                    calls: Arc::new(StdMutex::new(Vec::new())),
+                },
+                started: Arc::clone(&started),
+            }),
+        );
+        let route = QuotaRouteKey {
+            source: "nvidia".to_owned(),
+            credential: None,
+            provider: "nvidia".to_owned(),
+            model: "vendor/native-model".to_owned(),
+        };
+        let request_quota = crate::QuotaResource::finite(
+            "nvidia/cancellation-requests",
+            crate::QuotaScope::Account,
+            crate::QuotaMetric::Requests,
+            2,
+            2,
+        );
+        let request_id = request_quota.id.clone();
+        let concurrent_quota = crate::QuotaResource::finite(
+            "nvidia/cancellation-concurrent",
+            crate::QuotaScope::Account,
+            crate::QuotaMetric::ConcurrentRequests,
+            1,
+            1,
+        );
+        let concurrent_id = concurrent_quota.id.clone();
+        let mut graph = crate::QuotaGraph::new();
+        graph.insert_resource(request_quota);
+        graph.insert_resource(concurrent_quota);
+        assert!(graph.bind(route.clone(), &request_id));
+        assert!(graph.bind(route, &concurrent_id));
+        let ledger = SharedQuotaLedger::new(QuotaLedger::new(graph));
+        let ledger_for_task = ledger.clone();
+        let request = InferenceRequest::new("vendor/model", "hi", 8);
+        let task = tokio::spawn(async move {
+            pool.infer_with_quota(
+                &catalog(),
+                RoutingStrategy::FastestResponseCheap(1.5),
+                &request,
+                RetryPolicy::default(),
+                &ledger_for_task,
+                QuotaExecutionContext {
+                    unknown_policy: QuotaUnknownPolicy::Reject,
+                    now_unix: 100,
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified()).await?;
+        let during = ledger.with_mut(|state| {
+            (
+                state.graph().resource(&request_id).map(|r| r.remaining),
+                state.evaluate(
+                    &QuotaRouteKey {
+                        source: "nvidia".to_owned(),
+                        credential: None,
+                        provider: "nvidia".to_owned(),
+                        model: "vendor/native-model".to_owned(),
+                    },
+                    QuotaDemand {
+                        requests: 1,
+                        concurrent_requests: 1,
+                        ..QuotaDemand::default()
+                    },
+                    100,
+                ),
+            )
+        })?;
+        assert_eq!(during.0, Some(crate::QuotaAmount::Finite(2)));
+        assert!(during.1.checks.iter().any(|check| {
+            check.resource_id == concurrent_id && check.available == crate::QuotaAmount::Finite(0)
+        }));
+        task.abort();
+        let cancelled = task.await;
+        assert!(cancelled.is_err_and(|error| error.is_cancelled()));
+        let after = ledger.with_mut(|state| {
+            (
+                state.graph().resource(&request_id).map(|r| r.remaining),
+                state.graph().resource(&concurrent_id).map(|r| r.remaining),
+                state.evaluate(
+                    &QuotaRouteKey {
+                        source: "nvidia".to_owned(),
+                        credential: None,
+                        provider: "nvidia".to_owned(),
+                        model: "vendor/native-model".to_owned(),
+                    },
+                    QuotaDemand {
+                        requests: 1,
+                        concurrent_requests: 1,
+                        ..QuotaDemand::default()
+                    },
+                    100,
+                ),
+            )
+        })?;
+        assert_eq!(after.0, Some(crate::QuotaAmount::Finite(1)));
+        assert_eq!(after.1, Some(crate::QuotaAmount::Finite(1)));
+        assert!(after.2.checks.iter().any(|check| {
+            check.resource_id == concurrent_id && check.available == crate::QuotaAmount::Finite(1)
+        }));
+        Ok(())
     }
 }

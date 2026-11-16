@@ -16,7 +16,8 @@ use inference_redox::{
     ModelLookup, ModelRouteSelectionCandidate, ModelSelectionEvidence, ModelSelectionPolicy,
     ModelSuitabilityReport, ModelSuitabilityRequirements, ProviderError, QuotaExecutionContext,
     QuotaGraph, QuotaGraphSnapshot, QuotaLedger, QuotaObservationBinding, QuotaUnknownPolicy,
-    RetryPolicy, RoutingStrategy, SelectedRouteExecutionPolicy, SuitabilityUnknownPolicy,
+    RetryPolicy, RoutingStrategy, SelectedRouteExecutionPolicy, SharedQuotaLedger,
+    SuitabilityUnknownPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -181,7 +182,7 @@ struct Providers {
     cache_affinity: Arc<Mutex<CacheAffinityProfile>>,
     conformance_probe_lock: Arc<Mutex<()>>,
     conformance_cache_path: Arc<PathBuf>,
-    quota: Arc<Mutex<QuotaLedger>>,
+    quota: SharedQuotaLedger,
 }
 
 impl Providers {
@@ -839,14 +840,13 @@ async fn handle_model_selection_operation(
         now_unix: unix_time_seconds(),
     };
     let pool = providers.pool();
-    let mut ledger = providers.quota.lock().await;
     match pool
         .select_with_quota(
             evidence,
             &request_template,
             RoutingStrategy::FastestResponseCheap(multiplier),
             policy,
-            &mut ledger,
+            &providers.quota,
         )
         .await
     {
@@ -906,12 +906,11 @@ async fn handle_selected_route_operation(
     match op {
         Operation::ValidateSelectedQuota => {
             let result = {
-                let mut ledger = providers.quota.lock().await;
                 pool.revalidate_selected_with_quota(
                     &catalog,
                     &selected,
                     &request_template,
-                    &mut ledger,
+                    &providers.quota,
                     policy,
                 )
                 .await
@@ -921,13 +920,12 @@ async fn handle_selected_route_operation(
         Operation::InferSelectedQuota => {
             let retry = retry.map_or_else(RetryPolicy::default, WireRetryPolicy::normalized);
             let result = {
-                let mut ledger = providers.quota.lock().await;
                 pool.infer_selected_with_quota(
                     &catalog,
                     &selected,
                     &request_template,
                     retry,
-                    &mut ledger,
+                    &providers.quota,
                     policy,
                 )
                 .await
@@ -1018,12 +1016,11 @@ async fn handle_quota_pool_operation(
     match op {
         Operation::RoutePoolQuota => {
             let result = {
-                let mut ledger = providers.quota.lock().await;
                 pool.route_with_quota(
                     &catalog,
                     strategy,
                     &request,
-                    &mut ledger,
+                    &providers.quota,
                     unknown_policy,
                     now_unix,
                 )
@@ -1038,8 +1035,7 @@ async fn handle_quota_pool_operation(
                 now_unix,
             };
             let result = {
-                let mut ledger = providers.quota.lock().await;
-                pool.infer_with_quota(&catalog, strategy, &request, retry, &mut ledger, quota)
+                pool.infer_with_quota(&catalog, strategy, &request, retry, &providers.quota, quota)
                     .await
             };
             if !persist_schema_conformance_or_write_error(
@@ -1063,22 +1059,11 @@ async fn handle_quota_state_operation(
     stdout: &Arc<Mutex<tokio::io::Stdout>>,
     id: Value,
 ) {
-    let result = {
-        let ledger = providers.quota.lock().await;
-        WireQuotaState {
-            graph: ledger.graph().snapshot(),
-            observation_bindings: ledger.observation_map().snapshot(),
-        }
-    };
-    write_json(
-        stdout,
-        &WireSuccess {
-            id,
-            ok: true,
-            result,
-        },
-    )
-    .await;
+    let result = providers.quota.with_mut(|ledger| WireQuotaState {
+        graph: ledger.graph().snapshot(),
+        observation_bindings: ledger.observation_map().snapshot(),
+    });
+    write_result_or_error(stdout, id, result).await;
 }
 
 async fn handle_openrouter_operation(
@@ -1395,7 +1380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache_affinity: Arc::new(Mutex::new(CacheAffinityProfile::default())),
         conformance_probe_lock: Arc::new(Mutex::new(())),
         conformance_cache_path: Arc::new(conformance_cache_path),
-        quota: Arc::new(Mutex::new(QuotaLedger::new(QuotaGraph::new()))),
+        quota: SharedQuotaLedger::new(QuotaLedger::new(QuotaGraph::new())),
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = BufReader::new(tokio::io::stdin());
