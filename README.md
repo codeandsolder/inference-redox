@@ -144,6 +144,18 @@ Quota is modeled as shared resources, not as `API key × model = faucet`. A `Quo
 
 Execution instances are keyed separately by provider source and an opaque credential/account label. This lets the pool hold multiple accounts for the same provider without putting secrets into routing metadata; selected endpoints retain that label, so execution dispatch and quota binding refer to the same logical account. `register(source, ...)` remains the default-credential shorthand while `register_credential(source, label, ...)` adds explicit instances.
 
+Quota-aware pool operations take a `SharedQuotaLedger` rather than a mutable
+borrowed `QuotaLedger`. This keeps quota reservations and settlements atomic
+while endpoint discovery and provider HTTP calls run concurrently. A dispatched
+request owns a cancellation-safe reservation lease; dropping an in-flight call
+commits the known worst-case demand because the transport cannot prove whether
+the upstream started processing. Pre-dispatch failures release the reservation
+without charging it. In the JSONL bridge the shared ledger is scoped to the
+process, so concurrently dispatched requests still share finite quota across
+credentials, routes and model aliases. `QuotaLedger` itself remains the
+single-transaction accounting engine; `SharedQuotaLedger::with_mut` gives
+callers bounded synchronous access for graph initialization and snapshots.
+
 Finite, unknown, and explicitly unlimited quota are separate states. Unknown limits or unknown credit cost produce an `Indeterminate` admission result rather than being treated as infinity. Provider reset timestamps are observation boundaries: once a reported reset time passes, the observation becomes unknown until refreshed instead of assuming every provider refills the same way. `QuotaLedger` reserves finite headroom for concurrent work, releases unaccepted requests, and commits actual token/credit usage when available.
 
 `InferencePool::route_with_quota` is the first routing integration. It applies ordinary model/capability/shape filtering, then quota admission, and only then computes the cheapest-cost band. Known-exhausted routes therefore cannot pin the cost floor; an exhausted $0 route is removed before a healthy paid route is compared. `QuotaUnknownPolicy::Allow` preserves experimental/unmeasured routes while excluding known exhaustion, whereas `Reject` requires known sufficient quota and returns the per-route admission reports when nothing survives.
@@ -168,7 +180,7 @@ Selected routes are never trusted indefinitely. `validate_selected_quota` re-dis
 
 Model-less planning is exposed as `select_pool_quota`. It combines canonical-model suitability evidence with a model-less `InferenceRequestTemplate`, then performs bounded live endpoint discovery and quota admission before applying one global `FastestResponseCheap` cost band across models. `ModelSelectionPolicy` makes unknown suitability, unknown quota, the live-discovery cap, and the observation timestamp explicit. Catalog pricing is only a fan-out pre-rank; final ordering always uses discovered endpoint pricing/telemetry. Canonical models without any requested route class are excluded before spending discovery budget. The result retains suitability and quota evidence beside every concrete execution route and reports how many suitable models were deferred by the discovery cap.
 
-The long-lived stdio bridge exposes persistent quota-aware routing as `route_pool_quota` and `infer_pool_quota`. Both require an explicit `quota_unknown_policy` (`allow` or `reject`) instead of silently choosing how to treat unmeasured capacity. A single in-process `QuotaLedger` is shared across these calls, so provider-declared topology and response observations affect later admissions. `quota_state` exposes the current typed graph and observation bindings for inspection. Ordinary `route_pool` / `infer_pool` remain unchanged and do not implicitly opt into quota enforcement.
+The long-lived stdio bridge exposes persistent quota-aware routing as `route_pool_quota` and `infer_pool_quota`. Both require an explicit `quota_unknown_policy` (`allow` or `reject`) instead of silently choosing how to treat unmeasured capacity. One process-wide `SharedQuotaLedger` is used across these calls, so provider-declared topology and response observations affect later admissions. `quota_state` exposes the current typed graph and observation bindings for inspection. Ordinary `route_pool` / `infer_pool` remain unchanged and do not implicitly opt into quota enforcement.
 
 Quota-aware execution can now consume mapped provider snapshots during failover. `QuotaLedger` owns both the quota graph and its `QuotaObservationMap`; `infer_with_quota` settles local usage, then applies authoritative mapped `remaining` snapshots before considering the next candidate. That means a response from one credential can immediately exhaust a shared account bucket and suppress sibling credentials, while unbound/mismatched observations remain diagnostic-only. A regression also covers concurrent reservations so releasing one request cannot erase another request\x27s held capacity.
 

@@ -13,6 +13,7 @@ mod quota;
 mod quota_headers;
 mod router;
 mod selection;
+mod shared_quota;
 mod structured_output;
 mod suitability;
 
@@ -65,6 +66,7 @@ pub use selection::{
     InferenceRequestTemplate, ModelRouteSelectionCandidate, ModelSelectionEvidence,
     ModelSelectionPlan, ModelSelectionPolicy, ModelSelectionRejection, SuitabilityUnknownPolicy,
 };
+pub use shared_quota::{SharedQuotaError, SharedQuotaLedger};
 pub use suitability::{
     BenchmarkAggregation, BenchmarkKind, BenchmarkRequirement, ModelSuitabilityReport,
     ModelSuitabilityRequirements, SuitabilityCheck, SuitabilityStatus,
