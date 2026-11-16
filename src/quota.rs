@@ -1123,6 +1123,7 @@ mod tests {
                 output_tokens: Some(60),
                 total_tokens: Some(81),
                 reasoning_tokens: Some(56),
+                cached_input_tokens: None,
             },
             tool_calls: Vec::new(),
             output_repairs: Vec::new(),

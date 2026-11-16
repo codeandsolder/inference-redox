@@ -1,13 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use crate::router::build_route_plan_with_affinity;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     BenchmarkCatalog, InferencePool, InferenceRequest, ModelCatalog, ModelSuitabilityReport,
     ModelSuitabilityRequirements, ProviderError, QuotaAdmissionReport, QuotaLedger, QuotaRouteKey,
     QuotaUnknownPolicy, RequestRequirements, RouteCandidate, RoutingStrategy, SuitabilityStatus,
-    build_route_plan, request_prompt_tokens,
+    request_prompt_tokens,
 };
 
 /// Request shape for work whose model has not been selected yet.
@@ -35,6 +36,9 @@ pub struct InferenceRequestTemplate {
     pub agentic: bool,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Opaque digest of the reusable cacheable prefix.
+    #[serde(default)]
+    pub cache_prefix_fingerprint: Option<String>,
     #[serde(default)]
     pub requirements: RequestRequirements,
 }
@@ -56,6 +60,7 @@ impl InferenceRequestTemplate {
             parallel_tool_calls: self.parallel_tool_calls,
             agentic: self.agentic,
             session_id: self.session_id.clone(),
+            cache_prefix_fingerprint: self.cache_prefix_fingerprint.clone(),
             requirements: self.requirements.clone(),
         }
     }
@@ -278,6 +283,8 @@ fn finish_plan(
     considered_models: usize,
     probed_models: usize,
     discovery: SelectionDiscovery,
+    affinity: &crate::CacheAffinityProfile,
+    now_unix: u64,
 ) -> Result<ModelSelectionPlan, ProviderError> {
     if discovery.endpoints.is_empty() {
         return Ok(empty_plan(
@@ -287,7 +294,13 @@ fn finish_plan(
             discovery.rejections,
         ));
     }
-    let route_plan = build_route_plan(strategy, request, discovery.endpoints)?;
+    let route_plan = build_route_plan_with_affinity(
+        strategy,
+        request,
+        discovery.endpoints,
+        Some(affinity),
+        now_unix,
+    )?;
     let mut candidates = Vec::with_capacity(route_plan.candidates.len());
     for route in route_plan.candidates {
         let route_key = QuotaRouteKey::from_endpoint(&route.endpoint);
@@ -440,6 +453,8 @@ impl InferencePool {
             considered_models,
             probed_models,
             discovery,
+            &self.cache_affinity_profile().await,
+            policy.now_unix,
         )
     }
 }
@@ -600,6 +615,7 @@ mod tests {
             parallel_tool_calls: None,
             agentic: false,
             session_id: None,
+            cache_prefix_fingerprint: None,
             requirements: RequestRequirements {
                 minimum_uptime_30m: None,
                 ..RequestRequirements::default()

@@ -812,6 +812,9 @@ pub struct InferenceRequest {
     /// Stable opaque conversation identifier. Required by routes whose terms/session policy demand it.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Opaque digest of the reusable prompt prefix, used only for observed cache affinity.
+    #[serde(default)]
+    pub cache_prefix_fingerprint: Option<String>,
     pub requirements: RequestRequirements,
 }
 
@@ -836,6 +839,7 @@ impl InferenceRequest {
             parallel_tool_calls: None,
             agentic: false,
             session_id: None,
+            cache_prefix_fingerprint: None,
             requirements: RequestRequirements::default(),
         }
     }
@@ -1304,6 +1308,9 @@ pub struct TokenUsage {
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+    /// Input tokens that the upstream explicitly reported reading from an existing cache.
+    #[serde(default)]
+    pub cached_input_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -1322,6 +1329,11 @@ impl TokenUsage {
             reasoning_tokens: usage
                 .pointer("/completion_tokens_details/reasoning_tokens")
                 .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
+                .and_then(Value::as_u64),
+            cached_input_tokens: usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+                .or_else(|| usage.pointer("/cache_read_input_tokens"))
                 .and_then(Value::as_u64),
         }
     }

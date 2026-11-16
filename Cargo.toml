@@ -2,7 +2,7 @@
 name = "inference-redox"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 description = "Provider-agnostic inference routing with shape-aware cost/latency selection"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codeandsolder/inference-redox"
@@ -31,3 +31,6 @@ expect_used = "deny"
 panic = "deny"
 todo = "deny"
 unimplemented = "deny"
+
+[lints.cargo]
+unused_dependencies = "deny"

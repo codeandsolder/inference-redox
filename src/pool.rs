@@ -1,17 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::router::{lowered_strict_schema, supports_request};
+use crate::router::{build_route_plan_with_affinity, lowered_strict_schema, supports_request};
 use crate::{
-    ConformanceProfile, InferenceProvider, InferenceRequest, InferenceRequestTemplate,
-    InferenceResponse, ModelCatalog, ModelLookup, ModelRouteClass, ModelRouteSelectionCandidate,
-    ProviderError, QuotaAdmission, QuotaAdmissionReport, QuotaAwareRoutePlan, QuotaDemand,
-    QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy, RouteCandidate, RoutePlan,
-    RoutingStrategy, build_route_plan, request_prompt_tokens,
+    CacheAffinityProfile, ConformanceProfile, InferenceProvider, InferenceRequest,
+    InferenceRequestTemplate, InferenceResponse, ModelCatalog, ModelLookup, ModelRouteClass,
+    ModelRouteSelectionCandidate, ProviderError, QuotaAdmission, QuotaAdmissionReport,
+    QuotaAwareRoutePlan, QuotaDemand, QuotaLedger, QuotaRouteKey, QuotaUnknownPolicy, RetryPolicy,
+    RouteCandidate, RoutePlan, RoutingStrategy, build_route_plan, request_prompt_tokens,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -35,6 +36,7 @@ impl ProviderInstanceKey {
 pub struct InferencePool {
     providers: BTreeMap<ProviderInstanceKey, Arc<dyn InferenceProvider>>,
     conformance: Arc<Mutex<ConformanceProfile>>,
+    cache_affinity: Arc<Mutex<CacheAffinityProfile>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +121,35 @@ pub enum QuotaInferenceError {
     LedgerInvariant(String),
 }
 
+/// A single-route dispatch plan: the selected endpoint is never silently replaced.
+fn single_candidate_plan(
+    candidate: &RouteCandidate,
+    prompt_tokens: u64,
+    expected_output_tokens: u64,
+) -> RoutePlan {
+    RoutePlan {
+        prompt_tokens,
+        expected_output_tokens,
+        cheapest_cost_usd: candidate.expected_cost_usd,
+        cost_ceiling_usd: candidate.expected_cost_usd,
+        candidates: vec![candidate.clone()],
+    }
+}
+
+fn ensure_synchronous_request(request: &InferenceRequest) -> Result<(), ProviderError> {
+    if request
+        .requirements
+        .allowed_route_classes
+        .contains(&ModelRouteClass::Batch)
+    {
+        Err(ProviderError::InvalidRequest(
+            "synchronous infer cannot admit batch routes; use the batch API".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn commit_successful_quota(
     ledger: &mut QuotaLedger,
     reservation: crate::QuotaReservationId,
@@ -200,6 +231,34 @@ impl InferencePool {
     /// Snapshot the current in-process conformance evidence.
     pub async fn conformance_profile(&self) -> ConformanceProfile {
         self.conformance.lock().await.clone()
+    }
+
+    /// Share short-lived observed prefix-cache evidence between pool instances.
+    #[must_use]
+    pub fn with_shared_cache_affinity_profile(
+        mut self,
+        profile: Arc<Mutex<CacheAffinityProfile>>,
+    ) -> Self {
+        self.cache_affinity = profile;
+        self
+    }
+
+    /// Current observed cache affinity, for introspection and checkpointing.
+    pub async fn cache_affinity_profile(&self) -> CacheAffinityProfile {
+        self.cache_affinity.lock().await.clone()
+    }
+
+    async fn record_cache_affinity(
+        &self,
+        request: &InferenceRequest,
+        endpoint: &crate::Endpoint,
+        response: &InferenceResponse,
+        now_unix: u64,
+    ) {
+        self.cache_affinity
+            .lock()
+            .await
+            .observe_response(request, endpoint, response, now_unix);
     }
 
     pub fn register<P>(&mut self, source: impl Into<String>, provider: Arc<P>)
@@ -338,7 +397,14 @@ impl InferencePool {
         request: &InferenceRequest,
     ) -> Result<RoutePlan, ProviderError> {
         let endpoints = self.endpoints(catalog, request).await?;
-        build_route_plan(strategy, request, endpoints)
+        let affinity = self.cache_affinity.lock().await;
+        build_route_plan_with_affinity(
+            strategy,
+            request,
+            endpoints,
+            Some(&affinity),
+            unix_time_seconds(),
+        )
     }
 
     pub(crate) async fn quota_admitted_endpoints(
@@ -409,7 +475,15 @@ impl InferencePool {
                 reports: discovery.reports,
             });
         }
-        let plan = build_route_plan(strategy, request, discovery.endpoints)?;
+        let affinity = self.cache_affinity.lock().await;
+        let plan = build_route_plan_with_affinity(
+            strategy,
+            request,
+            discovery.endpoints,
+            Some(&affinity),
+            now_unix,
+        )?;
+        drop(affinity);
         Ok(QuotaAwareRoutePlan {
             plan,
             quota_reports: discovery.reports,
@@ -544,13 +618,11 @@ impl InferencePool {
         let provider = self.providers.get(&instance).ok_or_else(|| {
             SelectedRouteExecutionError::RouteUnavailable(selected.canonical_id.clone())
         })?;
-        let plan = RoutePlan {
-            prompt_tokens: request_prompt_tokens(&request),
-            expected_output_tokens: request.expected_output_tokens,
-            cheapest_cost_usd: candidate.expected_cost_usd,
-            cost_ceiling_usd: candidate.expected_cost_usd,
-            candidates: vec![candidate.clone()],
-        };
+        let plan = single_candidate_plan(
+            &candidate,
+            request_prompt_tokens(&request),
+            request.expected_output_tokens,
+        );
         match provider.execute_plan(&request, &plan, retry).await {
             Ok(response) => {
                 commit_successful_quota(
@@ -563,14 +635,23 @@ impl InferencePool {
                 )
                 .map_err(|error| SelectedRouteExecutionError::Accounting(error.to_string()))?;
                 match crate::structured_output::validate_inference_response(&request, response) {
-                    Ok(response) => Ok(QuotaPooledInferenceResponse {
-                        quota_plan: QuotaAwareRoutePlan {
-                            plan,
-                            quota_reports: vec![validation.quota],
-                        },
-                        selected: candidate,
-                        response,
-                    }),
+                    Ok(response) => {
+                        self.record_cache_affinity(
+                            &request,
+                            &candidate.endpoint,
+                            &response,
+                            policy.now_unix,
+                        )
+                        .await;
+                        Ok(QuotaPooledInferenceResponse {
+                            quota_plan: QuotaAwareRoutePlan {
+                                plan,
+                                quota_reports: vec![validation.quota],
+                            },
+                            selected: candidate,
+                            response,
+                        })
+                    }
                     Err(failure) => {
                         self.record_runtime_schema_failure(&candidate.endpoint, &request, &failure)
                             .await;
@@ -608,16 +689,7 @@ impl InferencePool {
         ledger: &mut QuotaLedger,
         quota: QuotaExecutionContext,
     ) -> Result<QuotaPooledInferenceResponse, QuotaInferenceError> {
-        if request
-            .requirements
-            .allowed_route_classes
-            .contains(&ModelRouteClass::Batch)
-        {
-            return Err(QuotaRoutingError::Provider(ProviderError::InvalidRequest(
-                "synchronous infer cannot admit batch routes; use the batch API".to_owned(),
-            ))
-            .into());
-        }
+        ensure_synchronous_request(request).map_err(QuotaRoutingError::Provider)?;
         let quota_plan = self
             .route_with_quota(
                 catalog,
@@ -656,13 +728,11 @@ impl InferencePool {
             attempted += 1;
             let mut native_request = request.clone();
             native_request.model.clone_from(&candidate.endpoint.model);
-            let candidate_plan = RoutePlan {
-                prompt_tokens: quota_plan.plan.prompt_tokens,
-                expected_output_tokens: quota_plan.plan.expected_output_tokens,
-                cheapest_cost_usd: candidate.expected_cost_usd,
-                cost_ceiling_usd: candidate.expected_cost_usd,
-                candidates: vec![candidate.clone()],
-            };
+            let candidate_plan = single_candidate_plan(
+                &candidate,
+                quota_plan.plan.prompt_tokens,
+                quota_plan.plan.expected_output_tokens,
+            );
             match provider
                 .execute_plan(&native_request, &candidate_plan, retry)
                 .await
@@ -678,6 +748,13 @@ impl InferencePool {
                     )?;
                     match crate::structured_output::validate_inference_response(request, response) {
                         Ok(response) => {
+                            self.record_cache_affinity(
+                                request,
+                                &candidate.endpoint,
+                                &response,
+                                quota.now_unix,
+                            )
+                            .await;
                             return Ok(QuotaPooledInferenceResponse {
                                 quota_plan,
                                 selected: candidate,
@@ -721,15 +798,7 @@ impl InferencePool {
         request: &InferenceRequest,
         retry: RetryPolicy,
     ) -> Result<PooledInferenceResponse, ProviderError> {
-        if request
-            .requirements
-            .allowed_route_classes
-            .contains(&ModelRouteClass::Batch)
-        {
-            return Err(ProviderError::InvalidRequest(
-                "synchronous infer cannot admit batch routes; use the batch API".to_owned(),
-            ));
-        }
+        ensure_synchronous_request(request)?;
         let plan = self.route(catalog, strategy, request).await?;
         let mut attempted = 0_usize;
         let mut last_error = None;
@@ -744,13 +813,8 @@ impl InferencePool {
             attempted += 1;
             let mut native_request = request.clone();
             native_request.model.clone_from(&candidate.endpoint.model);
-            let candidate_plan = RoutePlan {
-                prompt_tokens: plan.prompt_tokens,
-                expected_output_tokens: plan.expected_output_tokens,
-                cheapest_cost_usd: candidate.expected_cost_usd,
-                cost_ceiling_usd: candidate.expected_cost_usd,
-                candidates: vec![candidate.clone()],
-            };
+            let candidate_plan =
+                single_candidate_plan(&candidate, plan.prompt_tokens, plan.expected_output_tokens);
             match provider
                 .execute_plan(&native_request, &candidate_plan, retry)
                 .await
@@ -758,6 +822,13 @@ impl InferencePool {
                 Ok(response) => {
                     match crate::structured_output::validate_inference_response(request, response) {
                         Ok(response) => {
+                            self.record_cache_affinity(
+                                request,
+                                &candidate.endpoint,
+                                &response,
+                                unix_time_seconds(),
+                            )
+                            .await;
                             return Ok(PooledInferenceResponse {
                                 plan,
                                 selected: candidate,
@@ -782,6 +853,12 @@ impl InferencePool {
             ProviderError::Request(format!("all {attempted} ranked provider candidates failed"))
         }))
     }
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn runtime_schema_transport(
@@ -961,6 +1038,7 @@ mod tests {
                     output_tokens: Some(20),
                     total_tokens: Some(30),
                     reasoning_tokens: None,
+                    cached_input_tokens: None,
                 },
                 tool_calls: Vec::new(),
                 output_repairs: Vec::new(),
@@ -1217,6 +1295,7 @@ mod tests {
             parallel_tool_calls: None,
             agentic: false,
             session_id: None,
+            cache_prefix_fingerprint: None,
             requirements: crate::RequestRequirements {
                 minimum_uptime_30m: None,
                 ..crate::RequestRequirements::default()

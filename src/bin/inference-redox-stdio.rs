@@ -10,13 +10,13 @@ use inference_redox::providers::{
     ollama::OllamaCloud, opencode::OpenCodeConsole, openrouter::OpenRouter,
 };
 use inference_redox::{
-    BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType, ConformanceProbe,
-    ConformanceProfile, InferencePool, InferenceProvider, InferenceRequest,
-    InferenceRequestTemplate, ModelCatalog, ModelLookup, ModelRouteSelectionCandidate,
-    ModelSelectionEvidence, ModelSelectionPolicy, ModelSuitabilityReport,
-    ModelSuitabilityRequirements, ProviderError, QuotaExecutionContext, QuotaGraph,
-    QuotaGraphSnapshot, QuotaLedger, QuotaObservationBinding, QuotaUnknownPolicy, RetryPolicy,
-    RoutingStrategy, SelectedRouteExecutionPolicy, SuitabilityUnknownPolicy,
+    BatchInferenceItem, BenchmarkCatalog, BenchmarkSource, BenchmarkTaskType,
+    CacheAffinityObservation, CacheAffinityProfile, ConformanceProbe, ConformanceProfile,
+    InferencePool, InferenceProvider, InferenceRequest, InferenceRequestTemplate, ModelCatalog,
+    ModelLookup, ModelRouteSelectionCandidate, ModelSelectionEvidence, ModelSelectionPolicy,
+    ModelSuitabilityReport, ModelSuitabilityRequirements, ProviderError, QuotaExecutionContext,
+    QuotaGraph, QuotaGraphSnapshot, QuotaLedger, QuotaObservationBinding, QuotaUnknownPolicy,
+    RetryPolicy, RoutingStrategy, SelectedRouteExecutionPolicy, SuitabilityUnknownPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,6 +37,8 @@ enum Operation {
     ValidateSelectedQuota,
     InferSelectedQuota,
     QuotaState,
+    CacheAffinityState,
+    CacheAffinityObserve,
     Models,
     ResolveModel,
     Suitability,
@@ -120,6 +122,8 @@ struct WireRequest {
     #[serde(default)]
     conformance: Option<WireConformanceRequest>,
     #[serde(default)]
+    cache_affinity_observation: Option<CacheAffinityObservation>,
+    #[serde(default)]
     request_template: Option<InferenceRequestTemplate>,
     #[serde(default)]
     selection: Option<WireModelSelectionPolicy>,
@@ -174,6 +178,7 @@ struct Providers {
     opencode: Option<Arc<OpenCodeConsole>>,
     opencode_go: Option<Arc<OpenCodeConsole>>,
     conformance: Arc<Mutex<ConformanceProfile>>,
+    cache_affinity: Arc<Mutex<CacheAffinityProfile>>,
     conformance_probe_lock: Arc<Mutex<()>>,
     conformance_cache_path: Arc<PathBuf>,
     quota: Arc<Mutex<QuotaLedger>>,
@@ -229,8 +234,9 @@ impl Providers {
     }
 
     fn pool(&self) -> InferencePool {
-        let mut pool =
-            InferencePool::new().with_shared_conformance_profile(Arc::clone(&self.conformance));
+        let mut pool = InferencePool::new()
+            .with_shared_conformance_profile(Arc::clone(&self.conformance))
+            .with_shared_cache_affinity_profile(Arc::clone(&self.cache_affinity));
         pool.register("openrouter", Arc::clone(&self.openrouter));
         if let Some(nvidia) = self.nvidia.as_ref() {
             pool.register("nvidia", Arc::clone(nvidia));
@@ -1168,6 +1174,47 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
         Operation::QuotaState => {
             handle_quota_state_operation(&providers, &stdout, request.id).await;
         }
+        Operation::CacheAffinityState => {
+            let snapshot = {
+                let mut profile = providers.cache_affinity.lock().await;
+                profile.prune(unix_time_seconds());
+                profile.clone()
+            };
+            write_json(
+                &stdout,
+                &WireSuccess {
+                    id: request.id,
+                    ok: true,
+                    result: snapshot,
+                },
+            )
+            .await;
+        }
+        Operation::CacheAffinityObserve => {
+            let Some(observation) = request.cache_affinity_observation else {
+                write_error(
+                    &stdout,
+                    request.id,
+                    "cache_affinity_observe requires cache_affinity_observation",
+                )
+                .await;
+                return;
+            };
+            let recorded = providers
+                .cache_affinity
+                .lock()
+                .await
+                .observe(observation, unix_time_seconds());
+            write_json(
+                &stdout,
+                &WireSuccess {
+                    id: request.id,
+                    ok: true,
+                    result: serde_json::json!({"recorded": recorded}),
+                },
+            )
+            .await;
+        }
         Operation::Route | Operation::Infer => {
             handle_openrouter_operation(&providers, &stdout, request).await;
         }
@@ -1180,7 +1227,7 @@ fn key_from_contents(contents: &str, name: &str) -> Option<String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = line.strip_prefix("export ").unwrap_or(line);
+        let line = line.trim_prefix("export ");
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -1314,6 +1361,9 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
     })
 }
 
+// Backpressure on JSONL input instead of unbounded concurrent requests.
+const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keys = load_api_keys()?;
@@ -1342,6 +1392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         opencode,
         opencode_go,
         conformance: Arc::new(Mutex::new(conformance)),
+        cache_affinity: Arc::new(Mutex::new(CacheAffinityProfile::default())),
         conformance_probe_lock: Arc::new(Mutex::new(())),
         conformance_cache_path: Arc::new(conformance_cache_path),
         quota: Arc::new(Mutex::new(QuotaLedger::new(QuotaGraph::new()))),
@@ -1350,13 +1401,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     let mut tasks = JoinSet::new();
-
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<WireRequest>(&line) {
             Ok(request) => {
+                while tasks.len() >= MAX_IN_FLIGHT_REQUESTS {
+                    if tasks.join_next().await.is_none() {
+                        break;
+                    }
+                }
                 tasks.spawn(handle(providers.clone(), Arc::clone(&stdout), request));
                 while tasks.try_join_next().is_some() {}
             }

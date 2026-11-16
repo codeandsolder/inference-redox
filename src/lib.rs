@@ -2,6 +2,7 @@
 
 mod batch;
 mod benchmarks;
+mod cache_affinity;
 mod catalog;
 mod conformance;
 mod inventory;
@@ -21,6 +22,9 @@ pub use batch::{BatchInferenceItem, BatchJob, BatchStatus};
 pub use benchmarks::{
     BenchmarkCatalog, BenchmarkObservation, BenchmarkSnapshot, BenchmarkSnapshotMeta,
     BenchmarkSource, BenchmarkTaskType, BenchmarkUnit,
+};
+pub use cache_affinity::{
+    CacheAffinityObservation, CacheAffinityProfile, DEFAULT_CACHE_AFFINITY_TTL_SECONDS,
 };
 pub use catalog::{
     ArtificialAnalysisBenchmarks, DesignArenaBenchmark, ModelArchitecture, ModelBenchmarks,

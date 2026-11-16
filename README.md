@@ -12,11 +12,34 @@ OpenRouter is the first backend. Its endpoint catalog is normalized into:
 - context and output limits;
 - schema/structured-output support;
 - reasoning support and normalized reasoning efforts;
-- implicit-cache capability (recorded now; warmed-cache-aware routing is intentionally deferred).
+- implicit-cache capability and optional observed warmed-prefix cache affinity in pooled routing.
 
 `FastestResponseCheap(x)` first filters incompatible/unhealthy endpoints, finds the cheapest endpoint for the *actual request shape*, admits endpoints costing at most `x × cheapest`, then ranks those by predicted response time:
 
 `latency + expected_output_tokens / throughput`
+
+### Observed warm-cache affinity
+
+Pooled routes can use cache *observations*, not merely advertised cache capability.
+Pass a stable opaque digest of the reusable prompt prefix as
+`cache_prefix_fingerprint` on `InferenceRequest` or `InferenceRequestTemplate`.
+A successful call with provider-reported cached input tokens records a five-minute
+route/endpoint/prefix/session observation. Implicit hits are probabilistic;
+observations decay continuously and expire, and a reported zero cache hit removes
+the matching evidence. The bridge shares the profile between its pool calls.
+It exposes `cache_affinity_state` to inspect its current evidence and
+`cache_affinity_observe` with `cache_affinity_observation` to submit externally
+measured evidence, including TTL, confidence and optional measured latency savings.
+
+When observed cache-read pricing is available, ranking discounts only the
+expected reused prefix-token cost, weighted by observation confidence and age.
+An explicit measured latency saving can likewise improve the time estimate.
+Affinity does not change feature admission, quota reservations, or the hard
+worst-case uncached cost ceiling during selected-route revalidation. It is
+deliberately opt-in: callers without a prefix fingerprint keep ordinary
+request-shape routing. The fingerprint should include all semantic content of the
+cacheable prefix and must be identical only when that exact prefix is reused;
+never send raw prompt text as the fingerprint.
 
 The primary response-time estimate uses p75 TTFT plus median output throughput; OpenRouter latency telemetry is normalized when the live per-model API reports milliseconds rather than documented seconds; p95 TTFT is the tail guard, then expected cost breaks ties. Throughput uses p50 because OpenRouter endpoint surfaces have shown inconsistent throughput-percentile direction/semantics; median throughput avoids turning that presentation detail into a routing assumption. Missing telemetry degrades the local ranking signal; it never delegates provider selection back to OpenRouter. Tiered endpoints such as Flex retain their native `service_tier` grammar. Transport, HTTP 408/429/5xx, and routable endpoint failures are retried with `Retry-After` support.
 
@@ -74,7 +97,7 @@ println!("{} via {} candidates", response.content, route.candidates.len());
 
 ## Long-lived stdio bridge
 
-`inference-redox-stdio` exposes the same normalized request and routing semantics to non-Rust callers as multiplexed JSONL. It keeps provider instances, endpoint/model/benchmark caches, and a live conformance profile warm, supports concurrent in-flight requests keyed by caller IDs, and drains outstanding requests before shutdown. Credentials may come from the process environment or `--env-file <path>`.
+`inference-redox-stdio` exposes the same normalized request and routing semantics to non-Rust callers as multiplexed JSONL. It keeps provider instances, endpoint/model/benchmark caches, and a live conformance profile warm, supports up to 64 concurrent in-flight requests keyed by caller IDs (applying stdin backpressure rather than spawning unbounded tasks), and drains outstanding requests before shutdown. Credentials may come from the process environment or `--env-file <path>`.
 
 The bridge is deliberately thin: provider-specific request grammar, capability filtering, request-shape cost calculation, service-tier handling, fallback and retry policy remain in the Rust adapter rather than being reimplemented by callers.
 

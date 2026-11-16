@@ -2092,6 +2092,7 @@ mod tests {
             parallel_tool_calls: None,
             agentic: false,
             session_id: None,
+            cache_prefix_fingerprint: None,
             requirements: crate::RequestRequirements {
                 response_schema: Some(ResponseSchema::JsonSchema {
                     name: "answer".to_owned(),
