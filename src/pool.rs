@@ -2426,7 +2426,12 @@ mod tests {
         graph.insert_resource(request_quota);
         graph.insert_resource(concurrent_quota);
         assert!(graph.bind(route.clone(), &request_id));
-        assert!(graph.bind(route, &concurrent_id));
+        assert!(graph.bind(route.clone(), &concurrent_id));
+        let demand = QuotaDemand {
+            requests: 1,
+            concurrent_requests: 1,
+            ..QuotaDemand::default()
+        };
         let ledger = SharedQuotaLedger::new(QuotaLedger::new(graph));
         let ledger_for_task = ledger.clone();
         let request = InferenceRequest::new("vendor/model", "hi", 8);
@@ -2448,20 +2453,7 @@ mod tests {
         let during = ledger.with_mut(|state| {
             (
                 state.graph().resource(&request_id).map(|r| r.remaining),
-                state.evaluate(
-                    &QuotaRouteKey {
-                        source: "nvidia".to_owned(),
-                        credential: None,
-                        provider: "nvidia".to_owned(),
-                        model: "vendor/native-model".to_owned(),
-                    },
-                    QuotaDemand {
-                        requests: 1,
-                        concurrent_requests: 1,
-                        ..QuotaDemand::default()
-                    },
-                    100,
-                ),
+                state.evaluate(&route, demand, 100),
             )
         })?;
         assert_eq!(during.0, Some(crate::QuotaAmount::Finite(2)));
@@ -2475,20 +2467,7 @@ mod tests {
             (
                 state.graph().resource(&request_id).map(|r| r.remaining),
                 state.graph().resource(&concurrent_id).map(|r| r.remaining),
-                state.evaluate(
-                    &QuotaRouteKey {
-                        source: "nvidia".to_owned(),
-                        credential: None,
-                        provider: "nvidia".to_owned(),
-                        model: "vendor/native-model".to_owned(),
-                    },
-                    QuotaDemand {
-                        requests: 1,
-                        concurrent_requests: 1,
-                        ..QuotaDemand::default()
-                    },
-                    100,
-                ),
+                state.evaluate(&route, demand, 100),
             )
         })?;
         assert_eq!(after.0, Some(crate::QuotaAmount::Finite(1)));
