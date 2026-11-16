@@ -1200,7 +1200,7 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
                 .await;
                 return;
             };
-            providers
+            let recorded = providers
                 .cache_affinity
                 .lock()
                 .await
@@ -1210,7 +1210,7 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
                 &WireSuccess {
                     id: request.id,
                     ok: true,
-                    result: serde_json::json!({"recorded": true}),
+                    result: serde_json::json!({"recorded": recorded}),
                 },
             )
             .await;

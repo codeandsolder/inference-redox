@@ -929,6 +929,9 @@ fn anthropic_usage(raw: &Value) -> TokenUsage {
         reasoning_tokens: raw
             .pointer("/usage/opencode/tokens/reasoning")
             .and_then(Value::as_u64),
+        cached_input_tokens: raw
+            .pointer("/usage/cache_read_input_tokens")
+            .and_then(Value::as_u64),
     }
 }
 
@@ -946,11 +949,33 @@ fn gemini_usage(raw: &Value) -> TokenUsage {
         reasoning_tokens: raw
             .pointer("/usageMetadata/thoughtsTokenCount")
             .and_then(Value::as_u64),
+        cached_input_tokens: raw
+            .pointer("/usageMetadata/cachedContentTokenCount")
+            .and_then(Value::as_u64),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_anthropic_and_gemini_cache_read_telemetry_is_normalized() {
+        let anthropic = serde_json::json!({
+            "usage": {"input_tokens": 100, "output_tokens": 5, "cache_read_input_tokens": 200}
+        });
+        let gemini = serde_json::json!({
+            "usageMetadata": {"promptTokenCount": 300, "cachedContentTokenCount": 250}
+        });
+        assert_eq!(
+            super::anthropic_usage(&anthropic).cached_input_tokens,
+            Some(200)
+        );
+        assert_eq!(super::gemini_usage(&gemini).cached_input_tokens, Some(250));
+        assert_eq!(
+            super::anthropic_usage(&serde_json::json!({})).cached_input_tokens,
+            None
+        );
+    }
+
     use super::*;
 
     fn metadata(value: Value) -> Result<ModelsDevModel, serde_json::Error> {

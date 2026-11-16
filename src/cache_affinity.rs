@@ -36,7 +36,7 @@ pub struct CacheAffinityProfile {
 
 impl CacheAffinityProfile {
     /// Record exact-route cache evidence. Invalid or already-expired observations are ignored.
-    pub fn observe(&mut self, observation: CacheAffinityObservation, now_unix: u64) {
+    pub fn observe(&mut self, observation: CacheAffinityObservation, now_unix: u64) -> bool {
         self.prune(now_unix);
         if observation.prefix_fingerprint.is_empty()
             || observation.endpoint_id.is_empty()
@@ -51,7 +51,7 @@ impl CacheAffinityProfile {
                 .latency_savings_seconds
                 .is_some_and(|value| !value.is_finite() || value < 0.0)
         {
-            return;
+            return false;
         }
         self.remove_exact(
             &observation.route,
@@ -71,6 +71,7 @@ impl CacheAffinityProfile {
                 self.observations.swap_remove(index);
             }
         }
+        true
     }
 
     /// Learn from explicit provider-reported cached token usage, not from catalog claims.
@@ -86,7 +87,7 @@ impl CacheAffinityProfile {
         let Some(prefix) = request.cache_prefix_fingerprint.as_deref() else {
             return;
         };
-        let Some(tokens) = observed_cached_prompt_tokens(&response.raw) else {
+        let Some(tokens) = response.usage.cached_input_tokens else {
             return;
         };
         let route = QuotaRouteKey::from_endpoint(endpoint);
@@ -94,7 +95,7 @@ impl CacheAffinityProfile {
             self.remove_exact(&route, &endpoint.id, prefix, request.session_id.as_deref());
             return;
         }
-        self.observe(
+        let _ = self.observe(
             CacheAffinityObservation {
                 route,
                 endpoint_id: endpoint.id.clone(),
@@ -215,42 +216,26 @@ impl CacheAffinityProfile {
     }
 }
 
-fn observed_cached_prompt_tokens(raw: &serde_json::Value) -> Option<u64> {
-    [
-        "/usage/prompt_tokens_details/cached_tokens",
-        "/usage/input_tokens_details/cached_tokens",
-        "/usage/cache_read_input_tokens",
-        "/usageMetadata/cachedContentTokenCount",
-        "/usage_metadata/cache_read_input_tokens",
-    ]
-    .into_iter()
-    .find_map(|path| raw.pointer(path).and_then(serde_json::Value::as_u64))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
 
     #[test]
-    fn recognizes_native_cache_telemetry_including_zero() {
+    fn openai_compatible_usage_normalizes_cached_tokens_including_zero() {
+        let raw = json!({"usage": {"prompt_tokens_details": {"cached_tokens": 240}}});
         assert_eq!(
-            observed_cached_prompt_tokens(
-                &json!({"usage": {"prompt_tokens_details": {"cached_tokens": 240}}})
-            ),
+            crate::TokenUsage::from_openai_compatible(&raw).cached_input_tokens,
             Some(240)
         );
+        let raw = json!({"usage": {"input_tokens_details": {"cached_tokens": 0}}});
         assert_eq!(
-            observed_cached_prompt_tokens(&json!({"usage": {"cache_read_input_tokens": 0}})),
+            crate::TokenUsage::from_openai_compatible(&raw).cached_input_tokens,
             Some(0)
         );
         assert_eq!(
-            observed_cached_prompt_tokens(
-                &json!({"usageMetadata": {"cachedContentTokenCount": 120}})
-            ),
-            Some(120)
+            crate::TokenUsage::from_openai_compatible(&json!({})).cached_input_tokens,
+            None
         );
-        assert_eq!(observed_cached_prompt_tokens(&json!({})), None);
     }
 }
 
@@ -398,7 +383,10 @@ mod routing_tests {
             model: None,
             provider: None,
             usage_cost_usd: None,
-            usage: crate::TokenUsage::default(),
+            usage: crate::TokenUsage {
+                cached_input_tokens: Some(cached_tokens),
+                ..crate::TokenUsage::default()
+            },
             tool_calls: vec![],
             output_repairs: vec![],
             quota_observations: vec![],
@@ -433,6 +421,28 @@ mod routing_tests {
             serde_json::from_str(&serde_json::to_string(&profile)?)?;
         assert_eq!(round_trip, profile);
         Ok(())
+    }
+
+    #[test]
+    fn cache_evidence_never_bleeds_across_endpoint_ids_sharing_a_quota_bucket() {
+        let original = endpoint("warm", 0.000_003, Some(0.000_000_2), 0.1);
+        let mut sibling = original.clone();
+        sibling.id = "different-endpoint-same-provider".to_owned();
+        assert_eq!(
+            QuotaRouteKey::from_endpoint(&original),
+            QuotaRouteKey::from_endpoint(&sibling)
+        );
+        let mut profile = CacheAffinityProfile::default();
+        assert!(profile.observe(observation(&original), 100));
+        let baseline = RouteCandidate {
+            endpoint: sibling,
+            expected_cost_usd: 0.003,
+            expected_response_p75_seconds: Some(1.0),
+            expected_response_p95_seconds: Some(2.0),
+        };
+        let mut adjusted = baseline.clone();
+        profile.adjust_candidate(&request(), 1000, &mut adjusted, 100);
+        assert_eq!(adjusted, baseline);
     }
 
     #[test]
