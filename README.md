@@ -99,6 +99,8 @@ println!("{} via {} candidates", response.content, route.candidates.len());
 
 `inference-redox-stdio` exposes the same normalized request and routing semantics to non-Rust callers as multiplexed JSONL. It keeps provider instances, endpoint/model/benchmark caches, and a live conformance profile warm, supports up to 64 concurrent in-flight requests keyed by caller IDs (applying stdin backpressure rather than spawning unbounded tasks), and drains outstanding requests before shutdown. Credentials may come from the process environment or `--env-file <path>`.
 
+Input is processed as bounded JSONL records rather than unbounded line buffering. Each request has a default 16 MiB line limit (excluding the newline), configurable using `INFERENCE_REDOX_MAX_REQUEST_BYTES` (a positive integer). Oversized or invalid UTF-8 records emit a JSONL error with `id: null` and are consumed through their newline; subsequent requests are accepted normally. This bounds each input record's memory usage independently of the 64-request in-flight cap.
+
 The bridge is deliberately thin: provider-specific request grammar, capability filtering, request-shape cost calculation, service-tier handling, fallback and retry policy remain in the Rust adapter rather than being reimplemented by callers.
 
 ## Model catalog and identity

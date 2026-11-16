@@ -21,7 +21,7 @@ use inference_redox::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
@@ -1349,6 +1349,71 @@ fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
 // Backpressure on JSONL input instead of unbounded concurrent requests.
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
+/// Default maximum decoded JSONL request size; callers can raise it when processing large prompts.
+const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+fn max_request_bytes() -> Result<usize, Box<dyn std::error::Error>> {
+    match env::var("INFERENCE_REDOX_MAX_REQUEST_BYTES") {
+        Ok(value) => {
+            let size = value.parse::<usize>()?;
+            if size == 0 {
+                return Err("INFERENCE_REDOX_MAX_REQUEST_BYTES must be positive".into());
+            }
+            Ok(size)
+        }
+        Err(env::VarError::NotPresent) => Ok(DEFAULT_MAX_REQUEST_BYTES),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Read one newline-delimited record without accumulating unbounded input.
+/// Oversized and invalid-UTF8 records are discarded through the next delimiter,
+/// allowing subsequent well-formed requests to proceed on the same stream.
+async fn next_bounded_jsonl<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    maximum: usize,
+) -> std::io::Result<Option<Result<String, &'static str>>> {
+    let mut bytes = Vec::new();
+    let mut over_limit = false;
+    let mut consumed_any = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if !consumed_any {
+                return Ok(None);
+            }
+            break;
+        }
+        let terminator = available.iter().position(|byte| *byte == b'\n');
+        let count = terminator.map_or(available.len(), |index| index + 1);
+        consumed_any = true;
+        if !over_limit {
+            let data = &available[..count - usize::from(terminator.is_some())];
+            if data.len() > maximum.saturating_sub(bytes.len()) {
+                bytes.clear();
+                over_limit = true;
+            } else {
+                bytes.extend_from_slice(data);
+            }
+        }
+        reader.consume(count);
+        if terminator.is_some() {
+            break;
+        }
+    }
+    if over_limit {
+        return Ok(Some(Err(
+            "request exceeds INFERENCE_REDOX_MAX_REQUEST_BYTES",
+        )));
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    Ok(Some(
+        String::from_utf8(bytes).map_err(|_| "request is not valid UTF-8"),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keys = load_api_keys()?;
@@ -1383,10 +1448,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quota: SharedQuotaLedger::new(QuotaLedger::new(QuotaGraph::new())),
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    let maximum = max_request_bytes()?;
     let mut tasks = JoinSet::new();
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = next_bounded_jsonl(&mut stdin, maximum).await? {
+        let line = match line {
+            Ok(line) => line,
+            Err(reason) => {
+                write_error(&stdout, Value::Null, reason).await;
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -1421,7 +1493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         BenchmarkSource, BenchmarkTaskType, Operation, WireRequest, key_from_contents,
-        load_conformance_profile, save_conformance_profile,
+        load_conformance_profile, next_bounded_jsonl, save_conformance_profile,
     };
     use inference_redox::{
         ConformanceObservation, ConformanceOutcome, ConformanceProbe, ConformanceProfile,
@@ -1430,6 +1502,69 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::process;
+
+    #[tokio::test]
+    async fn jsonl_reader_bounds_memory_and_recovers_after_bad_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = b"abcde\nabcdef\r\nxy\ninvalid\xff\nhi\r\n";
+        let mut reader = tokio::io::BufReader::with_capacity(2, &input[..]);
+        assert_eq!(
+            next_bounded_jsonl(&mut reader, 5).await?,
+            Some(Ok("abcde".to_owned()))
+        );
+        assert_eq!(
+            next_bounded_jsonl(&mut reader, 5).await?,
+            Some(Err("request exceeds INFERENCE_REDOX_MAX_REQUEST_BYTES")),
+        );
+        assert_eq!(
+            next_bounded_jsonl(&mut reader, 5).await?,
+            Some(Ok("xy".to_owned()))
+        );
+        assert_eq!(
+            next_bounded_jsonl(&mut reader, 20).await?,
+            Some(Err("request is not valid UTF-8")),
+        );
+        assert_eq!(
+            next_bounded_jsonl(&mut reader, 5).await?,
+            Some(Ok("hi".to_owned()))
+        );
+        assert_eq!(next_bounded_jsonl(&mut reader, 5).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jsonl_reader_accepts_eof_without_delimiter_and_empty_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = b"\n\r\nhello";
+        let mut reader = tokio::io::BufReader::with_capacity(1, &input[..]);
+        assert_eq!(
+            next_bounded_jsonl(&mut reader, 5).await?,
+            Some(Ok(String::new()))
+        );
+        assert_eq!(
+            next_bounded_jsonl(&mut reader, 5).await?,
+            Some(Ok(String::new()))
+        );
+        assert_eq!(
+            next_bounded_jsonl(&mut reader, 5).await?,
+            Some(Ok("hello".to_owned()))
+        );
+        assert_eq!(next_bounded_jsonl(&mut reader, 5).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jsonl_reader_skips_unterminated_oversized_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = b"abcdefghijkl";
+        let mut reader = tokio::io::BufReader::with_capacity(3, &input[..]);
+        assert_eq!(
+            next_bounded_jsonl(&mut reader, 4).await?,
+            Some(Err("request exceeds INFERENCE_REDOX_MAX_REQUEST_BYTES")),
+        );
+        assert_eq!(next_bounded_jsonl(&mut reader, 4).await?, None);
+        Ok(())
+    }
 
     #[test]
     fn env_file_parser_handles_export_quotes_and_crlf() {
