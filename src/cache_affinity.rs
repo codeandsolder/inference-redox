@@ -207,10 +207,10 @@ impl CacheAffinityProfile {
         }
         if let Some(saved) = observation.latency_savings_seconds {
             if let Some(seconds) = &mut candidate.expected_response_p75_seconds {
-                *seconds = (*seconds - saved * survival).max(0.0);
+                *seconds = saved.mul_add(-survival, *seconds).max(0.0);
             }
             if let Some(seconds) = &mut candidate.expected_response_p95_seconds {
-                *seconds = (*seconds - saved * survival).max(0.0);
+                *seconds = saved.mul_add(-survival, *seconds).max(0.0);
             }
         }
     }
@@ -362,7 +362,7 @@ mod routing_tests {
                 .id,
             "cold"
         );
-        let mut other_prefix = request.clone();
+        let mut other_prefix = request;
         other_prefix.cache_prefix_fingerprint = Some("different-prefix".to_owned());
         assert_eq!(
             route(&other_prefix, Some(&profile), 100)?.candidates[0]

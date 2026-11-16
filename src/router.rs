@@ -282,7 +282,7 @@ pub fn build_route_plan(
 
 /// Like `build_route_plan`, with optional fresh observed prefix-cache evidence.
 /// Quota reservations and dispatch cost limits must still use uncached worst-case costs.
-pub(crate) fn build_route_plan_with_affinity(
+pub fn build_route_plan_with_affinity(
     strategy: RoutingStrategy,
     request: &InferenceRequest,
     endpoints: Vec<Endpoint>,

@@ -483,6 +483,7 @@ impl InferencePool {
             Some(&affinity),
             now_unix,
         )?;
+        drop(affinity);
         Ok(QuotaAwareRoutePlan {
             plan,
             quota_reports: discovery.reports,
