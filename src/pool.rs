@@ -397,7 +397,7 @@ impl InferencePool {
         request: &InferenceRequest,
     ) -> Result<RoutePlan, ProviderError> {
         let endpoints = self.endpoints(catalog, request).await?;
-        let affinity = self.cache_affinity.lock().await.clone();
+        let affinity = self.cache_affinity.lock().await;
         build_route_plan_with_affinity(
             strategy,
             request,
@@ -475,7 +475,7 @@ impl InferencePool {
                 reports: discovery.reports,
             });
         }
-        let affinity = self.cache_affinity.lock().await.clone();
+        let affinity = self.cache_affinity.lock().await;
         let plan = build_route_plan_with_affinity(
             strategy,
             request,
