@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@00a63ba02d14f0868af9820edcab51a8da64939a # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@82886ae85915af41ea90bf225bdffb3d9d359f69 # main
     with:
       cargo-args: --workspace --all-targets --all-features
       ban-python-outside-ci: true
