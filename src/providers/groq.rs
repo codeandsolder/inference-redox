@@ -20,6 +20,7 @@ const DEFAULT_BASE_URL: &str = "https://api.groq.com/openai/v1";
 
 /// Direct `GroqCloud` adapter for recurring free-tier capacity.
 #[derive(Debug, Clone)]
+#[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct GroqCloud {
     client: Client,
     api_key: String,
@@ -36,7 +37,6 @@ struct CachedGroqModels {
 }
 
 impl GroqCloud {
-    #[must_use = "the returned provider owns the configured inference client"]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
@@ -48,7 +48,6 @@ impl GroqCloud {
         }
     }
 
-    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         base_url
             .into()
@@ -57,7 +56,6 @@ impl GroqCloud {
         self
     }
 
-    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self
@@ -65,7 +63,6 @@ impl GroqCloud {
 
     /// Assign an opaque logical upstream quota pool (organization/project). Multiple credentials
     /// with the same label share model-scoped Groq resources; the label must never be a secret.
-    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_quota_pool(mut self, quota_pool: impl Into<String>) -> Self {
         self.quota_pool = Some(quota_pool.into());
         self

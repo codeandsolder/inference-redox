@@ -20,6 +20,7 @@ const DEFAULT_BASE_URL: &str = "https://ai-gateway.kilo.ai/api/v1";
 
 /// Free-only Kilo Gateway adapter. Paid Kilo routes are intentionally excluded.
 #[derive(Debug, Clone)]
+#[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct KiloGateway {
     client: Client,
     api_key: Option<String>,
@@ -36,7 +37,6 @@ struct CachedModels {
 }
 
 impl KiloGateway {
-    #[must_use = "the returned provider owns the configured inference client"]
     pub fn new(api_key: Option<String>) -> Self {
         Self {
             client: Client::new(),
@@ -48,12 +48,10 @@ impl KiloGateway {
         }
     }
 
-    #[must_use = "the returned provider contains the anonymous access configuration"]
     pub fn anonymous() -> Self {
         Self::new(None)
     }
 
-    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         base_url
             .into()
@@ -62,7 +60,6 @@ impl KiloGateway {
         self
     }
 
-    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_quota_pool(mut self, quota_pool: impl Into<String>) -> Self {
         self.quota_pool = Some(quota_pool.into());
         self

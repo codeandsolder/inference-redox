@@ -52,6 +52,7 @@ impl MistralSurface {
 /// Native Mistral chat-completions adapter. `new` targets Studio; `codestral` targets the
 /// dedicated Codestral endpoint and keeps its independent credential/quota surface distinct.
 #[derive(Debug, Clone)]
+#[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct MistralCloud {
     client: Client,
     api_key: String,
@@ -69,12 +70,10 @@ struct CachedMistralModels {
 }
 
 impl MistralCloud {
-    #[must_use = "the returned provider owns the configured inference client"]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::for_surface(api_key.into(), MistralSurface::Studio, MISTRAL_BASE_URL)
     }
 
-    #[must_use = "the returned provider contains the Codestral access configuration"]
     pub fn codestral(api_key: impl Into<String>) -> Self {
         Self::for_surface(
             api_key.into(),
@@ -95,7 +94,6 @@ impl MistralCloud {
         }
     }
 
-    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         base_url
             .into()
@@ -104,13 +102,11 @@ impl MistralCloud {
         self
     }
 
-    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self
     }
 
-    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_quota_pool(mut self, quota_pool: impl Into<String>) -> Self {
         self.quota_pool = Some(quota_pool.into());
         self
