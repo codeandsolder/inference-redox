@@ -20,7 +20,7 @@ pub enum StandingTaskState {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandingTaskRecord<T> {
     pub id: String,
     pub task: T,
@@ -40,7 +40,7 @@ pub struct StandingTaskLease {
 }
 
 /// Lease-fenced queue of deferred tasks. The caller owns scheduling and storage.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StandingTaskQueue<T> {
     tasks: BTreeMap<String, StandingTaskRecord<T>>,
     next_lease_id: u64,
@@ -190,7 +190,6 @@ impl<T> StandingTaskQueue<T> {
         self.tasks.get(id)
     }
 
-    #[must_use]
     pub fn records(&self) -> impl Iterator<Item = &StandingTaskRecord<T>> {
         self.tasks.values()
     }
@@ -324,7 +323,7 @@ impl<T> StandingTaskQueue<T> {
             .sum()
     }
 
-    fn reap_expired_record(record: &mut StandingTaskRecord<T>, now_unix: u64) -> bool {
+    const fn reap_expired_record(record: &mut StandingTaskRecord<T>, now_unix: u64) -> bool {
         let expired = matches!(
             record.state,
             StandingTaskState::Leased {
