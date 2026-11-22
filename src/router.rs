@@ -8,14 +8,14 @@ use crate::{
 
 /// Cheap cross-model token estimate used only for routing/cost prediction.
 /// Callers can set `InferenceRequest::prompt_tokens` when they have a model tokenizer.
-#[must_use]
+#[must_use = "the returned estimate is needed for token budgeting"]
 pub fn approximate_prompt_tokens(prompt: &str) -> u64 {
     let bytes = u64::try_from(prompt.len()).unwrap_or(u64::MAX);
     bytes.div_ceil(4).max(1)
 }
 
 /// Resolve the prompt-token estimate used consistently by routing and quota admission.
-#[must_use]
+#[must_use = "the returned estimate is needed for request token budgeting"]
 pub fn request_prompt_tokens(request: &InferenceRequest) -> u64 {
     request.prompt_tokens.unwrap_or_else(|| {
         let system_tokens = request

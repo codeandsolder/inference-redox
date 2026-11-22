@@ -1,14 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
 
-use super::openai_compatible::{base_chat_body, execute_chat_with_retry, response_format};
+use super::native_catalog::NativeCatalog;
+use super::openai_compatible::{base_chat_body, response_format};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest,
     InferenceResponse, ModelCatalog, ModelRouteClass, NativeModelRecord, Pricing, ProviderError,
@@ -20,49 +17,29 @@ const DEFAULT_BASE_URL: &str = "https://ai-gateway.kilo.ai/api/v1";
 
 /// Free-only Kilo Gateway adapter. Paid Kilo routes are intentionally excluded.
 #[derive(Debug, Clone)]
+#[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct KiloGateway {
-    client: Client,
-    api_key: Option<String>,
-    base_url: String,
-    model_cache: Arc<Mutex<Option<CachedModels>>>,
-    catalog_ttl: Duration,
+    catalog: NativeCatalog<Option<String>>,
     quota_pool: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct CachedModels {
-    fetched_at: Instant,
-    models: Vec<NativeModelRecord>,
-}
-
 impl KiloGateway {
-    #[must_use]
     pub fn new(api_key: Option<String>) -> Self {
         Self {
-            client: Client::new(),
-            api_key,
-            base_url: DEFAULT_BASE_URL.to_owned(),
-            model_cache: Arc::new(Mutex::new(None)),
-            catalog_ttl: Duration::from_secs(60),
+            catalog: NativeCatalog::new(api_key, DEFAULT_BASE_URL),
             quota_pool: None,
         }
     }
 
-    #[must_use]
     pub fn anonymous() -> Self {
         Self::new(None)
     }
 
-    #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        base_url
-            .into()
-            .trim_end_matches('/')
-            .clone_into(&mut self.base_url);
+        self.catalog.set_base_url(base_url);
         self
     }
 
-    #[must_use]
     pub fn with_quota_pool(mut self, quota_pool: impl Into<String>) -> Self {
         self.quota_pool = Some(quota_pool.into());
         self
@@ -84,51 +61,16 @@ impl KiloGateway {
     }
 
     async fn native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
-        let mut cache = self.model_cache.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed() <= self.catalog_ttl
-        {
-            return Ok(cached.models.clone());
-        }
-        let stale = cache.as_ref().map(|cached| cached.models.clone());
-        drop(cache);
-        let fetched = async {
-            let response = self
-                .client
-                .get(format!("{}/models", self.base_url))
-                .send()
-                .await
-                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(ProviderError::Catalog(format!("HTTP {status}")));
-            }
-            let envelope: KiloModelEnvelope = response
-                .json()
-                .await
-                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-            Ok::<Vec<NativeModelRecord>, ProviderError>(
-                envelope
-                    .data
+        self.catalog
+            .models(async {
+                let models = self.catalog.fetch_models::<KiloModel>(None, false).await?;
+                Ok(models
                     .into_iter()
                     .filter(KiloModel::is_free)
                     .map(KiloModel::normalize)
-                    .collect(),
-            )
-        }
-        .await;
-        match fetched {
-            Ok(models) => {
-                cache = self.model_cache.lock().await;
-                *cache = Some(CachedModels {
-                    fetched_at: Instant::now(),
-                    models: models.clone(),
-                });
-                drop(cache);
-                Ok(models)
-            }
-            Err(error) => stale.ok_or(error),
-        }
+                    .collect())
+            })
+            .await
     }
 
     fn compile_body(request: &InferenceRequest) -> Result<Value, ProviderError> {
@@ -230,31 +172,17 @@ impl InferenceProvider for KiloGateway {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        let Some(candidate) = plan.candidates.first() else {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        };
-        if candidate.endpoint.source != "kilo" || candidate.endpoint.provider_key != "kilo" {
-            return Err(ProviderError::InvalidRequest(
-                "Kilo adapter received a non-Kilo route".to_owned(),
-            ));
-        }
-        let body = Self::compile_body(request)?;
-        execute_chat_with_retry(
-            &self.client,
-            self.api_key.as_deref(),
-            &format!("{}/chat/completions", self.base_url),
-            &body,
-            "kilo",
-            Some(0.0),
-            retry,
-        )
-        .await
+        self.catalog
+            .execute_free_chat(
+                self.catalog.api_key.as_deref(),
+                request,
+                plan,
+                retry,
+                ("kilo", "Kilo adapter received a non-Kilo route"),
+                Self::compile_body,
+            )
+            .await
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct KiloModelEnvelope {
-    data: Vec<KiloModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,14 +239,15 @@ mod tests {
 
     #[test]
     fn only_free_catalog_routes_are_retained() -> Result<(), Box<dyn std::error::Error>> {
-        let envelope: KiloModelEnvelope = serde_json::from_value(serde_json::json!({
-            "data": [
-                {"id":"paid/model","isFree":false,"context_length":1000},
-                {"id":"free/model:free","isFree":true,"context_length":2000,
-                 "top_provider":{"max_completion_tokens":500},
-                 "supported_parameters":["max_tokens","response_format"]}
-            ]
-        }))?;
+        let envelope: super::super::native_catalog::ModelEnvelope<KiloModel> =
+            serde_json::from_value(serde_json::json!({
+                "data": [
+                    {"id":"paid/model","isFree":false,"context_length":1000},
+                    {"id":"free/model:free","isFree":true,"context_length":2000,
+                     "top_provider":{"max_completion_tokens":500},
+                     "supported_parameters":["max_tokens","response_format"]}
+                ]
+            }))?;
         let models = envelope
             .data
             .into_iter()

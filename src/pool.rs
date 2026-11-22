@@ -152,19 +152,19 @@ fn ensure_synchronous_request(request: &InferenceRequest) -> Result<(), Provider
 }
 
 impl InferencePool {
-    #[must_use]
+    #[must_use = "the returned pool owns the routing and provider state"]
     pub fn new() -> Self {
         Self::default()
     }
 
-    #[must_use]
+    #[must_use = "the configured pool is returned rather than changing caller state"]
     pub fn with_conformance_profile(mut self, profile: ConformanceProfile) -> Self {
         self.conformance = Arc::new(Mutex::new(profile));
         self
     }
 
     /// Share mutable conformance evidence with a long-lived caller such as the stdio bridge.
-    #[must_use]
+    #[must_use = "the configured pool is returned rather than changing caller state"]
     pub fn with_shared_conformance_profile(
         mut self,
         profile: Arc<Mutex<ConformanceProfile>>,
@@ -179,7 +179,7 @@ impl InferencePool {
     }
 
     /// Share short-lived observed prefix-cache evidence between pool instances.
-    #[must_use]
+    #[must_use = "the configured pool is returned rather than changing caller state"]
     pub fn with_shared_cache_affinity_profile(
         mut self,
         profile: Arc<Mutex<CacheAffinityProfile>>,

@@ -11,7 +11,7 @@ pub enum BenchmarkSource {
 }
 
 impl BenchmarkSource {
-    #[must_use]
+    #[must_use = "the returned string identifies the benchmark query parameter"]
     pub const fn as_query_str(self) -> &'static str {
         match self {
             Self::ArtificialAnalysis => "artificial-analysis",
@@ -30,7 +30,7 @@ pub enum BenchmarkTaskType {
 }
 
 impl BenchmarkTaskType {
-    #[must_use]
+    #[must_use = "the returned string identifies the benchmark query parameter"]
     pub const fn as_query_str(self) -> &'static str {
         match self {
             Self::Coding => "coding",
@@ -111,7 +111,7 @@ impl BenchmarkCatalog {
         self.observations.extend(snapshot.observations);
     }
 
-    #[must_use]
+    #[must_use = "the returned records or request describe the selected model"]
     pub fn for_model(&self, canonical_id: &str) -> Vec<&BenchmarkObservation> {
         self.observations
             .iter()

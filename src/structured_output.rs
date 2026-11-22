@@ -58,7 +58,7 @@ struct RepairCandidate {
 /// Canonicalization is deliberately non-fatal: unsupported constructs remain in their original
 /// form rather than becoming a locally invented approximation. The original schema remains the
 /// authority for response validation.
-#[must_use]
+#[must_use = "the lowered schema is returned rather than modifying the input"]
 pub fn lower_json_schema(schema: &Value) -> Value {
     if contains_model_guidance(schema) || !has_lowering_opportunity(schema) {
         return schema.clone();
@@ -625,7 +625,7 @@ fn prefix_pointer(prefix: &str, path: &str) -> String {
 }
 
 /// Map a validator keyword failure onto the existing route-level schema capability model.
-#[must_use]
+#[must_use = "the returned feature identifies the keyword requirement"]
 pub fn schema_feature_for_validation_keyword(keyword: &str) -> Option<SchemaFeature> {
     match keyword {
         "oneOf" => Some(SchemaFeature::OneOf),

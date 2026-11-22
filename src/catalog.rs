@@ -134,7 +134,7 @@ pub enum ModelLookup {
 }
 
 impl ModelCatalog {
-    #[must_use]
+    #[must_use = "the returned lookup distinguishes resolved and ambiguous models"]
     pub fn resolve(&self, query: &str) -> ModelLookup {
         let query = query.trim();
         if query.is_empty() {
@@ -211,7 +211,7 @@ impl ModelCatalog {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned list identifies the canonical models"]
     pub fn canonical_models(&self) -> Vec<ResolvedModel> {
         let mut canonical_ids = BTreeSet::new();
         for model in &self.models {
@@ -308,12 +308,12 @@ impl ModelCatalog {
     }
 }
 
-#[must_use]
+#[must_use = "the returned identifier associates an unmatched model with the catalog"]
 pub fn provisional_canonical_id(native_id: &str) -> String {
     native_id.trim().to_ascii_lowercase()
 }
 
-#[must_use]
+#[must_use = "the normalized name is returned rather than modifying the input"]
 pub fn normalize_model_name(value: &str) -> String {
     value
         .chars()
@@ -322,7 +322,7 @@ pub fn normalize_model_name(value: &str) -> String {
         .collect()
 }
 
-#[must_use]
+#[must_use = "the normalized slug is returned rather than modifying the input"]
 pub fn normalize_model_slug(value: &str) -> String {
     let tail = value.rsplit('/').next().unwrap_or(value);
     let base = tail.split(':').next().unwrap_or(tail);

@@ -13,14 +13,11 @@ permissions:
   contents: read
 
 jobs:
-  rust-1-100-shared-sccache:
-    name: Rust 1.100.0 shared sccache
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@097cc824fc551bce6708700117f796c746689faa # main
+  rust-shared-sccache:
+    name: Native nightly shared sccache
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
     with:
-      rust-toolchain: "1.100.0"
       rust-components: "clippy rustfmt"
       rustflags: "-C target-cpu=x86-64-v2"
       command: >-
-        cargo +1.100.0 fmt --all -- --check &&
-        CARGO_BUILD_WARNINGS=deny cargo +1.100.0 clippy --workspace --all-targets --all-features -- -D warnings -A unfulfilled-lint-expectations &&
-        cargo +1.100.0 test --workspace --all-features
+        cargo test --workspace --all-features

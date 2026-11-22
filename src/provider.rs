@@ -43,7 +43,7 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
-    #[must_use]
+    #[must_use = "the returned phase distinguishes where the execution failed"]
     pub const fn execution_phase(&self) -> Option<ExecutionFailurePhase> {
         match self {
             Self::Execution { phase, .. } => Some(*phase),
@@ -51,7 +51,7 @@ impl ProviderError {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned observations are needed for quota accounting"]
     pub fn quota_observations(&self) -> &[QuotaObservation] {
         match self {
             Self::Execution {

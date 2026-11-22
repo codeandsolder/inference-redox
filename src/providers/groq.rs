@@ -1,14 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 
-use super::openai_compatible::{base_chat_body, execute_chat_with_retry, response_format};
+use super::native_catalog::NativeCatalog;
+use super::openai_compatible::{base_chat_body, response_format};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest,
     InferenceResponse, ModelCatalog, ModelRouteClass, NativeModelRecord, Pricing, ProviderError,
@@ -20,52 +18,32 @@ const DEFAULT_BASE_URL: &str = "https://api.groq.com/openai/v1";
 
 /// Direct `GroqCloud` adapter for recurring free-tier capacity.
 #[derive(Debug, Clone)]
+#[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct GroqCloud {
-    client: Client,
-    api_key: String,
-    base_url: String,
-    model_cache: Arc<Mutex<Option<CachedGroqModels>>>,
-    catalog_ttl: Duration,
+    catalog: NativeCatalog<String>,
     quota_pool: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct CachedGroqModels {
-    fetched_at: Instant,
-    models: Vec<NativeModelRecord>,
-}
-
 impl GroqCloud {
-    #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
-            api_key: api_key.into(),
-            base_url: DEFAULT_BASE_URL.to_owned(),
-            model_cache: Arc::new(Mutex::new(None)),
-            catalog_ttl: Duration::from_secs(60),
+            catalog: NativeCatalog::new(api_key.into(), DEFAULT_BASE_URL),
             quota_pool: None,
         }
     }
 
-    #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        base_url
-            .into()
-            .trim_end_matches('/')
-            .clone_into(&mut self.base_url);
+        self.catalog.set_base_url(base_url);
         self
     }
 
-    #[must_use]
     pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
-        self.catalog_ttl = ttl;
+        self.catalog.set_ttl(ttl);
         self
     }
 
     /// Assign an opaque logical upstream quota pool (organization/project). Multiple credentials
     /// with the same label share model-scoped Groq resources; the label must never be a secret.
-    #[must_use]
     pub fn with_quota_pool(mut self, quota_pool: impl Into<String>) -> Self {
         self.quota_pool = Some(quota_pool.into());
         self
@@ -105,54 +83,19 @@ impl GroqCloud {
     }
 
     async fn native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
-        let mut cache = self.model_cache.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed() <= self.catalog_ttl
-        {
-            return Ok(cached.models.clone());
-        }
-        let stale = cache.as_ref().map(|cached| cached.models.clone());
-        drop(cache);
-
-        let fetched = async {
-            let response = self
-                .client
-                .get(format!("{}/models", self.base_url))
-                .bearer_auth(&self.api_key)
-                .send()
-                .await
-                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(ProviderError::Catalog(format!("HTTP {status}")));
-            }
-            let envelope: GroqModelEnvelope = response
-                .json()
-                .await
-                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-            Ok::<Vec<NativeModelRecord>, ProviderError>(
-                envelope
-                    .data
+        self.catalog
+            .models(async {
+                let models = self
+                    .catalog
+                    .fetch_models::<GroqModel>(Some(&self.catalog.api_key), false)
+                    .await?;
+                Ok(models
                     .into_iter()
                     .filter(|model| model.active.unwrap_or(true))
                     .map(GroqModel::normalize)
-                    .collect(),
-            )
-        }
-        .await;
-
-        match fetched {
-            Ok(models) => {
-                cache = self.model_cache.lock().await;
-                *cache = Some(CachedGroqModels {
-                    fetched_at: Instant::now(),
-                    models: models.clone(),
-                });
-                drop(cache);
-                Ok(models)
-            }
-            Err(error) => stale.ok_or(error),
-        }
+                    .collect())
+            })
+            .await
     }
 
     fn reasoning_support(model: &str) -> ReasoningSupport {
@@ -336,31 +279,17 @@ impl InferenceProvider for GroqCloud {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        let Some(candidate) = plan.candidates.first() else {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        };
-        if candidate.endpoint.source != "groq" || candidate.endpoint.provider_key != "groq" {
-            return Err(ProviderError::InvalidRequest(
-                "Groq adapter received a non-Groq route".to_owned(),
-            ));
-        }
-        let body = Self::compile_body(request)?;
-        execute_chat_with_retry(
-            &self.client,
-            Some(&self.api_key),
-            &format!("{}/chat/completions", self.base_url),
-            &body,
-            "groq",
-            Some(0.0),
-            retry,
-        )
-        .await
+        self.catalog
+            .execute_free_chat(
+                Some(&self.catalog.api_key),
+                request,
+                plan,
+                retry,
+                ("groq", "Groq adapter received a non-Groq route"),
+                Self::compile_body,
+            )
+            .await
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct GroqModelEnvelope {
-    data: Vec<GroqModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -403,18 +332,19 @@ mod tests {
 
     #[test]
     fn parses_groq_model_record() -> Result<(), Box<dyn std::error::Error>> {
-        let envelope: GroqModelEnvelope = serde_json::from_value(serde_json::json!({
-            "object": "list",
-            "data": [{
-                "id": "openai/gpt-oss-120b",
-                "object": "model",
-                "created": 1_693_721_698,
-                "owned_by": "OpenAI",
-                "active": true,
-                "context_window": 131_072,
-                "max_completion_tokens": 65_536
-            }]
-        }))?;
+        let envelope: super::super::native_catalog::ModelEnvelope<GroqModel> =
+            serde_json::from_value(serde_json::json!({
+                "object": "list",
+                "data": [{
+                    "id": "openai/gpt-oss-120b",
+                    "object": "model",
+                    "created": 1_693_721_698,
+                    "owned_by": "OpenAI",
+                    "active": true,
+                    "context_window": 131_072,
+                    "max_completion_tokens": 65_536
+                }]
+            }))?;
         let normalized = envelope
             .data
             .into_iter()

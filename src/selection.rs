@@ -44,7 +44,7 @@ pub struct InferenceRequestTemplate {
 }
 
 impl InferenceRequestTemplate {
-    #[must_use]
+    #[must_use = "the returned records or request describe the selected model"]
     pub fn for_model(&self, model: impl Into<String>) -> InferenceRequest {
         InferenceRequest {
             model: model.into(),

@@ -33,7 +33,7 @@ pub struct BatchJob {
 }
 
 impl BatchJob {
-    #[must_use]
+    #[must_use = "the returned status determines whether more work remains"]
     pub const fn is_terminal(&self) -> bool {
         matches!(
             self.status,
@@ -44,7 +44,7 @@ impl BatchJob {
         )
     }
 
-    #[must_use]
+    #[must_use = "the returned outcome determines whether the batch succeeded"]
     pub fn is_success(&self) -> bool {
         self.status == BatchStatus::Completed
     }

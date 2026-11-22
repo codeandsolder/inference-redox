@@ -28,7 +28,7 @@ pub enum SchemaFeatureTransport {
 }
 
 impl SchemaFeatureTransport {
-    #[must_use]
+    #[must_use = "the returned parameter identifies the capability under evaluation"]
     pub const fn parameter(self) -> &'static str {
         match self {
             Self::StructuredOutputs => "structured_outputs",
@@ -36,7 +36,7 @@ impl SchemaFeatureTransport {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned string is the wire representation of this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::StructuredOutputs => "structured_outputs",
@@ -710,7 +710,7 @@ fn probe_route_plan(endpoint: Endpoint, request: &InferenceRequest) -> RoutePlan
 }
 
 impl ConformanceProbe {
-    #[must_use]
+    #[must_use = "the returned identifier distinguishes this conformance test"]
     pub fn test_id(self) -> String {
         match self {
             Self::BasicChat => "basic-chat".to_owned(),
@@ -740,7 +740,7 @@ impl ConformanceProbe {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned version identifies the conformance test contract"]
     pub const fn test_version(self) -> u32 {
         match self {
             Self::ReasoningOff
@@ -782,7 +782,7 @@ impl ConformanceProbe {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned parameter identifies the capability under evaluation"]
     pub const fn parameter(self) -> &'static str {
         match self {
             Self::BasicChat => "chat_completions",
@@ -810,7 +810,7 @@ impl ConformanceProbe {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned effort describes the reasoning configuration"]
     pub const fn reasoning_effort(self) -> Option<ReasoningEffort> {
         match self {
             Self::ReasoningOff => Some(ReasoningEffort::None),
@@ -838,7 +838,7 @@ impl ConformanceProbe {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned classification identifies a reasoning probe"]
     pub const fn is_reasoning_probe(self) -> bool {
         matches!(
             self,
@@ -853,7 +853,7 @@ impl ConformanceProbe {
         )
     }
 
-    #[must_use]
+    #[must_use = "the returned classification identifies a constraint probe"]
     pub const fn is_constraint_probe(self) -> bool {
         matches!(
             self,
@@ -871,7 +871,7 @@ impl ConformanceProbe {
         )
     }
 
-    #[must_use]
+    #[must_use = "the returned classification identifies a constraint stress probe"]
     pub const fn is_constraint_stress(self) -> bool {
         matches!(
             self,
@@ -884,7 +884,7 @@ impl ConformanceProbe {
         )
     }
 
-    #[must_use]
+    #[must_use = "the returned classification identifies a prompted constraint"]
     pub const fn is_prompted_constraint(self) -> bool {
         matches!(
             self,
@@ -892,7 +892,7 @@ impl ConformanceProbe {
         )
     }
 
-    #[must_use]
+    #[must_use = "the constructed request contains the probe configuration"]
     pub fn request(self, model: impl Into<String>) -> InferenceRequest {
         let model = model.into();
         match self {
@@ -1308,7 +1308,7 @@ pub struct ConformanceProfile {
 
 impl ConformanceProfile {
     /// Return a current-version cached observation for one exact probe scope.
-    #[must_use]
+    #[must_use = "the returned observation is needed to determine cached conformance evidence"]
     pub fn cached_probe(
         &self,
         endpoint: &Endpoint,

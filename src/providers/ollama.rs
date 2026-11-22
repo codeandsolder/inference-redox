@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 
+use super::native_catalog::{NativeCatalog, select_route};
 use super::openai_compatible::{base_chat_body, execute_json_with_retry, response_format};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, FunctionTool, InferenceProvider,
@@ -25,44 +23,25 @@ const FREE_STARTER_GEMMA4: &str = "gemma4:31b";
 /// This intentionally exposes only models explicitly documented as available on Ollama's free
 /// starter allowance. Other cloud models are omitted rather than risking paid credit usage.
 #[derive(Debug, Clone)]
+#[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct OllamaCloud {
-    client: Client,
-    api_key: String,
-    base_url: String,
-    model_cache: Arc<Mutex<Option<CachedOllamaModels>>>,
-    catalog_ttl: Duration,
-}
-
-#[derive(Debug, Clone)]
-struct CachedOllamaModels {
-    fetched_at: Instant,
-    models: Vec<NativeModelRecord>,
+    catalog: NativeCatalog<String>,
 }
 
 impl OllamaCloud {
-    #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
-            api_key: api_key.into(),
-            base_url: DEFAULT_BASE_URL.to_owned(),
-            model_cache: Arc::new(Mutex::new(None)),
-            catalog_ttl: Duration::from_secs(60),
+            catalog: NativeCatalog::new(api_key.into(), DEFAULT_BASE_URL),
         }
     }
 
-    #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        base_url
-            .into()
-            .trim_end_matches('/')
-            .clone_into(&mut self.base_url);
+        self.catalog.set_base_url(base_url);
         self
     }
 
-    #[must_use]
     pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
-        self.catalog_ttl = ttl;
+        self.catalog.set_ttl(ttl);
         self
     }
 
@@ -82,54 +61,19 @@ impl OllamaCloud {
     }
 
     async fn native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
-        let mut cache = self.model_cache.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed() <= self.catalog_ttl
-        {
-            return Ok(cached.models.clone());
-        }
-        let stale = cache.as_ref().map(|cached| cached.models.clone());
-        drop(cache);
-
-        let fetched = async {
-            let response = self
-                .client
-                .get(format!("{}/models", self.base_url))
-                .bearer_auth(&self.api_key)
-                .send()
-                .await
-                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(ProviderError::Catalog(format!("HTTP {status}")));
-            }
-            let envelope: OllamaModelEnvelope = response
-                .json()
-                .await
-                .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-            Ok::<Vec<NativeModelRecord>, ProviderError>(
-                envelope
-                    .data
+        self.catalog
+            .models(async {
+                let models = self
+                    .catalog
+                    .fetch_models::<OllamaModel>(Some(&self.catalog.api_key), false)
+                    .await?;
+                Ok(models
                     .into_iter()
                     .filter(OllamaModel::is_documented_free_starter)
                     .map(OllamaModel::normalize)
-                    .collect(),
-            )
-        }
-        .await;
-
-        match fetched {
-            Ok(models) => {
-                cache = self.model_cache.lock().await;
-                *cache = Some(CachedOllamaModels {
-                    fetched_at: Instant::now(),
-                    models: models.clone(),
-                });
-                drop(cache);
-                Ok(models)
-            }
-            Err(error) => stale.ok_or(error),
-        }
+                    .collect())
+            })
+            .await
     }
 
     fn function_tool(tool: &FunctionTool) -> Value {
@@ -316,22 +260,14 @@ impl InferenceProvider for OllamaCloud {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        let Some(candidate) = plan.candidates.first() else {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        };
-        if candidate.endpoint.source != "ollama-cloud"
-            || candidate.endpoint.provider_key != "ollama-cloud"
-        {
-            return Err(ProviderError::InvalidRequest(
-                "Ollama adapter received a non-Ollama route".to_owned(),
-            ));
-        }
-
+        select_route(request, plan, "ollama-cloud", || {
+            "Ollama adapter received a non-Ollama route".to_owned()
+        })?;
         let body = Self::compile_body(request)?;
         let response = execute_json_with_retry(
-            &self.client,
-            Some(&self.api_key),
-            &format!("{}/chat/completions", self.base_url),
+            &self.catalog.client,
+            Some(&self.catalog.api_key),
+            &format!("{}/chat/completions", self.catalog.base_url),
             &body,
             retry,
         )
@@ -360,11 +296,6 @@ impl InferenceProvider for OllamaCloud {
             raw,
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaModelEnvelope {
-    data: Vec<OllamaModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -415,13 +346,14 @@ mod tests {
 
     #[test]
     fn only_documented_free_starter_is_retained() -> Result<(), Box<dyn std::error::Error>> {
-        let envelope: OllamaModelEnvelope = serde_json::from_value(json!({
-            "object": "list",
-            "data": [
-                {"id": "gemma4:31b", "object": "model", "owned_by": "library"},
-                {"id": "gpt-oss:120b", "object": "model", "owned_by": "library"}
-            ]
-        }))?;
+        let envelope: super::super::native_catalog::ModelEnvelope<OllamaModel> =
+            serde_json::from_value(json!({
+                "object": "list",
+                "data": [
+                    {"id": "gemma4:31b", "object": "model", "owned_by": "library"},
+                    {"id": "gpt-oss:120b", "object": "model", "owned_by": "library"}
+                ]
+            }))?;
         let models = envelope
             .data
             .into_iter()

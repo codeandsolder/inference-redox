@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 
+use super::native_catalog::{NativeCatalog, select_route};
 use super::openai_compatible::{base_chat_body, execute_json_with_retry};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, FunctionTool, InferenceProvider,
@@ -52,29 +50,18 @@ impl MistralSurface {
 /// Native Mistral chat-completions adapter. `new` targets Studio; `codestral` targets the
 /// dedicated Codestral endpoint and keeps its independent credential/quota surface distinct.
 #[derive(Debug, Clone)]
+#[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct MistralCloud {
-    client: Client,
-    api_key: String,
-    base_url: String,
+    catalog: NativeCatalog<String>,
     surface: MistralSurface,
-    model_cache: Arc<Mutex<Option<CachedMistralModels>>>,
-    catalog_ttl: Duration,
     quota_pool: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct CachedMistralModels {
-    fetched_at: Instant,
-    models: Vec<NativeModelRecord>,
-}
-
 impl MistralCloud {
-    #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::for_surface(api_key.into(), MistralSurface::Studio, MISTRAL_BASE_URL)
     }
 
-    #[must_use]
     pub fn codestral(api_key: impl Into<String>) -> Self {
         Self::for_surface(
             api_key.into(),
@@ -85,32 +72,22 @@ impl MistralCloud {
 
     fn for_surface(api_key: String, surface: MistralSurface, base_url: &str) -> Self {
         Self {
-            client: Client::new(),
-            api_key,
-            base_url: base_url.to_owned(),
+            catalog: NativeCatalog::new(api_key, base_url),
             surface,
-            model_cache: Arc::new(Mutex::new(None)),
-            catalog_ttl: Duration::from_secs(60),
             quota_pool: None,
         }
     }
 
-    #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        base_url
-            .into()
-            .trim_end_matches('/')
-            .clone_into(&mut self.base_url);
+        self.catalog.set_base_url(base_url);
         self
     }
 
-    #[must_use]
     pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
-        self.catalog_ttl = ttl;
+        self.catalog.set_ttl(ttl);
         self
     }
 
-    #[must_use]
     pub fn with_quota_pool(mut self, quota_pool: impl Into<String>) -> Self {
         self.quota_pool = Some(quota_pool.into());
         self
@@ -132,50 +109,20 @@ impl MistralCloud {
     }
 
     async fn native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
-        let mut cache = self.model_cache.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed() <= self.catalog_ttl
-        {
-            return Ok(cached.models.clone());
-        }
-        let stale = cache.as_ref().map(|cached| cached.models.clone());
-        drop(cache);
-
-        match self.fetch_native_models().await {
-            Ok(models) => {
-                cache = self.model_cache.lock().await;
-                *cache = Some(CachedMistralModels {
-                    fetched_at: Instant::now(),
-                    models: models.clone(),
-                });
-                drop(cache);
-                Ok(models)
-            }
+        match self.catalog.models(self.fetch_native_models()).await {
             Err(_) if self.surface == MistralSurface::Codestral => {
-                Ok(stale.unwrap_or_else(|| vec![Self::codestral_fallback_record()]))
+                Ok(vec![Self::codestral_fallback_record()])
             }
-            Err(error) => stale.ok_or(error),
+            result => result,
         }
     }
 
     async fn fetch_native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
-        let response = self
-            .client
-            .get(format!("{}/models", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ProviderError::Catalog(format!("HTTP {status}")));
-        }
-        let envelope: MistralModelEnvelope = response
-            .json()
-            .await
-            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-        let models = envelope
-            .data
+        let models = self
+            .catalog
+            .fetch_models::<MistralModel>(Some(&self.catalog.api_key), false)
+            .await?;
+        let models = models
             .into_iter()
             .filter_map(|model| model.normalize(self.surface))
             .collect::<Vec<_>>();
@@ -548,22 +495,17 @@ impl InferenceProvider for MistralCloud {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        let Some(candidate) = plan.candidates.first() else {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        };
-        if candidate.endpoint.source != self.surface.source()
-            || candidate.endpoint.provider_key != self.surface.source()
-        {
-            return Err(ProviderError::InvalidRequest(format!(
+        let candidate = select_route(request, plan, self.surface.source(), || {
+            format!(
                 "{} adapter received a foreign route",
                 self.surface.provider_name()
-            )));
-        }
+            )
+        })?;
         let body = Self::compile_body(request)?;
         let response = execute_json_with_retry(
-            &self.client,
-            Some(&self.api_key),
-            &format!("{}/chat/completions", self.base_url),
+            &self.catalog.client,
+            Some(&self.catalog.api_key),
+            &format!("{}/chat/completions", self.catalog.base_url),
             &body,
             retry,
         )
@@ -597,11 +539,6 @@ impl InferenceProvider for MistralCloud {
             raw,
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct MistralModelEnvelope {
-    data: Vec<MistralModel>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

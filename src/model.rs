@@ -26,7 +26,7 @@ pub struct Percentiles {
 
 impl Percentiles {
     /// Returns p75, interpolating from nearby published samples when needed.
-    #[must_use]
+    #[must_use = "the returned quantile estimate is needed for latency scoring"]
     pub fn p75_or_interpolate(self) -> Option<f64> {
         self.p75.or_else(|| match (self.p50, self.p90) {
             (Some(p50), Some(p90)) => Some(f64::mul_add(p90 - p50, 0.625, p50)),
@@ -37,7 +37,7 @@ impl Percentiles {
     }
 
     /// Returns a p95 value, interpolating between p90 and p99 when the source omits p95.
-    #[must_use]
+    #[must_use = "the returned quantile estimate is needed for latency scoring"]
     pub fn p95_or_interpolate(self) -> Option<f64> {
         self.p95.or_else(|| match (self.p90, self.p99) {
             (Some(p90), Some(p99)) => Some(f64::mul_add(p99 - p90, 5.0 / 9.0, p90)),
@@ -85,7 +85,7 @@ pub struct Pricing {
 
 impl Pricing {
     /// Resolve prompt-length-dependent token rates.
-    #[must_use]
+    #[must_use = "the returned pricing accounts for the applicable tier"]
     pub fn effective(&self, prompt_tokens: u64) -> EffectivePricing {
         let mut effective = EffectivePricing {
             prompt_per_token: self.prompt_per_token,
@@ -116,7 +116,7 @@ impl Pricing {
     }
 
     /// Estimate uncached request cost for a request shape.
-    #[must_use]
+    #[must_use = "the returned cost estimate is needed for routing decisions"]
     pub fn expected_cost(&self, prompt_tokens: u64, output_tokens: u64) -> f64 {
         let effective = self.effective(prompt_tokens);
         let token_cost = effective.completion_per_token.mul_add(
@@ -141,7 +141,7 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    #[must_use]
+    #[must_use = "the returned string is the wire representation of this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -166,7 +166,7 @@ pub enum ReasoningSupport {
 }
 
 impl ReasoningSupport {
-    #[must_use]
+    #[must_use = "the returned capability decision determines whether the requested effort is supported"]
     pub fn supports(&self, effort: ReasoningEffort) -> bool {
         match self {
             Self::None => effort == ReasoningEffort::None,
@@ -297,7 +297,7 @@ impl SchemaFeature {
         Self::UnevaluatedItems,
         Self::LegacyTupleItems,
     ];
-    #[must_use]
+    #[must_use = "the returned string is the wire representation of this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OneOf => "one_of",
@@ -452,7 +452,7 @@ pub struct EndpointCapabilities {
 
 impl EndpointCapabilities {
     /// Effective parameter support, with observations overriding nominal claims.
-    #[must_use]
+    #[must_use = "the returned capability decision determines whether the parameter is supported"]
     pub fn supports_parameter(&self, parameter: &str) -> bool {
         if self.rejected_parameters.contains(parameter)
             || !self.adapter_parameters.contains(parameter)
@@ -464,7 +464,7 @@ impl EndpointCapabilities {
     }
 
     /// Whether every requested parameter is currently believed to work.
-    #[must_use]
+    #[must_use = "the returned capability decision determines whether all parameters are supported"]
     pub fn supports_parameters(&self, parameters: &BTreeSet<String>) -> bool {
         parameters
             .iter()
@@ -473,14 +473,14 @@ impl EndpointCapabilities {
 
     /// Positive route-local conformance evidence for a wire parameter. Provider/catalog claims
     /// deliberately do not satisfy this check.
-    #[must_use]
+    #[must_use = "the returned decision distinguishes verified capability evidence"]
     pub fn verified_parameter(&self, parameter: &str) -> bool {
         self.adapter_parameters.contains(parameter)
             && self.verified_parameters.contains(parameter)
             && !self.rejected_parameters.contains(parameter)
     }
 
-    #[must_use]
+    #[must_use = "the returned evidence describes the constraint enforcement mechanism"]
     pub fn constraint_enforcement(&self, parameter: &str) -> Option<ConstraintEnforcement> {
         self.constraint_enforcement.get(parameter).copied()
     }
@@ -489,7 +489,7 @@ impl EndpointCapabilities {
     /// positive evidence on this exact transport. Unknown and explicitly rejected features fail
     /// closed. Basic object/type/required/const/additionalProperties behavior is established by
     /// the base enforcement probe and therefore is not represented here.
-    #[must_use]
+    #[must_use = "the returned evidence determines whether the required schema features are verified"]
     pub fn verified_schema_feature_set(
         &self,
         parameter: &str,
@@ -503,7 +503,7 @@ impl EndpointCapabilities {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned transport identifies a supported structured-output path"]
     pub fn strict_output_transport_for_schema(
         &self,
         schema: &Value,
@@ -512,7 +512,7 @@ impl EndpointCapabilities {
     }
 
     /// Select strict structured-output transport under the caller's empirical-evidence policy.
-    #[must_use]
+    #[must_use = "the returned transport identifies a path satisfying the evidence policy"]
     pub fn strict_output_transport_for_schema_with_policy(
         &self,
         schema: &Value,
@@ -573,7 +573,7 @@ impl EndpointCapabilities {
     /// Select a semantics-preserving transport for a tool request. Native tools are preferred.
     /// Structured output may emulate exact, required, and auto choices only when the endpoint has
     /// enough evidence under the request's schema policy for the generated envelope.
-    #[must_use]
+    #[must_use = "the returned transport determines how tool calls can be represented"]
     pub fn tool_transport(&self, request: &InferenceRequest) -> Option<ToolTransport> {
         if request.tools.is_empty() || matches!(request.tool_choice, Some(ToolChoice::None)) {
             return None;
@@ -634,7 +634,7 @@ impl EndpointCapabilities {
     /// Effective support for one normalized reasoning effort. Exact conformance evidence
     /// overrides nominal provider metadata. When `require_verified` is true, nominal metadata
     /// alone is insufficient.
-    #[must_use]
+    #[must_use = "the returned capability decision determines whether the effort is usable"]
     pub fn supports_reasoning_effort(
         &self,
         effort: ReasoningEffort,
@@ -819,7 +819,7 @@ pub struct InferenceRequest {
 }
 
 impl InferenceRequest {
-    #[must_use]
+    #[must_use = "the returned request contains the supplied model and prompt"]
     pub fn new(
         model: impl Into<String>,
         prompt: impl Into<String>,
@@ -845,7 +845,7 @@ impl InferenceRequest {
     }
 
     /// Return the single function that the request requires unconditionally.
-    #[must_use]
+    #[must_use = "the returned tool identifies the required function"]
     pub fn exact_required_tool(&self) -> Option<&FunctionTool> {
         match self.tool_choice.as_ref() {
             Some(ToolChoice::Function { name }) => {
@@ -859,7 +859,7 @@ impl InferenceRequest {
     /// Build the schema used to emulate native tool turns through structured output. The envelope
     /// keeps text and calls independent, so `auto` can return text, calls, or both; an array keeps
     /// parallel/multiple calls representable.
-    #[must_use]
+    #[must_use = "the returned schema and features define the response requirement"]
     pub fn structured_tool_response_schema(&self) -> Option<(Value, BTreeSet<SchemaFeature>)> {
         if self.tools.is_empty() || matches!(self.tool_choice, Some(ToolChoice::None)) {
             return None;
@@ -923,7 +923,7 @@ impl InferenceRequest {
     }
 
     /// Canonicalize a generated tool-turn envelope without introducing new feature classes.
-    #[must_use]
+    #[must_use = "the returned schema and features define the lowered response requirement"]
     pub fn lowered_structured_tool_response_schema(
         &self,
     ) -> Option<(Value, BTreeSet<SchemaFeature>)> {
@@ -945,7 +945,7 @@ impl InferenceRequest {
 /// Basic object/type/required/const/additionalProperties(bool) behavior is established by
 /// the base enforcement probe. Any unrecognized validation keyword inserts `UnknownKeyword`, which
 /// can never be verified and therefore makes cross-transport translation fail closed.
-#[must_use]
+#[must_use = "the returned feature set defines the schema requirements"]
 pub fn schema_feature_requirements(schema: &Value) -> BTreeSet<SchemaFeature> {
     let mut features = BTreeSet::new();
     collect_root_schema_features(schema, &mut features);
