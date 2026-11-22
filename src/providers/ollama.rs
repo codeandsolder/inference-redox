@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::native_catalog::NativeCatalog;
+use super::native_catalog::{NativeCatalog, select_route};
 use super::openai_compatible::{base_chat_body, execute_json_with_retry, response_format};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, FunctionTool, InferenceProvider,
@@ -63,30 +63,15 @@ impl OllamaCloud {
     async fn native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
         self.catalog
             .models(async {
-                let response = self
+                let models = self
                     .catalog
-                    .client
-                    .get(format!("{}/models", self.catalog.base_url))
-                    .bearer_auth(&self.catalog.api_key)
-                    .send()
-                    .await
-                    .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(ProviderError::Catalog(format!("HTTP {status}")));
-                }
-                let envelope: OllamaModelEnvelope = response
-                    .json()
-                    .await
-                    .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-                Ok::<Vec<NativeModelRecord>, ProviderError>(
-                    envelope
-                        .data
-                        .into_iter()
-                        .filter(OllamaModel::is_documented_free_starter)
-                        .map(OllamaModel::normalize)
-                        .collect(),
-                )
+                    .fetch_models::<OllamaModel>(Some(&self.catalog.api_key), false)
+                    .await?;
+                Ok(models
+                    .into_iter()
+                    .filter(OllamaModel::is_documented_free_starter)
+                    .map(OllamaModel::normalize)
+                    .collect())
             })
             .await
     }
@@ -275,17 +260,9 @@ impl InferenceProvider for OllamaCloud {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        let Some(candidate) = plan.candidates.first() else {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        };
-        if candidate.endpoint.source != "ollama-cloud"
-            || candidate.endpoint.provider_key != "ollama-cloud"
-        {
-            return Err(ProviderError::InvalidRequest(
-                "Ollama adapter received a non-Ollama route".to_owned(),
-            ));
-        }
-
+        select_route(request, plan, "ollama-cloud", || {
+            "Ollama adapter received a non-Ollama route".to_owned()
+        })?;
         let body = Self::compile_body(request)?;
         let response = execute_json_with_retry(
             &self.catalog.client,
@@ -319,11 +296,6 @@ impl InferenceProvider for OllamaCloud {
             raw,
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaModelEnvelope {
-    data: Vec<OllamaModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,13 +346,14 @@ mod tests {
 
     #[test]
     fn only_documented_free_starter_is_retained() -> Result<(), Box<dyn std::error::Error>> {
-        let envelope: OllamaModelEnvelope = serde_json::from_value(json!({
-            "object": "list",
-            "data": [
-                {"id": "gemma4:31b", "object": "model", "owned_by": "library"},
-                {"id": "gpt-oss:120b", "object": "model", "owned_by": "library"}
-            ]
-        }))?;
+        let envelope: super::super::native_catalog::ModelEnvelope<OllamaModel> =
+            serde_json::from_value(json!({
+                "object": "list",
+                "data": [
+                    {"id": "gemma4:31b", "object": "model", "owned_by": "library"},
+                    {"id": "gpt-oss:120b", "object": "model", "owned_by": "library"}
+                ]
+            }))?;
         let models = envelope
             .data
             .into_iter()

@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::native_catalog::NativeCatalog;
-use super::openai_compatible::{base_chat_body, execute_chat_with_retry, response_format};
+use super::openai_compatible::{base_chat_body, response_format};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest,
     InferenceResponse, ModelCatalog, ModelRouteClass, NativeModelRecord, Pricing, ProviderError,
@@ -58,30 +58,11 @@ impl NvidiaNim {
     async fn native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
         self.catalog
             .models(async {
-                let response = self
+                let models = self
                     .catalog
-                    .client
-                    .get(format!("{}/models", self.catalog.base_url))
-                    .bearer_auth(&self.catalog.api_key)
-                    .send()
-                    .await
-                    .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-                let status = response.status();
-                if !status.is_success() {
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(ProviderError::Catalog(format!("HTTP {status}: {body}")));
-                }
-                let envelope: NvidiaModelEnvelope = response
-                    .json()
-                    .await
-                    .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-                Ok::<Vec<NativeModelRecord>, ProviderError>(
-                    envelope
-                        .data
-                        .into_iter()
-                        .map(NvidiaModel::normalize)
-                        .collect(),
-                )
+                    .fetch_models::<NvidiaModel>(Some(&self.catalog.api_key), true)
+                    .await?;
+                Ok(models.into_iter().map(NvidiaModel::normalize).collect())
             })
             .await
     }
@@ -164,31 +145,17 @@ impl InferenceProvider for NvidiaNim {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        let Some(candidate) = plan.candidates.first() else {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        };
-        if candidate.endpoint.source != "nvidia" || candidate.endpoint.provider_key != "nvidia" {
-            return Err(ProviderError::InvalidRequest(
-                "NVIDIA adapter received a non-NVIDIA route".to_owned(),
-            ));
-        }
-        let body = Self::compile_body(request)?;
-        execute_chat_with_retry(
-            &self.catalog.client,
-            Some(&self.catalog.api_key),
-            &format!("{}/chat/completions", self.catalog.base_url),
-            &body,
-            "nvidia",
-            Some(0.0),
-            retry,
-        )
-        .await
+        self.catalog
+            .execute_free_chat(
+                Some(&self.catalog.api_key),
+                request,
+                plan,
+                retry,
+                ("nvidia", "NVIDIA adapter received a non-NVIDIA route"),
+                Self::compile_body,
+            )
+            .await
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct NvidiaModelEnvelope {
-    data: Vec<NvidiaModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,15 +305,16 @@ mod tests {
 
     #[test]
     fn parses_openai_compatible_nvidia_model_record() -> Result<(), Box<dyn std::error::Error>> {
-        let envelope: NvidiaModelEnvelope = serde_json::from_value(serde_json::json!({
-            "object": "list",
-            "data": [{
-                "id": "nvidia/nemotron-3-ultra-550b-a55b",
-                "object": "model",
-                "created": 1_790_000_000,
-                "owned_by": "nvidia"
-            }]
-        }))?;
+        let envelope: super::super::native_catalog::ModelEnvelope<NvidiaModel> =
+            serde_json::from_value(serde_json::json!({
+                "object": "list",
+                "data": [{
+                    "id": "nvidia/nemotron-3-ultra-550b-a55b",
+                    "object": "model",
+                    "created": 1_790_000_000,
+                    "owned_by": "nvidia"
+                }]
+            }))?;
         let normalized = envelope
             .data
             .into_iter()

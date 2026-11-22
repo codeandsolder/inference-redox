@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::native_catalog::NativeCatalog;
-use super::openai_compatible::{base_chat_body, execute_chat_with_retry, response_format};
+use super::openai_compatible::{base_chat_body, response_format};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest,
     InferenceResponse, ModelCatalog, ModelRouteClass, NativeModelRecord, Pricing, ProviderError,
@@ -85,30 +85,15 @@ impl GroqCloud {
     async fn native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
         self.catalog
             .models(async {
-                let response = self
+                let models = self
                     .catalog
-                    .client
-                    .get(format!("{}/models", self.catalog.base_url))
-                    .bearer_auth(&self.catalog.api_key)
-                    .send()
-                    .await
-                    .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(ProviderError::Catalog(format!("HTTP {status}")));
-                }
-                let envelope: GroqModelEnvelope = response
-                    .json()
-                    .await
-                    .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-                Ok::<Vec<NativeModelRecord>, ProviderError>(
-                    envelope
-                        .data
-                        .into_iter()
-                        .filter(|model| model.active.unwrap_or(true))
-                        .map(GroqModel::normalize)
-                        .collect(),
-                )
+                    .fetch_models::<GroqModel>(Some(&self.catalog.api_key), false)
+                    .await?;
+                Ok(models
+                    .into_iter()
+                    .filter(|model| model.active.unwrap_or(true))
+                    .map(GroqModel::normalize)
+                    .collect())
             })
             .await
     }
@@ -294,31 +279,17 @@ impl InferenceProvider for GroqCloud {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        let Some(candidate) = plan.candidates.first() else {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        };
-        if candidate.endpoint.source != "groq" || candidate.endpoint.provider_key != "groq" {
-            return Err(ProviderError::InvalidRequest(
-                "Groq adapter received a non-Groq route".to_owned(),
-            ));
-        }
-        let body = Self::compile_body(request)?;
-        execute_chat_with_retry(
-            &self.catalog.client,
-            Some(&self.catalog.api_key),
-            &format!("{}/chat/completions", self.catalog.base_url),
-            &body,
-            "groq",
-            Some(0.0),
-            retry,
-        )
-        .await
+        self.catalog
+            .execute_free_chat(
+                Some(&self.catalog.api_key),
+                request,
+                plan,
+                retry,
+                ("groq", "Groq adapter received a non-Groq route"),
+                Self::compile_body,
+            )
+            .await
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct GroqModelEnvelope {
-    data: Vec<GroqModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,18 +332,19 @@ mod tests {
 
     #[test]
     fn parses_groq_model_record() -> Result<(), Box<dyn std::error::Error>> {
-        let envelope: GroqModelEnvelope = serde_json::from_value(serde_json::json!({
-            "object": "list",
-            "data": [{
-                "id": "openai/gpt-oss-120b",
-                "object": "model",
-                "created": 1_693_721_698,
-                "owned_by": "OpenAI",
-                "active": true,
-                "context_window": 131_072,
-                "max_completion_tokens": 65_536
-            }]
-        }))?;
+        let envelope: super::super::native_catalog::ModelEnvelope<GroqModel> =
+            serde_json::from_value(serde_json::json!({
+                "object": "list",
+                "data": [{
+                    "id": "openai/gpt-oss-120b",
+                    "object": "model",
+                    "created": 1_693_721_698,
+                    "owned_by": "OpenAI",
+                    "active": true,
+                    "context_window": 131_072,
+                    "max_completion_tokens": 65_536
+                }]
+            }))?;
         let normalized = envelope
             .data
             .into_iter()

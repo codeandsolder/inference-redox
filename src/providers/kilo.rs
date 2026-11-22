@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::native_catalog::NativeCatalog;
-use super::openai_compatible::{base_chat_body, execute_chat_with_retry, response_format};
+use super::openai_compatible::{base_chat_body, response_format};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, InferenceProvider, InferenceRequest,
     InferenceResponse, ModelCatalog, ModelRouteClass, NativeModelRecord, Pricing, ProviderError,
@@ -63,29 +63,12 @@ impl KiloGateway {
     async fn native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
         self.catalog
             .models(async {
-                let response = self
-                    .catalog
-                    .client
-                    .get(format!("{}/models", self.catalog.base_url))
-                    .send()
-                    .await
-                    .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(ProviderError::Catalog(format!("HTTP {status}")));
-                }
-                let envelope: KiloModelEnvelope = response
-                    .json()
-                    .await
-                    .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-                Ok::<Vec<NativeModelRecord>, ProviderError>(
-                    envelope
-                        .data
-                        .into_iter()
-                        .filter(KiloModel::is_free)
-                        .map(KiloModel::normalize)
-                        .collect(),
-                )
+                let models = self.catalog.fetch_models::<KiloModel>(None, false).await?;
+                Ok(models
+                    .into_iter()
+                    .filter(KiloModel::is_free)
+                    .map(KiloModel::normalize)
+                    .collect())
             })
             .await
     }
@@ -189,31 +172,17 @@ impl InferenceProvider for KiloGateway {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        let Some(candidate) = plan.candidates.first() else {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        };
-        if candidate.endpoint.source != "kilo" || candidate.endpoint.provider_key != "kilo" {
-            return Err(ProviderError::InvalidRequest(
-                "Kilo adapter received a non-Kilo route".to_owned(),
-            ));
-        }
-        let body = Self::compile_body(request)?;
-        execute_chat_with_retry(
-            &self.catalog.client,
-            self.catalog.api_key.as_deref(),
-            &format!("{}/chat/completions", self.catalog.base_url),
-            &body,
-            "kilo",
-            Some(0.0),
-            retry,
-        )
-        .await
+        self.catalog
+            .execute_free_chat(
+                self.catalog.api_key.as_deref(),
+                request,
+                plan,
+                retry,
+                ("kilo", "Kilo adapter received a non-Kilo route"),
+                Self::compile_body,
+            )
+            .await
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct KiloModelEnvelope {
-    data: Vec<KiloModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,14 +239,15 @@ mod tests {
 
     #[test]
     fn only_free_catalog_routes_are_retained() -> Result<(), Box<dyn std::error::Error>> {
-        let envelope: KiloModelEnvelope = serde_json::from_value(serde_json::json!({
-            "data": [
-                {"id":"paid/model","isFree":false,"context_length":1000},
-                {"id":"free/model:free","isFree":true,"context_length":2000,
-                 "top_provider":{"max_completion_tokens":500},
-                 "supported_parameters":["max_tokens","response_format"]}
-            ]
-        }))?;
+        let envelope: super::super::native_catalog::ModelEnvelope<KiloModel> =
+            serde_json::from_value(serde_json::json!({
+                "data": [
+                    {"id":"paid/model","isFree":false,"context_length":1000},
+                    {"id":"free/model:free","isFree":true,"context_length":2000,
+                     "top_provider":{"max_completion_tokens":500},
+                     "supported_parameters":["max_tokens","response_format"]}
+                ]
+            }))?;
         let models = envelope
             .data
             .into_iter()

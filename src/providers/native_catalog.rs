@@ -2,9 +2,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::{NativeModelRecord, ProviderError};
+use super::openai_compatible::execute_chat_with_retry;
+use crate::{
+    InferenceRequest, InferenceResponse, NativeModelRecord, ProviderError, RetryPolicy,
+    RouteCandidate, RoutePlan,
+};
 
 /// Connection configuration and refresh state shared by native model catalogs.
 /// A clone shares cached records, exactly as the individual adapters did.
@@ -21,6 +27,26 @@ pub(super) struct NativeCatalog<K> {
 struct CachedModels {
     fetched_at: Instant,
     models: Vec<NativeModelRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ModelEnvelope<M> {
+    pub(super) data: Vec<M>,
+}
+
+pub(super) fn select_route<'a>(
+    request: &InferenceRequest,
+    plan: &'a RoutePlan,
+    source: &str,
+    mismatch: impl FnOnce() -> String,
+) -> Result<&'a RouteCandidate, ProviderError> {
+    let Some(candidate) = plan.candidates.first() else {
+        return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
+    };
+    if candidate.endpoint.source != source || candidate.endpoint.provider_key != source {
+        return Err(ProviderError::InvalidRequest(mismatch()));
+    }
+    Ok(candidate)
 }
 
 impl<K> NativeCatalog<K> {
@@ -43,6 +69,64 @@ impl<K> NativeCatalog<K> {
 
     pub(super) const fn set_ttl(&mut self, ttl: Duration) {
         self.ttl = ttl;
+    }
+
+    pub(super) async fn fetch_models<M: DeserializeOwned>(
+        &self,
+        api_key: Option<&str>,
+        include_error_body: bool,
+    ) -> Result<Vec<M>, ProviderError> {
+        let request = self.client.get(format!("{}/models", self.base_url));
+        let request = if let Some(key) = api_key {
+            request.bearer_auth(key)
+        } else {
+            request
+        };
+        let response = request
+            .send()
+            .await
+            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let detail = if include_error_body {
+                format!(
+                    "HTTP {status}: {}",
+                    response.text().await.unwrap_or_default()
+                )
+            } else {
+                format!("HTTP {status}")
+            };
+            return Err(ProviderError::Catalog(detail));
+        }
+        let envelope: ModelEnvelope<M> = response
+            .json()
+            .await
+            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
+        Ok(envelope.data)
+    }
+
+    /// Free text-only adapters all use the same route check, request and response transport.
+    pub(super) async fn execute_free_chat(
+        &self,
+        api_key: Option<&str>,
+        request: &InferenceRequest,
+        plan: &RoutePlan,
+        retry: RetryPolicy,
+        provider: (&str, &str),
+        compile_body: impl FnOnce(&InferenceRequest) -> Result<Value, ProviderError>,
+    ) -> Result<InferenceResponse, ProviderError> {
+        select_route(request, plan, provider.0, || provider.1.to_owned())?;
+        let body = compile_body(request)?;
+        execute_chat_with_retry(
+            &self.client,
+            api_key,
+            &format!("{}/chat/completions", self.base_url),
+            &body,
+            provider.0,
+            Some(0.0),
+            retry,
+        )
+        .await
     }
 
     /// Return fresh cached data, refresh without holding the lock across I/O,

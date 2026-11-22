@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::native_catalog::NativeCatalog;
+use super::native_catalog::{NativeCatalog, select_route};
 use super::openai_compatible::{base_chat_body, execute_json_with_retry};
 use crate::{
     Endpoint, EndpointCapabilities, EndpointStats, FunctionTool, InferenceProvider,
@@ -118,24 +118,11 @@ impl MistralCloud {
     }
 
     async fn fetch_native_models(&self) -> Result<Vec<NativeModelRecord>, ProviderError> {
-        let response = self
+        let models = self
             .catalog
-            .client
-            .get(format!("{}/models", self.catalog.base_url))
-            .bearer_auth(&self.catalog.api_key)
-            .send()
-            .await
-            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ProviderError::Catalog(format!("HTTP {status}")));
-        }
-        let envelope: MistralModelEnvelope = response
-            .json()
-            .await
-            .map_err(|error| ProviderError::Catalog(error.to_string()))?;
-        let models = envelope
-            .data
+            .fetch_models::<MistralModel>(Some(&self.catalog.api_key), false)
+            .await?;
+        let models = models
             .into_iter()
             .filter_map(|model| model.normalize(self.surface))
             .collect::<Vec<_>>();
@@ -508,17 +495,12 @@ impl InferenceProvider for MistralCloud {
         plan: &RoutePlan,
         retry: RetryPolicy,
     ) -> Result<InferenceResponse, ProviderError> {
-        let Some(candidate) = plan.candidates.first() else {
-            return Err(ProviderError::NoEligibleEndpoint(request.model.clone()));
-        };
-        if candidate.endpoint.source != self.surface.source()
-            || candidate.endpoint.provider_key != self.surface.source()
-        {
-            return Err(ProviderError::InvalidRequest(format!(
+        let candidate = select_route(request, plan, self.surface.source(), || {
+            format!(
                 "{} adapter received a foreign route",
                 self.surface.provider_name()
-            )));
-        }
+            )
+        })?;
         let body = Self::compile_body(request)?;
         let response = execute_json_with_retry(
             &self.catalog.client,
@@ -557,11 +539,6 @@ impl InferenceProvider for MistralCloud {
             raw,
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct MistralModelEnvelope {
-    data: Vec<MistralModel>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
