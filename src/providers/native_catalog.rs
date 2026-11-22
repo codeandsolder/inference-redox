@@ -49,7 +49,7 @@ pub(super) fn select_route<'a>(
     Ok(candidate)
 }
 
-impl<K> NativeCatalog<K> {
+impl<K: Send + Sync> NativeCatalog<K> {
     pub(super) fn new(api_key: K, base_url: &str) -> Self {
         Self {
             client: Client::new(),
@@ -71,7 +71,7 @@ impl<K> NativeCatalog<K> {
         self.ttl = ttl;
     }
 
-    pub(super) async fn fetch_models<M: DeserializeOwned>(
+    pub(super) async fn fetch_models<M: DeserializeOwned + Send>(
         &self,
         api_key: Option<&str>,
         include_error_body: bool,
@@ -113,7 +113,7 @@ impl<K> NativeCatalog<K> {
         plan: &RoutePlan,
         retry: RetryPolicy,
         provider: (&str, &str),
-        compile_body: impl FnOnce(&InferenceRequest) -> Result<Value, ProviderError>,
+        compile_body: impl FnOnce(&InferenceRequest) -> Result<Value, ProviderError> + Send,
     ) -> Result<InferenceResponse, ProviderError> {
         select_route(request, plan, provider.0, || provider.1.to_owned())?;
         let body = compile_body(request)?;
@@ -133,7 +133,7 @@ impl<K> NativeCatalog<K> {
     /// and fall back to the previous successful snapshot on refresh failure.
     pub(super) async fn models(
         &self,
-        fetch: impl std::future::Future<Output = Result<Vec<NativeModelRecord>, ProviderError>>,
+        fetch: impl std::future::Future<Output = Result<Vec<NativeModelRecord>, ProviderError>> + Send,
     ) -> Result<Vec<NativeModelRecord>, ProviderError> {
         let cache = self.cached.lock().await;
         if let Some(cached) = cache.as_ref()
@@ -159,7 +159,6 @@ impl<K> NativeCatalog<K> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::future::ready;
 
     use super::*;
@@ -179,14 +178,14 @@ mod tests {
             records("first")
         );
         let clone = catalog.clone();
-        let polled = Cell::new(false);
+        let mut polled = false;
         let result = clone
             .models(async {
-                polled.set(true);
+                polled = true;
                 Ok(records("unexpected"))
             })
             .await?;
-        assert!(!polled.get());
+        assert!(!polled);
         assert_eq!(result, records("first"));
         Ok(())
     }
