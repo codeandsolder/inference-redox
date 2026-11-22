@@ -15,7 +15,7 @@ permissions:
 jobs:
   rust-1-100-shared-sccache:
     name: Rust 1.100.0 shared sccache
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@2376b14a6bc8263ab77013bd744248f49384b2fa # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@097cc824fc551bce6708700117f796c746689faa # main
     with:
       rust-toolchain: "1.100.0"
       rust-components: "clippy rustfmt"
