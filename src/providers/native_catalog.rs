@@ -72,3 +72,72 @@ impl<K> NativeCatalog<K> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::future::ready;
+
+    use super::*;
+
+    fn records(id: &str) -> Vec<NativeModelRecord> {
+        vec![NativeModelRecord {
+            id: id.to_owned(),
+            ..NativeModelRecord::default()
+        }]
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_is_shared_and_does_not_poll_fetch() -> Result<(), ProviderError> {
+        let catalog = NativeCatalog::new((), "https://catalog.invalid");
+        assert_eq!(
+            catalog.models(ready(Ok(records("first")))).await?,
+            records("first")
+        );
+        let clone = catalog.clone();
+        let polled = Cell::new(false);
+        let result = clone
+            .models(async {
+                polled.set(true);
+                Ok(records("unexpected"))
+            })
+            .await?;
+        assert!(!polled.get());
+        assert_eq!(result, records("first"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_stale_data_and_replaces_successful_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let catalog = NativeCatalog::new((), "https://catalog.invalid");
+        let error = || ProviderError::Catalog("unavailable".to_owned());
+        assert!(matches!(
+            catalog.models(ready(Err(error()))).await,
+            Err(ProviderError::Catalog(_))
+        ));
+        assert_eq!(
+            catalog.models(ready(Ok(records("first")))).await?,
+            records("first")
+        );
+        {
+            let mut cache = catalog.cached.lock().await;
+            cache.as_mut().ok_or("missing populated cache")?.fetched_at = Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .ok_or("cannot represent expired timestamp")?;
+        }
+        assert_eq!(catalog.models(ready(Err(error()))).await?, records("first"));
+        let refreshed = catalog
+            .models(async {
+                assert!(catalog.cached.try_lock().is_ok());
+                Ok(records("second"))
+            })
+            .await?;
+        assert_eq!(refreshed, records("second"));
+        assert_eq!(
+            catalog.models(ready(Err(error()))).await?,
+            records("second")
+        );
+        Ok(())
+    }
+}
