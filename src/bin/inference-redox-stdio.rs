@@ -1,5 +1,7 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -1238,35 +1240,70 @@ fn environment_key(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
-fn env_file_argument() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
-    let mut args = env::args_os().skip(1);
-    let Some(arg) = args.next() else {
-        return Ok(None);
-    };
-    if arg != "--env-file" {
-        return Err(format!("unknown argument: {}", arg.to_string_lossy()).into());
+#[derive(Debug, PartialEq, Eq)]
+struct StdioOptions {
+    env_file: Option<PathBuf>,
+    conformance_cache: Option<PathBuf>,
+    max_request_bytes: usize,
+}
+
+impl StdioOptions {
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut args = args.into_iter();
+        let mut env_file = None;
+        let mut conformance_cache = None;
+        let mut max_request_bytes = None;
+
+        while let Some(arg) = args.next() {
+            match arg.to_str() {
+                Some("--env-file") if env_file.is_none() => {
+                    env_file = Some(PathBuf::from(
+                        args.next()
+                            .filter(|value| !value.as_encoded_bytes().starts_with(b"--"))
+                            .ok_or("--env-file requires a path")?,
+                    ));
+                }
+                Some("--conformance-cache") if conformance_cache.is_none() => {
+                    conformance_cache = Some(PathBuf::from(
+                        args.next()
+                            .filter(|value| !value.as_encoded_bytes().starts_with(b"--"))
+                            .ok_or("--conformance-cache requires a path")?,
+                    ));
+                }
+                Some("--max-request-bytes") if max_request_bytes.is_none() => {
+                    let raw = args.next().ok_or("--max-request-bytes requires a value")?;
+                    let size = raw
+                        .to_str()
+                        .ok_or("--max-request-bytes must be a positive integer")?
+                        .parse::<NonZeroUsize>()
+                        .map_err(|_| "--max-request-bytes must be a positive integer")?;
+                    max_request_bytes = Some(size.get());
+                }
+                Some("--env-file" | "--conformance-cache" | "--max-request-bytes") => {
+                    return Err(format!("duplicate argument: {}", arg.to_string_lossy()).into());
+                }
+                _ => {
+                    return Err(format!("unknown argument: {}", arg.to_string_lossy()).into());
+                }
+            }
+        }
+
+        Ok(Self {
+            env_file,
+            conformance_cache,
+            max_request_bytes: max_request_bytes.unwrap_or(DEFAULT_MAX_REQUEST_BYTES),
+        })
     }
-    let Some(path) = args.next() else {
-        return Err("--env-file requires a path".into());
-    };
-    if let Some(extra) = args.next() {
-        return Err(format!("unexpected argument: {}", extra.to_string_lossy()).into());
-    }
-    Ok(Some(path.into()))
 }
 
 fn default_conformance_cache_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Some(path) = env::var_os("INFERENCE_REDOX_CONFORMANCE_CACHE") {
-        return Ok(PathBuf::from(path));
-    }
     if let Some(cache_home) = env::var_os("XDG_CACHE_HOME") {
         return Ok(PathBuf::from(cache_home)
             .join("inference-redox")
             .join("conformance-v1.json"));
     }
-    let home = env::var_os("HOME").ok_or(
-        "HOME is unset; set INFERENCE_REDOX_CONFORMANCE_CACHE for persistent probe caching",
-    )?;
+    let home = env::var_os("HOME")
+        .ok_or("HOME is unset; pass --conformance-cache for persistent probe caching")?;
     Ok(PathBuf::from(home)
         .join(".cache")
         .join("inference-redox")
@@ -1312,12 +1349,9 @@ struct ApiKeys {
     opencode: Option<String>,
 }
 
-fn load_api_keys() -> Result<ApiKeys, Box<dyn std::error::Error>> {
-    let env_file = env_file_argument()?;
+fn load_api_keys(env_file: Option<&Path>) -> Result<ApiKeys, Box<dyn std::error::Error>> {
     let from_file = |name: &str| -> Result<Option<String>, Box<dyn std::error::Error>> {
-        env_file
-            .as_deref()
-            .map_or(Ok(None), |path| key_from_env_file(path, name))
+        env_file.map_or(Ok(None), |path| key_from_env_file(path, name))
     };
     let openrouter = environment_key("OPENROUTER_API_KEY")
         .or(from_file("OPENROUTER_API_KEY")?)
@@ -1351,20 +1385,6 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
 /// Default maximum decoded JSONL request size; callers can raise it when processing large prompts.
 const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-
-fn max_request_bytes() -> Result<usize, Box<dyn std::error::Error>> {
-    match env::var("INFERENCE_REDOX_MAX_REQUEST_BYTES") {
-        Ok(value) => {
-            let size = value.parse::<usize>()?;
-            if size == 0 {
-                return Err("INFERENCE_REDOX_MAX_REQUEST_BYTES must be positive".into());
-            }
-            Ok(size)
-        }
-        Err(env::VarError::NotPresent) => Ok(DEFAULT_MAX_REQUEST_BYTES),
-        Err(error) => Err(error.into()),
-    }
-}
 
 /// Read one newline-delimited record without accumulating unbounded input.
 /// Oversized and invalid-UTF8 records are discarded through the next delimiter,
@@ -1402,9 +1422,7 @@ async fn next_bounded_jsonl<R: AsyncBufRead + Unpin>(
         }
     }
     if over_limit {
-        return Ok(Some(Err(
-            "request exceeds INFERENCE_REDOX_MAX_REQUEST_BYTES",
-        )));
+        return Ok(Some(Err("request exceeds --max-request-bytes")));
     }
     if bytes.last() == Some(&b'\r') {
         bytes.pop();
@@ -1416,8 +1434,12 @@ async fn next_bounded_jsonl<R: AsyncBufRead + Unpin>(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let keys = load_api_keys()?;
-    let conformance_cache_path = default_conformance_cache_path()?;
+    let options = StdioOptions::parse(env::args_os().skip(1))?;
+    let keys = load_api_keys(options.env_file.as_deref())?;
+    let conformance_cache_path = match options.conformance_cache {
+        Some(path) => path,
+        None => default_conformance_cache_path()?,
+    };
     let conformance = load_conformance_profile(&conformance_cache_path)?;
     let (opencode, opencode_go) = keys.opencode.map_or((None, None), |key| {
         (
@@ -1449,7 +1471,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut stdin = BufReader::new(tokio::io::stdin());
-    let maximum = max_request_bytes()?;
+    let maximum = options.max_request_bytes;
     let mut tasks = JoinSet::new();
     while let Some(line) = next_bounded_jsonl(&mut stdin, maximum).await? {
         let line = match line {
@@ -1492,8 +1514,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchmarkSource, BenchmarkTaskType, Operation, WireRequest, key_from_contents,
-        load_conformance_profile, next_bounded_jsonl, save_conformance_profile,
+        BenchmarkSource, BenchmarkTaskType, DEFAULT_MAX_REQUEST_BYTES, Operation, StdioOptions,
+        WireRequest, key_from_contents, load_conformance_profile, next_bounded_jsonl,
+        save_conformance_profile,
     };
     use inference_redox::{
         ConformanceObservation, ConformanceOutcome, ConformanceProbe, ConformanceProfile,
@@ -1502,6 +1525,58 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::process;
+
+    #[test]
+    fn stdio_options_are_explicit_and_order_independent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let defaults = StdioOptions::parse([])?;
+        assert_eq!(defaults.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES);
+        assert_eq!(defaults.env_file, None);
+        assert_eq!(defaults.conformance_cache, None);
+
+        let options = StdioOptions::parse(
+            [
+                "--max-request-bytes",
+                "4096",
+                "--conformance-cache",
+                "cache/profile.json",
+                "--env-file",
+                "credentials.env",
+            ]
+            .map(Into::into),
+        )?;
+        assert_eq!(options.max_request_bytes, 4096);
+        assert_eq!(options.env_file, Some("credentials.env".into()));
+        assert_eq!(options.conformance_cache, Some("cache/profile.json".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn stdio_options_reject_invalid_or_duplicate_arguments() {
+        for args in [
+            &["--unknown"][..],
+            &["--env-file"],
+            &["--env-file", "--conformance-cache"],
+            &["--conformance-cache"],
+            &["--conformance-cache", "--env-file"],
+            &["--max-request-bytes"],
+            &["--max-request-bytes", "0"],
+            &["--max-request-bytes", "-1"],
+            &["--max-request-bytes", "not-a-number"],
+            &[
+                "--max-request-bytes",
+                "9999999999999999999999999999999999999999999",
+            ],
+            &["--env-file", "a", "--env-file", "b"],
+            &["--conformance-cache", "a", "--conformance-cache", "b"],
+            &["--max-request-bytes", "1", "--max-request-bytes", "2"],
+        ] {
+            assert!(
+                StdioOptions::parse(args.iter().copied().map(Into::into)).is_err(),
+                "{args:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn jsonl_reader_bounds_memory_and_recovers_after_bad_records()
@@ -1514,7 +1589,7 @@ mod tests {
         );
         assert_eq!(
             next_bounded_jsonl(&mut reader, 5).await?,
-            Some(Err("request exceeds INFERENCE_REDOX_MAX_REQUEST_BYTES")),
+            Some(Err("request exceeds --max-request-bytes")),
         );
         assert_eq!(
             next_bounded_jsonl(&mut reader, 5).await?,
@@ -1560,7 +1635,7 @@ mod tests {
         let mut reader = tokio::io::BufReader::with_capacity(3, &input[..]);
         assert_eq!(
             next_bounded_jsonl(&mut reader, 4).await?,
-            Some(Err("request exceeds INFERENCE_REDOX_MAX_REQUEST_BYTES")),
+            Some(Err("request exceeds --max-request-bytes")),
         );
         assert_eq!(next_bounded_jsonl(&mut reader, 4).await?, None);
         Ok(())
