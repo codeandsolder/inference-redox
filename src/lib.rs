@@ -10,6 +10,9 @@ mod provider;
 mod quota;
 mod quota_headers;
 mod router;
+mod standing;
+mod standing_queue;
+mod standing_store;
 mod suitability;
 
 pub mod providers;
@@ -47,6 +50,15 @@ pub use quota::{
     SharedQuotaLedger,
 };
 pub use router::{approximate_prompt_tokens, build_route_plan, request_prompt_tokens};
+pub use standing::{
+    StandingInferenceTask, StandingOpportunity, StandingPlanStatus, StandingRouteFailure,
+    StandingTaskError, StandingTaskPlan, StandingTaskPolicy, StandingWorkload,
+};
+pub use standing_queue::{
+    StandingInferenceQueue, StandingQueueError, StandingTaskLease, StandingTaskQueue,
+    StandingTaskRecord, StandingTaskState,
+};
+pub use standing_store::{StandingQueueStore, StandingStoreError};
 pub use suitability::{
     BenchmarkKind, ModelSuitabilityReport, ModelSuitabilityRequirements, SuitabilityCheck,
     SuitabilityStatus,

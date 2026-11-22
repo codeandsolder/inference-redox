@@ -12,7 +12,7 @@ use inference_redox::{
     InferencePool, InferenceProvider, InferenceRequest, ModelCatalog, ModelLookup,
     ModelSuitabilityRequirements, PooledInferenceResponse, ProviderError, ProviderInventory,
     QuotaExecutionContext, QuotaGraph, QuotaLedger, QuotaObservationMap, QuotaUnknownPolicy,
-    RetryPolicy, RoutingStrategy, SharedQuotaLedger,
+    RetryPolicy, RoutingStrategy, SharedQuotaLedger, StandingInferenceTask,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +34,7 @@ enum Operation {
     ResolveModel,
     Suitability,
     QuotaState,
+    PlanStanding,
     SubmitBatch,
     BatchStatus,
     DeleteBatch,
@@ -75,6 +76,8 @@ struct WireRequest {
     probe: Option<ConformanceProbe>,
     #[serde(default)]
     suitability: Option<ModelSuitabilityRequirements>,
+    #[serde(default)]
+    standing_task: Option<StandingInferenceTask>,
     #[serde(default)]
     batch_model: Option<String>,
     #[serde(default)]
@@ -558,6 +561,45 @@ fn unix_time_seconds() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+async fn handle_standing_operation(
+    providers: &Providers,
+    stdout: &Arc<Mutex<tokio::io::Stdout>>,
+    wire: WireRequest,
+) {
+    let WireRequest {
+        id, standing_task, ..
+    } = wire;
+    let Some(task) = standing_task else {
+        write_error(stdout, id, "plan_standing requires standing_task").await;
+        return;
+    };
+    let catalog = match providers.catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            write_error(stdout, id, error.to_string()).await;
+            return;
+        }
+    };
+    let pool = providers.pool().await;
+    match pool
+        .plan_standing_task(&catalog, &task, &providers.quota, unix_time_seconds())
+        .await
+    {
+        Ok(plan) => {
+            write_json(
+                stdout,
+                &WireSuccess {
+                    id,
+                    ok: true,
+                    result: plan,
+                },
+            )
+            .await;
+        }
+        Err(error) => write_error(stdout, id, error.to_string()).await,
+    }
+}
+
 async fn handle_pool_operation(
     providers: &Providers,
     stdout: &Arc<Mutex<tokio::io::Stdout>>,
@@ -736,6 +778,10 @@ async fn handle(providers: Providers, stdout: Arc<Mutex<tokio::io::Stdout>>, req
         Operation::SubmitBatch | Operation::BatchStatus | Operation::DeleteBatch => {
             handle_batch_operation(&providers, &stdout, request).await;
         }
+        Operation::PlanStanding => {
+            handle_standing_operation(&providers, &stdout, request).await;
+        }
+        Operation::PlanStanding => handle_standing_operation(providers, stdout, wire).await,
         Operation::RoutePool | Operation::InferPool => {
             handle_pool_operation(&providers, &stdout, request).await;
         }
@@ -981,6 +1027,60 @@ mod tests {
             "op": "quota_state"
         }))?;
         assert!(matches!(wire.op, Operation::QuotaState));
+        Ok(())
+    }
+
+    #[test]
+    fn standing_plan_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "op": "plan_standing",
+            "standing_task": {
+                "id": "datasheet",
+                "workload": {
+                    "prompt": "extract fields",
+                    "expected_output_tokens": 128
+                }
+            }
+        }))?;
+        assert!(matches!(wire.op, Operation::PlanStanding));
+        assert_eq!(
+            wire.standing_task.as_ref().map(|task| task.id.as_str()),
+            Some("datasheet")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn standing_queue_wire_requests_deserialize() -> Result<(), serde_json::Error> {
+        for operation in [
+            "standing_enqueue",
+            "standing_tasks",
+            "standing_claim",
+            "standing_release",
+            "standing_complete",
+        ] {
+            let wire: WireRequest = serde_json::from_value(serde_json::json!({
+                "id": operation,
+                "op": operation,
+            }))?;
+            assert!(matches!(
+                wire.op,
+                Operation::StandingEnqueue
+                    | Operation::StandingTasks
+                    | Operation::StandingClaim
+                    | Operation::StandingRelease
+                    | Operation::StandingComplete
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plan_standing_wire_request_deserializes() -> Result<(), serde_json::Error> {
+        let wire: WireRequest =
+            serde_json::from_str(r#"{"id":1,"op":"plan_standing","standing_task":null}"#)?;
+        assert!(matches!(wire.op, Operation::PlanStanding));
         Ok(())
     }
 
