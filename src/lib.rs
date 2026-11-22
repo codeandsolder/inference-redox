@@ -15,6 +15,7 @@ mod router;
 mod selection;
 mod shared_quota;
 mod standing_queue;
+mod standing_store;
 mod structured_output;
 mod suitability;
 
@@ -71,6 +72,7 @@ pub use shared_quota::{SharedQuotaError, SharedQuotaLedger};
 pub use standing_queue::{
     StandingQueueError, StandingTaskLease, StandingTaskQueue, StandingTaskRecord, StandingTaskState,
 };
+pub use standing_store::{StandingQueueStore, StandingStoreError};
 pub use suitability::{
     BenchmarkAggregation, BenchmarkKind, BenchmarkRequirement, ModelSuitabilityReport,
     ModelSuitabilityRequirements, SuitabilityCheck, SuitabilityStatus,
