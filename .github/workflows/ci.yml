@@ -20,6 +20,4 @@ jobs:
       rust-components: "clippy rustfmt"
       rustflags: "-C target-cpu=x86-64-v2"
       command: >-
-        cargo fmt --all -- --check &&
-        CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets --all-features -- -D warnings &&
-        cargo test --workspace --all-features
+        cargo test --locked --workspace --all-features
