@@ -71,7 +71,7 @@ pub struct QuotaResource {
 }
 
 impl QuotaResource {
-    #[must_use]
+    #[must_use = "the returned quota resource represents a finite capacity"]
     pub fn finite(
         id: impl Into<String>,
         scope: QuotaScope,
@@ -90,7 +90,7 @@ impl QuotaResource {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned quota resource represents unknown capacity"]
     pub fn unknown(id: impl Into<String>, scope: QuotaScope, metric: QuotaMetric) -> Self {
         Self {
             id: QuotaResourceId(id.into()),
@@ -121,7 +121,7 @@ pub struct QuotaRouteKey {
 }
 
 impl QuotaRouteKey {
-    #[must_use]
+    #[must_use = "the returned value identifies the quota scope of the endpoint"]
     pub fn from_endpoint(endpoint: &Endpoint) -> Self {
         Self {
             source: endpoint.source.clone(),
@@ -145,7 +145,7 @@ pub struct QuotaDemand {
 }
 
 impl QuotaDemand {
-    #[must_use]
+    #[must_use = "the returned demand describes the request resource requirements"]
     pub const fn for_request(request: &InferenceRequest) -> Self {
         Self {
             requests: 1,
@@ -156,14 +156,14 @@ impl QuotaDemand {
         }
     }
 
-    #[must_use]
+    #[must_use = "the updated demand is returned rather than changing caller state"]
     pub const fn with_credits(mut self, credits: u64) -> Self {
         self.credits = Some(credits);
         self
     }
 
     /// Replace request estimates with provider-reported token counts where they are available.
-    #[must_use]
+    #[must_use = "the updated demand accounts for the observed usage"]
     pub const fn with_actual_usage(mut self, response: &crate::InferenceResponse) -> Self {
         if let Some(tokens) = response.usage.input_tokens {
             self.input_tokens = Some(tokens);
@@ -262,12 +262,12 @@ pub struct QuotaGraphSnapshot {
 }
 
 impl QuotaGraph {
-    #[must_use]
+    #[must_use = "the returned graph owns the quota resource state"]
     pub fn new() -> Self {
         Self::default()
     }
 
-    #[must_use]
+    #[must_use = "the returned snapshot represents the current quota state"]
     pub fn snapshot(&self) -> QuotaGraphSnapshot {
         QuotaGraphSnapshot {
             resources: self.resources.values().cloned().collect(),
@@ -286,7 +286,7 @@ impl QuotaGraph {
         self.resources.insert(resource.id.clone(), resource);
     }
 
-    #[must_use]
+    #[must_use = "the returned resource describes the requested quota entry"]
     pub fn resource(&self, id: &QuotaResourceId) -> Option<&QuotaResource> {
         self.resources.get(id)
     }
@@ -352,12 +352,12 @@ pub struct QuotaObservationBinding {
 }
 
 impl QuotaObservationMap {
-    #[must_use]
+    #[must_use = "the returned observation map owns the quota bindings"]
     pub fn new() -> Self {
         Self::default()
     }
 
-    #[must_use]
+    #[must_use = "the returned snapshot represents the current quota state"]
     pub fn snapshot(&self) -> Vec<QuotaObservationBinding> {
         self.bindings
             .iter()
@@ -460,7 +460,7 @@ pub struct QuotaLedger {
 }
 
 impl QuotaLedger {
-    #[must_use]
+    #[must_use = "the returned ledger owns the supplied quota graph"]
     pub fn new(graph: QuotaGraph) -> Self {
         Self {
             graph,
@@ -471,7 +471,7 @@ impl QuotaLedger {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned ledger contains the supplied observation mapping"]
     pub const fn with_observation_map(
         graph: QuotaGraph,
         observation_map: QuotaObservationMap,
@@ -485,7 +485,7 @@ impl QuotaLedger {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned graph describes the ledger resources"]
     pub const fn graph(&self) -> &QuotaGraph {
         &self.graph
     }
@@ -494,7 +494,7 @@ impl QuotaLedger {
         &mut self.graph
     }
 
-    #[must_use]
+    #[must_use = "the returned map associates observations with quota resources"]
     pub const fn observation_map(&self) -> &QuotaObservationMap {
         &self.observation_map
     }
@@ -503,7 +503,7 @@ impl QuotaLedger {
         &mut self.observation_map
     }
 
-    #[must_use]
+    #[must_use = "the returned evaluation describes the requested suitability or quota decision"]
     pub fn evaluate(
         &self,
         route: &QuotaRouteKey,

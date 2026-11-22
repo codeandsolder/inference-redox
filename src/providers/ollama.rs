@@ -40,7 +40,7 @@ struct CachedOllamaModels {
 }
 
 impl OllamaCloud {
-    #[must_use]
+    #[must_use = "the returned provider owns the configured inference client"]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
@@ -51,7 +51,7 @@ impl OllamaCloud {
         }
     }
 
-    #[must_use]
+    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         base_url
             .into()
@@ -60,7 +60,7 @@ impl OllamaCloud {
         self
     }
 
-    #[must_use]
+    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self

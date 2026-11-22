@@ -26,7 +26,7 @@ pub struct SharedQuotaLedger {
 }
 
 impl SharedQuotaLedger {
-    #[must_use]
+    #[must_use = "the returned shared quota wrapper owns the ledger"]
     pub fn new(ledger: QuotaLedger) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ledger)),

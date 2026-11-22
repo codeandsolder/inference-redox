@@ -199,12 +199,12 @@ impl OpenCodeModel {
 }
 
 impl OpenCodeConsole {
-    #[must_use]
+    #[must_use = "the returned provider owns the configured inference client"]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_surface(api_key.into(), OpenCodeSurface::PayAsYouGo)
     }
 
-    #[must_use]
+    #[must_use = "the returned provider contains the Go access configuration"]
     pub fn new_go(api_key: impl Into<String>) -> Self {
         Self::with_surface(api_key.into(), OpenCodeSurface::Go)
     }
@@ -225,7 +225,7 @@ impl OpenCodeConsole {
         }
     }
 
-    #[must_use]
+    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_inference_base(mut self, base: impl Into<String>) -> Self {
         base.into()
             .trim_end_matches('/')
@@ -233,13 +233,13 @@ impl OpenCodeConsole {
         self
     }
 
-    #[must_use]
+    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_models_dev_url(mut self, url: impl Into<String>) -> Self {
         self.models_dev_url = url.into();
         self
     }
 
-    #[must_use]
+    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self

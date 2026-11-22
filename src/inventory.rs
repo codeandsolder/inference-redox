@@ -60,7 +60,7 @@ pub struct ProviderInventory {
 }
 
 impl ProviderInventory {
-    #[must_use]
+    #[must_use = "the returned inventory contains reconciled model records"]
     pub fn reconcile(
         provider: impl Into<String>,
         native_models: Vec<NativeModelRecord>,
@@ -109,7 +109,7 @@ impl ProviderInventory {
         Self { provider, models }
     }
 
-    #[must_use]
+    #[must_use = "the returned count reports resolved inventory entries"]
     pub fn resolved_count(&self) -> usize {
         self.models
             .iter()
@@ -117,7 +117,7 @@ impl ProviderInventory {
             .count()
     }
 
-    #[must_use]
+    #[must_use = "the returned count reports unmatched inventory entries"]
     pub fn unmatched_count(&self) -> usize {
         self.models
             .iter()

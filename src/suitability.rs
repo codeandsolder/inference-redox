@@ -128,12 +128,12 @@ pub struct ModelSuitabilityReport {
 }
 
 impl ModelSuitabilityRequirements {
-    #[must_use]
+    #[must_use = "the returned evaluation describes the requested suitability or quota decision"]
     pub fn evaluate(&self, entry: &ModelCatalogEntry) -> ModelSuitabilityReport {
         self.evaluate_with_optional_benchmarks(entry, None)
     }
 
-    #[must_use]
+    #[must_use = "the returned suitability report incorporates benchmark evidence"]
     pub fn evaluate_with_benchmarks(
         &self,
         entry: &ModelCatalogEntry,
@@ -142,7 +142,7 @@ impl ModelSuitabilityRequirements {
         self.evaluate_with_optional_benchmarks(entry, Some(benchmarks))
     }
 
-    #[must_use]
+    #[must_use = "the returned query set identifies required benchmark evidence"]
     pub fn benchmark_queries(&self) -> BTreeSet<(BenchmarkSource, BenchmarkTaskType)> {
         self.benchmark_requirements
             .iter()
@@ -289,7 +289,7 @@ impl ModelSuitabilityRequirements {
 }
 impl ModelCatalog {
     /// Evaluate one metadata representative per canonical model without external benchmark snapshots.
-    #[must_use]
+    #[must_use = "the returned reports describe model suitability"]
     pub fn suitability_reports(
         &self,
         requirements: &ModelSuitabilityRequirements,
@@ -298,7 +298,7 @@ impl ModelCatalog {
     }
 
     /// Evaluate one metadata representative per canonical model with rich benchmark evidence.
-    #[must_use]
+    #[must_use = "the returned reports incorporate benchmark evidence"]
     pub fn suitability_reports_with_benchmarks(
         &self,
         requirements: &ModelSuitabilityRequirements,

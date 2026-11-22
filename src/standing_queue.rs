@@ -148,7 +148,7 @@ pub enum StandingQueueError {
 }
 
 impl<T> StandingTaskQueue<T> {
-    #[must_use]
+    #[must_use = "the returned queue owns the standing task records"]
     pub fn new() -> Self {
         Self::default()
     }
@@ -185,7 +185,7 @@ impl<T> StandingTaskQueue<T> {
         Ok(())
     }
 
-    #[must_use]
+    #[must_use = "the returned record identifies the requested standing task"]
     pub fn get(&self, id: &str) -> Option<&StandingTaskRecord<T>> {
         self.tasks.get(id)
     }

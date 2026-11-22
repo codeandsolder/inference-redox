@@ -94,7 +94,7 @@ impl OpenRouterServiceTier {
 }
 
 impl OpenRouter {
-    #[must_use]
+    #[must_use = "the returned provider owns the configured inference client"]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
@@ -110,7 +110,7 @@ impl OpenRouter {
         }
     }
 
-    #[must_use]
+    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
         self.base_url.clear();
@@ -118,7 +118,7 @@ impl OpenRouter {
         self
     }
 
-    #[must_use]
+    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub fn with_app_attribution(
         mut self,
         title: impl Into<String>,
@@ -129,13 +129,13 @@ impl OpenRouter {
         self
     }
 
-    #[must_use]
+    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub const fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
         self.catalog_ttl = ttl;
         self
     }
 
-    #[must_use]
+    #[must_use = "the configured provider is returned rather than changing caller state"]
     pub const fn with_benchmark_ttl(mut self, ttl: Duration) -> Self {
         self.benchmark_ttl = ttl;
         self
