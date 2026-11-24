@@ -15,7 +15,7 @@ permissions:
 jobs:
   rust-shared-sccache:
     name: Native nightly shared sccache
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
     with:
       rust-components: "clippy rustfmt"
       rustflags: "-C target-cpu=x86-64-v2"
