@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use reqwest::{
-    Client,
-    header::{HeaderMap, HeaderValue, USER_AGENT},
-};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
+use wreq::{
+    Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+};
 
 use super::openai_compatible::{
     JsonResponse, base_chat_body, execute_json_with_retry_headers, response_format,
@@ -289,9 +289,14 @@ impl OpenCodeConsole {
         let live_request = self
             .client
             .get(format!("{}/v1/models", self.inference_base))
+            .redirect(wreq::redirect::Policy::limited(10))
             .bearer_auth(&self.api_key)
             .send();
-        let metadata_request = self.client.get(&self.models_dev_url).send();
+        let metadata_request = self
+            .client
+            .get(self.models_dev_url.as_str())
+            .redirect(wreq::redirect::Policy::limited(10))
+            .send();
         let (live_response, metadata_response) =
             tokio::try_join!(live_request, metadata_request)
                 .map_err(|error| ProviderError::Catalog(error.to_string()))?;

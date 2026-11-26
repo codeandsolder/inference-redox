@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::Client;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::sync::Mutex;
+use wreq::Client;
 
 use super::openai_compatible::execute_chat_with_retry;
 use crate::{
@@ -76,7 +76,10 @@ impl<K: Send + Sync> NativeCatalog<K> {
         api_key: Option<&str>,
         include_error_body: bool,
     ) -> Result<Vec<M>, ProviderError> {
-        let request = self.client.get(format!("{}/models", self.base_url));
+        let request = self
+            .client
+            .get(format!("{}/models", self.base_url))
+            .redirect(wreq::redirect::Policy::limited(10));
         let request = if let Some(key) = api_key {
             request.bearer_auth(key)
         } else {

@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use reqwest::{
+use serde_json::{Map, Value, json};
+use tokio::time::{sleep, timeout};
+use wreq::{
     Client, StatusCode,
     header::{HeaderMap, RETRY_AFTER},
 };
-use serde_json::{Map, Value, json};
-use tokio::time::{sleep, timeout};
 
 use crate::{
     ExecutionFailurePhase, InferenceRequest, InferenceResponse, ProviderError, ResponseSchema,
@@ -77,7 +77,7 @@ fn retryable_status(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
-fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+fn retry_after(response: &wreq::Response) -> Option<Duration> {
     response
         .headers()
         .get(RETRY_AFTER)?
@@ -139,7 +139,11 @@ async fn execute_once(
     body: &Value,
     headers: &HeaderMap,
 ) -> Result<JsonResponse, AttemptFailure> {
-    let mut request = client.post(url).headers(headers.clone()).json(body);
+    let mut request = client
+        .post(url)
+        .redirect(wreq::redirect::Policy::limited(10))
+        .headers(headers.clone())
+        .json(body);
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     }
