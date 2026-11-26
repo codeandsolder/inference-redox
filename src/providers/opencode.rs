@@ -29,7 +29,7 @@ const PER_MILLION: f64 = 1_000_000.0;
 
 /// `OpenCode` Console pay-as-you-go adapter. Free-tier rows are intentionally excluded because
 /// `OpenCode` documents them as available only from the `OpenCode` client, not arbitrary API clients.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct OpenCodeConsole {
     client: Client,
@@ -39,6 +39,18 @@ pub struct OpenCodeConsole {
     model_cache: Arc<Mutex<Option<CachedModels>>>,
     catalog_ttl: Duration,
     surface: OpenCodeSurface,
+}
+
+impl std::fmt::Debug for OpenCodeConsole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenCodeConsole")
+            .field("inference_base", &self.inference_base)
+            .field("models_dev_url", &self.models_dev_url)
+            .field("catalog_ttl", &self.catalog_ttl)
+            .field("surface", &self.surface)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]

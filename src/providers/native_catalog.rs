@@ -14,13 +14,23 @@ use crate::{
 
 /// Connection configuration and refresh state shared by native model catalogs.
 /// A clone shares cached records, exactly as the individual adapters did.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct NativeCatalog<K> {
     pub(super) client: Client,
     pub(super) api_key: K,
     pub(super) base_url: String,
     ttl: Duration,
     cached: Arc<Mutex<Option<CachedModels>>>,
+}
+
+impl<K> std::fmt::Debug for NativeCatalog<K> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeCatalog")
+            .field("base_url", &self.base_url)
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]

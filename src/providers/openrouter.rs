@@ -25,7 +25,7 @@ use crate::{
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// `OpenRouter` adapter using its native chat-completions and endpoint-catalog grammars.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct OpenRouter {
     client: Client,
@@ -38,6 +38,17 @@ pub struct OpenRouter {
     benchmark_cache: Arc<Mutex<HashMap<(BenchmarkSource, BenchmarkTaskType), CachedBenchmarks>>>,
     catalog_ttl: Duration,
     benchmark_ttl: Duration,
+}
+
+impl std::fmt::Debug for OpenRouter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenRouter")
+            .field("base_url", &self.base_url)
+            .field("catalog_ttl", &self.catalog_ttl)
+            .field("benchmark_ttl", &self.benchmark_ttl)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
