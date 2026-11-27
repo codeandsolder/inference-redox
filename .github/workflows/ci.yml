@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -22,3 +23,19 @@ jobs:
       command: ":"
       test-suites: |
         [{"name":"native","cargo":["--workspace","--all-features"],"doctests":["--workspace","--all-features"]}]
+  duplicates:
+    uses: codeandsolder/ci-workflows/.github/workflows/clone-regression.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
+  strict-rust:
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@121c7f9e5f73be0b14c4dd5cb652de82f829ff1e # main
+    with:
+      cargo-args: --workspace --all-targets --all-features
+      ban-python-outside-ci: true
+  merge-gate:
+    name: CI merge gate
+    needs: [rust-shared-sccache, duplicates, strict-rust]
+    if: ${{ always() }}
+    uses: codeandsolder/ci-workflows/.github/workflows/merge-gate.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
+    with:
+      needs-json: ${{ toJSON(needs) }}
+      expected-results: |
+        [["rust-shared-sccache","success"],["duplicates","success"],["strict-rust","success"]]
