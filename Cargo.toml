@@ -9,7 +9,7 @@ repository = "https://github.com/codeandsolder/inference-redox"
 
 [dependencies]
 async-trait = "0.1.92"
-jsonschema = { version = "0.63.0", default-features = false }
+jsonschema = { version = "0.63.1", default-features = false }
 wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "aad8f97d78e40c4c9fc0ddbb0cf88af870f848ac", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
