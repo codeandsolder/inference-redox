@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::Client;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::sync::Mutex;
+use wreq::Client;
 
 use super::openai_compatible::execute_chat_with_retry;
 use crate::{
@@ -14,13 +14,23 @@ use crate::{
 
 /// Connection configuration and refresh state shared by native model catalogs.
 /// A clone shares cached records, exactly as the individual adapters did.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct NativeCatalog<K> {
     pub(super) client: Client,
     pub(super) api_key: K,
     pub(super) base_url: String,
     ttl: Duration,
     cached: Arc<Mutex<Option<CachedModels>>>,
+}
+
+impl<K> std::fmt::Debug for NativeCatalog<K> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeCatalog")
+            .field("base_url", &self.base_url)
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,7 +86,10 @@ impl<K: Send + Sync> NativeCatalog<K> {
         api_key: Option<&str>,
         include_error_body: bool,
     ) -> Result<Vec<M>, ProviderError> {
-        let request = self.client.get(format!("{}/models", self.base_url));
+        let request = self
+            .client
+            .get(format!("{}/models", self.base_url))
+            .redirect(wreq::redirect::Policy::limited(10));
         let request = if let Some(key) = api_key {
             request.bearer_auth(key)
         } else {

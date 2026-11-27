@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
+use wreq::{Client, StatusCode, header::RETRY_AFTER};
 
 use crate::model::STRUCTURED_TOOL_TRANSPORT_INSTRUCTION;
 use crate::{
@@ -25,7 +25,7 @@ use crate::{
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// `OpenRouter` adapter using its native chat-completions and endpoint-catalog grammars.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct OpenRouter {
     client: Client,
@@ -38,6 +38,17 @@ pub struct OpenRouter {
     benchmark_cache: Arc<Mutex<HashMap<(BenchmarkSource, BenchmarkTaskType), CachedBenchmarks>>>,
     catalog_ttl: Duration,
     benchmark_ttl: Duration,
+}
+
+impl std::fmt::Debug for OpenRouter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenRouter")
+            .field("base_url", &self.base_url)
+            .field("catalog_ttl", &self.catalog_ttl)
+            .field("benchmark_ttl", &self.benchmark_ttl)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -137,8 +148,12 @@ impl OpenRouter {
         self
     }
 
-    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
-        let mut request = self.client.request(method, url).bearer_auth(&self.api_key);
+    fn request(&self, method: wreq::Method, url: String) -> wreq::RequestBuilder {
+        let mut request = self
+            .client
+            .request(method, url)
+            .redirect(wreq::redirect::Policy::limited(10))
+            .bearer_auth(&self.api_key);
         if let Some(title) = self.app_title.as_ref() {
             request = request.header("X-Title", title);
         }
@@ -577,7 +592,7 @@ impl OpenRouter {
     ) -> Result<BatchJob, ProviderError> {
         let body = Self::compile_batch_submission(batch_model, items, provider)?;
         let response = self
-            .request(reqwest::Method::POST, format!("{}/batches", self.base_url))
+            .request(wreq::Method::POST, format!("{}/batches", self.base_url))
             .json(&body)
             .send()
             .await
@@ -606,7 +621,7 @@ impl OpenRouter {
         }
         let response = self
             .request(
-                reqwest::Method::GET,
+                wreq::Method::GET,
                 format!("{}/batches/{batch_id}", self.base_url),
             )
             .send()
@@ -637,7 +652,7 @@ impl OpenRouter {
         }
         let response = self
             .request(
-                reqwest::Method::DELETE,
+                wreq::Method::DELETE,
                 format!("{}/batches/{batch_id}", self.base_url),
             )
             .send()
@@ -660,7 +675,7 @@ impl OpenRouter {
     ) -> Result<InferenceResponse, OpenRouterAttemptFailure> {
         let body = Self::compile_body(request, plan, candidate);
         let response = self
-            .request(reqwest::Method::POST, url.to_owned())
+            .request(wreq::Method::POST, url.to_owned())
             .json(&body)
             .send()
             .await
@@ -1050,7 +1065,7 @@ impl OpenRouter {
         let url = format!("{}/models", self.base_url);
         let fetched = async {
             let response = self
-                .request(reqwest::Method::GET, url)
+                .request(wreq::Method::GET, url)
                 .send()
                 .await
                 .map_err(|error| ProviderError::Catalog(error.to_string()))?;
@@ -1120,7 +1135,7 @@ impl OpenRouter {
         );
         let fetched = async {
             let response = self
-                .request(reqwest::Method::GET, url)
+                .request(wreq::Method::GET, url)
                 .send()
                 .await
                 .map_err(|error| ProviderError::Catalog(error.to_string()))?;
@@ -1173,7 +1188,7 @@ impl OpenRouter {
         Ok(self.models().await?.resolve(query))
     }
 
-    fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    fn retry_after(response: &wreq::Response) -> Option<Duration> {
         response
             .headers()
             .get(RETRY_AFTER)
@@ -1838,7 +1853,7 @@ impl InferenceProvider for OpenRouter {
         let url = self.model_endpoint_url(model)?;
         let fetched = async {
             let response = self
-                .request(reqwest::Method::GET, url)
+                .request(wreq::Method::GET, url)
                 .send()
                 .await
                 .map_err(|error| ProviderError::Catalog(error.to_string()))?;

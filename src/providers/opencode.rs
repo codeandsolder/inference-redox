@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use reqwest::{
-    Client,
-    header::{HeaderMap, HeaderValue, USER_AGENT},
-};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
+use wreq::{
+    Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+};
 
 use super::openai_compatible::{
     JsonResponse, base_chat_body, execute_json_with_retry_headers, response_format,
@@ -29,7 +29,7 @@ const PER_MILLION: f64 = 1_000_000.0;
 
 /// `OpenCode` Console pay-as-you-go adapter. Free-tier rows are intentionally excluded because
 /// `OpenCode` documents them as available only from the `OpenCode` client, not arbitrary API clients.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[must_use = "the configured provider must be retained to issue inference requests"]
 pub struct OpenCodeConsole {
     client: Client,
@@ -39,6 +39,18 @@ pub struct OpenCodeConsole {
     model_cache: Arc<Mutex<Option<CachedModels>>>,
     catalog_ttl: Duration,
     surface: OpenCodeSurface,
+}
+
+impl std::fmt::Debug for OpenCodeConsole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenCodeConsole")
+            .field("inference_base", &self.inference_base)
+            .field("models_dev_url", &self.models_dev_url)
+            .field("catalog_ttl", &self.catalog_ttl)
+            .field("surface", &self.surface)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -289,9 +301,14 @@ impl OpenCodeConsole {
         let live_request = self
             .client
             .get(format!("{}/v1/models", self.inference_base))
+            .redirect(wreq::redirect::Policy::limited(10))
             .bearer_auth(&self.api_key)
             .send();
-        let metadata_request = self.client.get(&self.models_dev_url).send();
+        let metadata_request = self
+            .client
+            .get(self.models_dev_url.as_str())
+            .redirect(wreq::redirect::Policy::limited(10))
+            .send();
         let (live_response, metadata_response) =
             tokio::try_join!(live_request, metadata_request)
                 .map_err(|error| ProviderError::Catalog(error.to_string()))?;

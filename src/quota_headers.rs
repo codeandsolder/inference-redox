@@ -1,4 +1,4 @@
-use reqwest::header::HeaderMap;
+use wreq::header::HeaderMap;
 
 use crate::{QuotaMetric, QuotaObservation};
 
@@ -112,7 +112,7 @@ fn decimal_component_millis(raw: &str, unit_millis: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use reqwest::header::{HeaderMap, HeaderValue};
+    use wreq::header::{HeaderMap, HeaderValue};
 
     use super::*;
 
